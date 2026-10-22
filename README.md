@@ -7,7 +7,7 @@ what it found, and -- once you say yes -- encrypts them with
 
 ```
 $ python sweep_and_secure.py
-sweep-and-secure 1.3.0  (TruffleHog + dotenvx)
+sweep-and-secure 1.3.1  (TruffleHog + dotenvx)
 Folder: /home/me/shop
   [ok] trufflehog  3.99.3     /usr/local/bin/trufflehog
   [ok] dotenvx     2.38.2     /usr/local/bin/dotenvx
@@ -59,22 +59,42 @@ route suits you. Each gives you a `sweep-and-secure` command.
 
 ```
 pipx install git+https://github.com/voxgig/sweep-and-secure            # latest from the default branch
-pipx install git+https://github.com/voxgig/sweep-and-secure@v1.3.0     # a specific release
+pipx install git+https://github.com/voxgig/sweep-and-secure@v1.3.1     # a specific release
 pipx run --spec git+https://github.com/voxgig/sweep-and-secure sweep-and-secure --dry-run   # try it without installing
 uvx --from git+https://github.com/voxgig/sweep-and-secure sweep-and-secure --dry-run
 ```
 
 **With curl, from a GitHub release** (macOS and Linux). The installer downloads
 `sweep_and_secure.py` from the latest release, checks its SHA-256 against the
-release's `SHA256SUMS`, and installs it as `sweep-and-secure`:
+release's `SHA256SUMS`, installs it as `sweep-and-secure`, then runs
+`sweep-and-secure --check-setup` so that you see at once whether the machine is
+ready: the TruffleHog and dotenvx it finds, with versions and locations (the
+same lines every run prints), a trial run of each, and what is missing if
+anything is:
 
 ```
-curl -sSfL https://github.com/voxgig/sweep-and-secure/releases/latest/download/install.sh | sh -s -- -b /usr/local/bin
+$ curl -sSfL https://github.com/voxgig/sweep-and-secure/releases/latest/download/install.sh | sh -s -- -b /usr/local/bin
+Downloading sweep_and_secure.py from https://github.com/voxgig/sweep-and-secure/releases/latest/download ...
+Checksum OK.
+Installed /usr/local/bin/sweep-and-secure
+
+sweep-and-secure 1.3.1  (TruffleHog + dotenvx)
+Python 3.12.3 (/usr/bin/python3) on Linux-6.8.0-x86_64-with-glibc2.39
+  [ok] trufflehog  3.99.3     /usr/local/bin/trufflehog
+  [ok] dotenvx     2.38.2     /usr/local/bin/dotenvx
+  [ok] git         2.43.0     /usr/bin/git  (optional: keeps .env.keys out of commits)
+  Scanned 1 file(s) in 0:02; TruffleHog reported 0 finding(s).
+  [ok] trufflehog  ran in a scratch folder: exit status 0, 1 file(s) scanned, no findings
+  [ok] dotenvx     ran in a scratch folder: encrypted a value, decrypted it back, wrote .env.keys
+
+Setup looks good. Nothing was changed. Next: sweep-and-secure --dry-run in a project folder.
 ```
 
 `-b DIR` chooses the folder (default: `/usr/local/bin` when writable, otherwise
-`~/.local/bin`), `-v v1.3.0` a specific release. The installer is `install.sh`
-in this repository and is attached to every release, so you can read it first.
+`~/.local/bin`), `-v v1.3.1` a specific release, `-n` skips the setup check (for
+an image build that installs the tools afterwards). The installer is
+`install.sh` in this repository and is attached to every release, so you can
+read it first.
 
 **By hand**: download `sweep_and_secure.py` from the
 [latest release](https://github.com/voxgig/sweep-and-secure/releases/latest),
@@ -82,8 +102,8 @@ check it against `SHA256SUMS`, make it executable and put it on your `PATH`, or
 simply run `python sweep_and_secure.py` from wherever it sits. On Windows use
 pipx or this route.
 
-Then install the two tools it drives (next section) and run the checks under
-"Checking the install".
+Then install the two tools it drives (next section), if the installer's check
+did not already find them, and run the checks under "Checking the install".
 
 ## Requirements
 
@@ -110,7 +130,7 @@ cannot be executed from here); `--no-version-check` overrides that.
 Three commands check an install without changing anything, in increasing depth.
 
 ```
-sweep-and-secure --version      # sweep-and-secure 1.3.0
+sweep-and-secure --version      # sweep-and-secure 1.3.1
 sweep-and-secure --help         # the option reference (see Options below)
 sweep-and-secure --check-setup  # are TruffleHog and dotenvx in place, and do they run?
 ```
@@ -120,7 +140,8 @@ with code 0, so they prove only that the script is on your `PATH` and that
 Python runs it. If you installed with pipx or uv and the command is not found,
 run `pipx ensurepath` (or `uv tool update-shell`) and open a new shell.
 
-`--check-setup` is the check to run once the two tools are installed. It prints
+`--check-setup` is the check to run once the two tools are installed (the curl
+installer runs it for you at the end of the install). It prints
 the Python it runs under, finds TruffleHog, dotenvx and git (optional) the way a
 real run does and shows their versions and locations, then runs both tools in a
 scratch folder under the system temp folder: TruffleHog scans a file that holds
@@ -130,7 +151,7 @@ and the scratch folder is removed afterwards.
 
 ```
 $ sweep-and-secure --check-setup
-sweep-and-secure 1.3.0  (TruffleHog + dotenvx)
+sweep-and-secure 1.3.1  (TruffleHog + dotenvx)
 Python 3.12.3 (/home/me/.local/share/pipx/venvs/sweep-and-secure/bin/python) on Linux-6.8.0-x86_64-with-glibc2.39
   [ok] trufflehog  3.99.3     /usr/local/bin/trufflehog
   [ok] dotenvx     2.38.2     /usr/local/bin/dotenvx
@@ -156,7 +177,7 @@ To check a downloaded `sweep_and_secure.py` against the published checksums,
 from the folder it was downloaded into (the curl installer does this for you):
 
 ```
-curl -sSfL -O https://github.com/voxgig/sweep-and-secure/releases/download/v1.3.0/SHA256SUMS
+curl -sSfL -O https://github.com/voxgig/sweep-and-secure/releases/download/v1.3.1/SHA256SUMS
 grep ' sweep_and_secure.py$' SHA256SUMS | sha256sum -c -      # macOS: ... | shasum -a 256 -c -
 ```
 
@@ -394,7 +415,7 @@ with the current TruffleHog and dotenvx, and a packaging job that builds the
 wheel, runs the console script and exercises `install.sh`.
 
 To release: set `__version__` in `sweep_and_secure.py`, merge, then either push
-a matching tag (`git tag v1.3.0 && git push origin v1.3.0`) or run the release
+a matching tag (`git tag v1.3.1 && git push origin v1.3.1`) or run the release
 workflow from the Actions tab with the version, which creates the tag for you.
 The workflow (`.github/workflows/release.yml`) checks that the tag matches the
 version, runs the tests, builds the sdist and wheel, and publishes a GitHub

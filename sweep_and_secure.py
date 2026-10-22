@@ -45,7 +45,7 @@ import time
 import traceback
 from collections import OrderedDict, deque
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 # --------------------------------------------------------------------------
 # Python 2 / 3 compatibility

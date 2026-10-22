@@ -51,6 +51,15 @@ jobs:
         env:
           SWEEP_TEST_REAL_TOOLS: "1"
         run: python -m unittest discover -s tests -v
+      - name: Exercise install.sh where the tools are present (its setup check must pass)
+        run: |
+          mkdir fake-release
+          cp sweep_and_secure.py install.sh fake-release/
+          (cd fake-release && sha256sum * > SHA256SUMS)
+          sh install.sh -u "file://$PWD/fake-release" -b "$RUNNER_TEMP/bin" 2>&1 | tee install.log
+          grep -q '\[ok\] trufflehog  3\.' install.log
+          grep -q '\[ok\] dotenvx ' install.log
+          grep -q 'Setup looks good' install.log
 
   package:
     name: ubuntu / package, console script and installer
@@ -74,5 +83,11 @@ jobs:
           mkdir fake-release
           cp sweep_and_secure.py install.sh dist/* fake-release/
           (cd fake-release && sha256sum * > SHA256SUMS)
-          sh install.sh -u "file://$PWD/fake-release" -b "$RUNNER_TEMP/bin"
+          # no TruffleHog or dotenvx here: the install succeeds and the check names both
+          sh install.sh -u "file://$PWD/fake-release" -b "$RUNNER_TEMP/bin" 2>&1 | tee install.log
+          grep -q 'Installed ' install.log
+          grep -q 'trufflehog is not installed' install.log
+          grep -q 'dotenvx is not installed' install.log
+          grep -q 'Install what is missing' install.log
+          sh install.sh -n -u "file://$PWD/fake-release" -b "$RUNNER_TEMP/bin" | grep -q 'skipped here because of -n'
           "$RUNNER_TEMP/bin/sweep-and-secure" --version
