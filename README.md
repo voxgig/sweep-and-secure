@@ -33,6 +33,7 @@ Other plaintext keys in env files: 2  (not flagged by TruffleHog; add --env-all 
   .env: PORT, APP_NAME
 
 Encrypt these 5 secret(s) now? [y/N/s]  (s = choose which): y
+  [ok] added .env.keys* to /home/me/shop/.gitignore
 
 Encrypting ...
   [ok] .env: encrypted 4 key(s): STRIPE_SECRET_KEY, SLACK_WEBHOOK, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
@@ -41,9 +42,8 @@ Encrypting ...
   [ok] src/settings.py: replaced 2 occurrence(s) of 2 secret(s) with placeholders (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
 
   [ok] private key file: .env.keys
-  [ok] added .env.keys* to /home/me/shop/.gitignore
 
-Done: 5 secret(s) encrypted, 1 need manual attention (see above)
+Done: 4 secret(s) stored encrypted; 4 plaintext occurrence(s) removed from 3 file(s); 1 need manual attention (see above)
 
 Next steps
   ...
@@ -51,7 +51,8 @@ Next steps
 
 ## Requirements
 
-* Python 2.7 or any Python 3 (no packages to install).
+* Python 3.8 or newer. (The script still carries Python 2.7 compatibility code
+  and may well work there, but only 3.8 and up are tested; see Development.)
 * [TruffleHog](https://trufflesecurity.com/trufflehog) 3.x on your `PATH`
   ([install](https://github.com/trufflesecurity/trufflehog#floppy_disk-installation)):
   `brew install trufflehog` or
@@ -65,6 +66,8 @@ If either tool is missing the script stops, says which one, and prints these
 links. `--trufflehog PATH` / `--dotenvx PATH` (or the `TRUFFLEHOG_BIN` /
 `DOTENVX_BIN` environment variables) point it at a copy that is not on your
 `PATH`; a project-local `node_modules/.bin/dotenvx` is picked up automatically.
+A tool whose `--version` cannot be read is refused (it usually means the file
+cannot be executed from here); `--no-version-check` overrides that.
 
 ## Usage
 
@@ -88,23 +91,47 @@ dotenvx, then asks. Answer `y` to encrypt everything listed, `n` to stop, or
 
 | where it was found | what is done |
 | --- | --- |
-| a dotenv file (`.env`, `.env.production`, `prod.env`, ...), as the value of `KEY=...` | `dotenvx encrypt -f <file> -k KEY` encrypts that key in place: `KEY="encrypted:..."` |
+| a dotenv file (`.env`, `.env.production`, `prod.env`, ...), as the value of `KEY=...` | `dotenvx encrypt -k KEY` encrypts that key in place: `KEY="encrypted:..."`. Every key whose value holds the secret is encrypted, not just the first |
 | anywhere else (source code, JSON, YAML, Markdown, certificates, ...) | the value is added to the project's `.env` (`--env-file` to change) and encrypted there; the plaintext in the file is replaced by `${KEY}` (`--placeholder` to change) |
-| a binary or archive file, a symlink, a secret TruffleHog had to decode first | listed under "cannot fix automatically" for you to deal with by hand |
+| a binary or archive file, a symlink, a secret TruffleHog had to decode first, a PDF, a generated lock file (`package-lock.json`, `poetry.lock`, ...), an example env file (`.env.example`, `.env.sample`, ...) | listed under "cannot fix automatically" for you to deal with by hand |
+| a value dotenvx cannot store exactly (it contains an apostrophe together with a backslash, or with both a backtick and a double quote) | listed under "cannot fix automatically"; moving it would corrupt it |
 
 Variable names come from the code around the secret (`AWS_SECRET_ACCESS_KEY = "..."`,
 `"apiKey": "..."`, `password: ...`), made specific with the detector name when
 they are too generic (`token` found by the GitHub detector becomes
 `GITHUB_TOKEN`), and fall back to the detector name plus a short hash
 (`PRIVATE_KEY_28AF08`). The same secret found in several files gets one name.
-Nothing is rewritten until dotenvx has confirmed the value is stored encrypted;
-if dotenvx fails, the env file is restored and the source files are left alone.
+A secret that is already in the env file -- in plaintext, or encrypted where the
+private key lets the script check -- is reused under its existing key, so running
+again after `--no-rewrite` or an interrupted run does not pile up `KEY_2`
+duplicates. A name that is taken by a different value gets a numeric suffix, and
+the listing says why.
+
+### How files are changed
+
+Nothing is written to an env file until the result has been checked. The env
+file is copied, under its own name, into a staging folder inside the swept
+folder; the new entries are appended to the copy; dotenvx encrypts the copy;
+the script then checks that every key is `encrypted:`, that no entry still holds
+a secret in plaintext, and -- where the private key is at hand -- that each value
+decrypts back to exactly what was stored. Only then is the copy moved over the
+real file in one atomic rename. If anything fails the real file has not been
+touched, and the source files are left alone. Plaintext never lands on the real
+env file's path, not even for a moment, so a crash or a power cut cannot leave
+it there. Source files are rewritten atomically as well, and only after their
+value has been stored.
 
 dotenvx writes the private key to `.env.keys` (dotenvx 2.x puts it in the swept
-folder; 1.x next to each env file). The script asks `git check-ignore` whether
-that file is ignored, appends `.env.keys*` to your `.gitignore` if it is not,
-and warns loudly if the file is already tracked by git. Files are rewritten
-atomically, and an interrupted run restores any env file it was changing.
+folder; 1.x next to each env file). Before anything is encrypted the script asks
+`git check-ignore` whether that file is ignored and appends `.env.keys*` to your
+`.gitignore` if it is not, so that an interrupted run cannot leave the key
+exposed; afterwards it checks again and warns loudly if the file is tracked by
+git. If a run is interrupted or hits an unexpected error it says exactly what
+was changed and what still holds plaintext; running again finishes the job.
+
+dotenvx itself only looks for `.env.keys` next to the env file, so for an env
+file in a sub-folder the "Next steps" give the command with `-fk`
+(`dotenvx run -f config/.env.production -fk .env.keys -- <your command>`).
 
 ### Options
 
@@ -121,20 +148,28 @@ path                    folder to sweep (default: current folder)
 --no-default-excludes   also scan .git, node_modules, virtualenvs, __pycache__ ...
 --min-length N          ignore secrets shorter than N characters (default: 8)
 --trufflehog PATH       trufflehog executable        --dotenvx PATH   dotenvx executable
+--no-version-check      use a tool even if its --version could not be read
 -v, --verbose           show the commands run and the tools' output
 --no-color              plain output
 ```
 
+`--exclude` patterns are regular expressions matched against the whole path; the
+built-in ones accept `/` and `\` as separators so that they work on Windows too,
+where TruffleHog sees backslashes.
+
 Exit codes: `0` done or nothing to do, `1` a tool is missing, the scan failed
-or was cut short, or an encryption failed, `2` you said no (or stdin was not a
-terminal and `--yes` was not given).
+or was cut short, an encryption or its verification failed, or the run was
+stopped by an unexpected error, `2` you said no (or stdin was not a terminal
+and `--yes` was not given), `130` interrupted.
 
 ## After a run
 
 1. Replace the placeholders in your code with real environment lookups
    (`os.environ["AWS_ACCESS_KEY_ID"]`, `process.env.AWS_ACCESS_KEY_ID`, ...).
 2. Start your program through dotenvx so the values are decrypted at run time:
-   `dotenvx run -- <your command>` (or `dotenvx run -f config/.env.production -- ...`).
+   `dotenvx run -- <your command>`, or for an env file in a sub-folder
+   `dotenvx run -f config/.env.production -fk .env.keys -- ...` (the exact
+   commands are printed).
 3. Keep `.env.keys` private: share the `DOTENV_PRIVATE_KEY*` values through a
    password manager or your CI's secret store. The encrypted `.env` files are
    safe to commit.
@@ -147,8 +182,15 @@ terminal and `--yes` was not given).
 * TruffleHog only knows the credential formats it has detectors for; a plain
   `DB_PASSWORD=hunter2` in a `.env` file is listed under "other plaintext keys"
   and is encrypted only with `--env-all`.
-* Secrets inside binaries, archives (TruffleHog looks inside them) or
-  base64/UTF-16 encoded text are reported but not rewritten.
+* Secrets inside binaries, archives (TruffleHog looks inside them), PDFs, lock
+  files or base64-encoded text are reported but not rewritten.
+* dotenvx expands `$NAME` and backslash escapes in double-quoted and backtick
+  values and keeps `\"` and `\\` as they are, so a value containing an apostrophe
+  together with a backslash (or with a backtick and a double quote) cannot be
+  stored exactly and is left for you to handle.
+* Values that were already in an env file and contain `$` or a backslash are
+  encrypted as dotenvx reads them (expanded), which is what your program got
+  before as well; they are checked for being decryptable, not for equality.
 * Replacing a literal with `${KEY}` removes the secret but does not make the
   program read the variable; that is the follow-up work the script lists.
 * Only the working tree is changed, never git history.
@@ -156,10 +198,14 @@ terminal and `--yes` was not given).
 ## Development
 
 ```
-python -m unittest discover -s tests -v      # Python 2.7 or 3.x
+python -m unittest discover -s tests -v
 ```
 
 The end-to-end tests run the script against a throw-away project with
 stand-ins for `trufflehog` and `dotenvx` from `tests/fakebin`, so they need
-neither tool installed. The script itself has also been run against the real
-TruffleHog 3.99 and dotenvx 2.38 under Python 2.7, 3.8 and 3.13.
+neither tool installed. The stand-in dotenvx follows the real tool's quoting,
+key-naming and key-lookup rules as measured against dotenvx 2.38. With
+`SWEEP_TEST_REAL_TOOLS=1` and the real tools on your `PATH` an extra tier runs
+the script against them. CI (`.github/workflows/test.yml`) runs the suite on
+Linux, macOS and Windows with Python 3.8 to 3.13, plus the real-tools tier on
+Linux with the current TruffleHog and dotenvx.

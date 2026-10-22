@@ -39,6 +39,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import traceback
 from collections import OrderedDict
 
 __version__ = "1.0.0"
@@ -84,13 +85,34 @@ def fs_text(path):
 
 
 def say(text=u"", stream=None):
-    """print() that never dies on odd terminal encodings (Python 2 included)."""
+    """print() that never dies: odd terminal encodings, a closed pipe or a missing
+    stdout (pythonw) must not take the run down half way through a rewrite."""
     stream = stream or sys.stdout
+    if stream is None:
+        return
     if PY2 and isinstance(text, text_type):  # pragma: no cover
         text = text.encode(getattr(stream, "encoding", None) or "utf-8", "replace")
-    stream.write(text)
-    stream.write("\n")
-    stream.flush()
+    try:
+        try:
+            stream.write(text)
+        except UnicodeEncodeError:
+            encoding = getattr(stream, "encoding", None) or "ascii"
+            stream.write(text.encode(encoding, "replace").decode(encoding, "replace"))
+        stream.write("\n")
+        stream.flush()
+    except (IOError, OSError, ValueError):  # closed or broken stream
+        pass
+
+
+def configure_streams():
+    """Ask Python 3.7+ to replace rather than choke on characters the console cannot show."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(errors="replace")
+            except (ValueError, TypeError, AttributeError):  # pragma: no cover
+                pass
 
 
 # --------------------------------------------------------------------------
@@ -131,20 +153,38 @@ TOOLS = OrderedDict([
 
 # Paths TruffleHog should not bother with, and we should never rewrite.
 # Regular expressions, matched against the full (forward-slash) path.
+# TruffleHog matches them against the path as the OS spells it (backslashes on
+# Windows), so both separators are accepted.
 DEFAULT_EXCLUDES = [
-    r"(^|/)\.git(/|$)",
-    r"(^|/)\.hg(/|$)",
-    r"(^|/)\.svn(/|$)",
-    r"(^|/)node_modules(/|$)",
-    r"(^|/)__pycache__(/|$)",
-    r"(^|/)\.venv(/|$)",
-    r"(^|/)venv(/|$)",
-    r"(^|/)\.tox(/|$)",
-    r"(^|/)\.env\.keys",      # dotenvx private keys: never scan, never touch
-    r"(^|/)\.env\.vault$",    # legacy dotenvx vault files
+    r"(^|[/\\])\.git([/\\]|$)",
+    r"(^|[/\\])\.hg([/\\]|$)",
+    r"(^|[/\\])\.svn([/\\]|$)",
+    r"(^|[/\\])node_modules([/\\]|$)",
+    r"(^|[/\\])__pycache__([/\\]|$)",
+    r"(^|[/\\])\.venv([/\\]|$)",
+    r"(^|[/\\])venv([/\\]|$)",
+    r"(^|[/\\])\.tox([/\\]|$)",
+    r"(^|[/\\])\.env\.keys",          # dotenvx private keys: never scan, never touch
+    r"(^|[/\\])\.env\.vault$",        # legacy dotenvx vault files
+    r"(^|[/\\])\.sweep-and-secure-",   # our own staging files, left by an interrupted run
 ]
 
-ENV_ENTRY_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_.\-]*)\s*=(.*)$")
+TEMP_PREFIX = ".sweep-and-secure-"
+
+# .env.example, .env.sample, template.env ...: placeholders for humans, not secrets to lock up.
+EXAMPLE_ENV_WORDS = set("example sample template dist defaults tpl".split())
+
+# Generated files that tooling checks or regenerates: a placeholder inside them breaks the
+# tool, so the secret has to be removed by regenerating the file.
+LOCKFILE_NAMES = set("""
+    package-lock.json npm-shrinkwrap.json yarn.lock pnpm-lock.yaml bun.lock bun.lockb
+    poetry.lock pipfile.lock uv.lock pdm.lock cargo.lock composer.lock gemfile.lock
+    mix.lock pubspec.lock packages.lock.json flake.lock .terraform.lock.hcl
+    """.split())
+
+# U+FEFF: a UTF-8 byte order mark, which dotenvx (JavaScript's \s) skips like whitespace;
+# after dotenvx prepends its public-key header the mark sits at the start of a later line.
+ENV_ENTRY_RE = re.compile(u"^[\\s\ufeff]*(?:export\\s+)?([A-Za-z_][A-Za-z0-9_.\\-]*)\\s*=(.*)$")
 KEYS_HINT_RE = re.compile(r"^\s*DOTENV_PUBLIC_KEY\w*\s*=.*#\s*-fk\s+(\S+)", re.MULTILINE)
 VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 
@@ -176,6 +216,7 @@ PAIR_DELIMITERS = (":", ";", ",", "|", "&")   # what TruffleHog puts between Raw
 URL_TAIL_PUNCTUATION = b".,;:!?"
 URL_CLOSERS = {b")": b"(", b"]": b"[", b"}": b"{"}
 MAX_FILE_BYTES = 64 * 1024 * 1024
+UTF16_BOMS = (b"\xff\xfe", b"\xfe\xff")
 
 
 class ToolError(Exception):
@@ -246,7 +287,10 @@ def which(name):
 
 
 def run_command(cmd, cwd=None, extra_env=None, stdin_text=u""):
-    """Run cmd, feed it stdin_text, return (exit code, stdout text, stderr text)."""
+    """Run cmd, feed it stdin_text, return (exit code, stdout text, stderr text).
+
+    If we are interrupted while the child runs, the child is killed and reaped
+    first, so that it cannot keep writing files after we have given up on it."""
     env = dict(os.environ)
     if extra_env:
         env.update(extra_env)
@@ -255,7 +299,18 @@ def run_command(cmd, cwd=None, extra_env=None, stdin_text=u""):
         cwd = cwd.encode(FS_ENCODING) if isinstance(cwd, text_type) else cwd
     proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.PIPE,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    out, err = proc.communicate(to_bytes(stdin_text))
+    try:
+        out, err = proc.communicate(to_bytes(stdin_text))
+    except BaseException:
+        try:
+            proc.kill()
+        except (OSError, IOError):
+            pass
+        try:
+            proc.wait()
+        except (OSError, IOError):
+            pass
+        raise
     return proc.returncode, to_text(out), to_text(err)
 
 
@@ -266,22 +321,21 @@ def read_bytes(path):
 
 def write_bytes(path, data):
     """Write data to path atomically (temp file + rename) so that an interrupt can
-    never leave a truncated file behind; the file's permission bits are kept."""
+    never leave a truncated file behind. A symbolic link is written through to its
+    target instead of being replaced by a plain file; permission bits (and the
+    owner, when we are allowed to) are kept."""
+    if os.path.islink(path):
+        path = os.path.realpath(path)
     folder = os.path.dirname(path) or "."
     try:
-        handle, tmp = tempfile.mkstemp(prefix=".sweep-and-secure-", dir=folder)
+        handle, tmp = tempfile.mkstemp(prefix=TEMP_PREFIX, dir=folder)
     except (IOError, OSError):
-        with io.open(path, "wb") as fh:  # folder not writable for us: plain write
-            fh.write(data)
-        return
+        return write_in_place(path, data)
     try:
         with io.open(handle, "wb") as fh:
             fh.write(data)
         if os.path.exists(path):
-            try:
-                shutil.copymode(path, tmp)
-            except (IOError, OSError):
-                pass
+            copy_attributes(path, tmp)
         replace = getattr(os, "replace", None)
         if replace is None and os.name == "nt" and os.path.exists(path):  # Python 2 on Windows
             os.remove(path)
@@ -294,6 +348,44 @@ def write_bytes(path, data):
         raise
 
 
+def write_in_place(path, data):
+    """Used when the folder refuses us a temp file: overwrite in place, and put the
+    old content back if the write fails half way. Not atomic, but never silently
+    truncated."""
+    original = None
+    if os.path.isfile(path):
+        try:
+            original = read_bytes(path)
+        except (IOError, OSError):
+            original = None
+    try:
+        with io.open(path, "wb") as fh:
+            fh.write(data)
+    except BaseException:
+        if original is not None:
+            try:
+                with io.open(path, "wb") as fh:
+                    fh.write(original)
+            except (IOError, OSError):
+                pass
+        raise
+
+
+def copy_attributes(src, dst):
+    """Keep the mode bits and, where we are privileged enough, the owner and group.
+    Timestamps are deliberately not copied: the file did change."""
+    try:
+        shutil.copymode(src, dst)
+    except (IOError, OSError):
+        pass
+    if hasattr(os, "chown"):
+        try:
+            st = os.stat(src)
+            os.chown(dst, st.st_uid, st.st_gid)
+        except (IOError, OSError, AttributeError):
+            pass
+
+
 def read_text(path):
     return to_text(read_bytes(path))
 
@@ -303,10 +395,13 @@ def slash_path(path):
 
 
 def is_excluded(path, exclude_res, is_dir=False):
-    probe = slash_path(path) + ("/" if is_dir else "")
+    probes = [slash_path(path) + ("/" if is_dir else "")]
+    if os.sep != "/":
+        probes.append(path + (os.sep if is_dir else ""))
     for rx in exclude_res:
-        if rx.search(probe):
-            return True
+        for probe in probes:
+            if rx.search(probe):
+                return True
     return False
 
 
@@ -315,6 +410,17 @@ def is_env_file(name):
     if name.startswith(".env.keys") or name in (".env.vault", ".envrc"):
         return False
     return name == ".env" or name.startswith(".env.") or name.endswith(".env")
+
+
+def is_example_env_file(name):
+    """.env.example, .env.sample, template.env ...: placeholders, not secrets to encrypt."""
+    if not is_env_file(name):
+        return False
+    return any(part in EXAMPLE_ENV_WORDS for part in name.lower().split("."))
+
+
+def is_lockfile(name):
+    return name.lower() in LOCKFILE_NAMES
 
 
 def find_closing_quote(body, quote):
@@ -337,6 +443,8 @@ def parse_env_entries(text):
     quoted values ('...', "...", `...`) may span lines and keep their content
     verbatim, an unquoted value stops at the first '#'. Nothing is unescaped.
     """
+    if text.startswith(u"\ufeff"):  # UTF-8 BOM (Notepad): dotenvx reads past it, so do we
+        text = text[1:]
     lines = text.splitlines()
     i = 0
     while i < len(lines):
@@ -373,16 +481,29 @@ def value_holds(value, token):
 def quote_env_value(value):
     """Quote a value for a .env line so dotenvx reads back exactly what we stored.
 
-    Single quotes are fully literal in dotenvx (no $VAR expansion, no escapes),
-    so they are the first choice. Returns (quoted_text, exact).
+    Measured against dotenvx 2.38: single quotes are fully literal; backticks are
+    literal except that $NAME is expanded (a backslash before the $ prevents it);
+    double quotes expand $NAME, \\n and \\t, honour \\$, and keep \\" and \\\\ as they
+    are (nothing is unescaped). So a value without an apostrophe goes in single
+    quotes, one with an apostrophe in backticks or double quotes with every $
+    escaped, and a value that also contains a backslash (or an apostrophe, a
+    backtick and a double quote together) cannot be written exactly at all.
+    Returns (quoted_text, exact); callers must not store an inexact value.
     """
     if "'" not in value:
         return "'" + value + "'", True
-    if "`" not in value and "$" not in value:
-        return "`" + value + "`", True
-    if '"' not in value and "$" not in value and "\\" not in value:
-        return '"' + value + '"', True
+    escaped = value.replace("$", "\\$")
+    if "`" not in value and "\\" not in value:
+        return "`" + escaped + "`", True
+    if '"' not in value and "\\" not in value:
+        return '"' + escaped + '"', True
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"', False
+
+
+def inexact_reason(value):
+    if "\\" in value:
+        return u"it contains both an apostrophe and a backslash"
+    return u"it contains an apostrophe, a backtick and a double quote"
 
 
 def normalize_name(raw):
@@ -468,7 +589,15 @@ def find_tool(name, override, root):
     if name == "dotenvx":  # a project-local npm install also counts
         candidates.append(os.path.join(root, "node_modules", ".bin", "dotenvx"))
     for candidate in candidates:
-        found = which(candidate)
+        found = None
+        if os.name == "nt" and os.path.dirname(candidate) and not os.path.splitext(candidate)[1]:
+            # npm installs both a POSIX shell script "dotenvx" and "dotenvx.cmd"; only the
+            # latter can be executed here, and shutil.which() before 3.12 would return the former.
+            for ext in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(os.pathsep):
+                if ext and os.path.isfile(candidate + ext):
+                    found = candidate + ext
+                    break
+        found = found or which(candidate)
         if found:
             # absolute, because the tools are later run with the swept folder as cwd
             return os.path.abspath(fs_text(found))
@@ -511,6 +640,12 @@ def locate_tools(args, root, style):
             problems += 1
             continue
         version, text = tool_version(path)
+        if version is None and not args.no_version_check:
+            complain_about_tool(name, u"at %s did not report a usable version (%s), so it probably cannot"
+                                u" be run from here; pass --no-version-check to try it anyway"
+                                % (path, text or u"no output"), style)
+            problems += 1
+            continue
         if version is not None and version < info["min_version"]:
             complain_about_tool(name, u"%s is too old. %s" % (text, info["why_version"]), style)
             problems += 1
@@ -629,18 +764,26 @@ def style_dim_block(text):
 # --------------------------------------------------------------------------
 
 def inventory_env_files(root, exclude_res):
-    """Return (encrypted, plaintext) lists of (path, key, line) over all dotenv files."""
-    encrypted, plaintext = [], []
+    """Return (encrypted, plaintext, stale) over all dotenv files: lists of
+    (path, key, line) / (path, key, line, value), and the staging files or folders
+    an earlier interrupted run left behind."""
+    encrypted, plaintext, stale = [], [], []
     for dirpath, dirnames, filenames in os.walk(root):
         keep = []
         for name in dirnames:
-            if not is_excluded(os.path.join(dirpath, name), exclude_res, is_dir=True):
+            full = os.path.join(dirpath, name)
+            if name.startswith(TEMP_PREFIX) and not os.path.islink(full):
+                stale.append(full)
+            elif not is_excluded(full, exclude_res, is_dir=True):
                 keep.append(name)
         dirnames[:] = sorted(keep)
         for name in sorted(filenames):
-            if not is_env_file(name):
-                continue
             path = os.path.join(dirpath, name)
+            if name.startswith(TEMP_PREFIX):
+                stale.append(path)
+                continue
+            if not is_env_file(name) or is_example_env_file(name):
+                continue
             if is_excluded(path, exclude_res) or os.path.islink(path):
                 continue
             try:
@@ -654,7 +797,22 @@ def inventory_env_files(root, exclude_res):
                     encrypted.append((path, key, line))
                 elif value:
                     plaintext.append((path, key, line, value))
-    return encrypted, plaintext
+    return encrypted, plaintext, stale
+
+
+def remove_stale(stale):
+    """Delete staging leftovers (ours: the name prefix is unique). Returns what is gone."""
+    removed = []
+    for path in stale:
+        try:
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
+            removed.append(path)
+        except (IOError, OSError):
+            pass
+    return removed
 
 
 # --------------------------------------------------------------------------
@@ -681,7 +839,7 @@ class Item(object):
         self.new_entry = False    # must we append KEY=value to self.store?
         self.number = 0           # 1-based number shown in the listing
         self.status = "planned"   # planned | done | stored | skipped | failed
-        self.note = u""
+        self.note = u""           # shown in the listing (naming) or the result (failures)
         self.replaced = 0
 
 
@@ -694,6 +852,7 @@ class Plan(object):
         self.encrypted = []          # (path, key, line) already encrypted
         self.plain_env = []          # (path, key, line, value) unflagged plaintext env keys
         self.extra_env_keys = {}     # env path -> [keys] that must be encrypted as well
+        self.ignored = 0             # findings inside excluded folders (TruffleHog on Windows)
 
     def rel(self, path):
         try:
@@ -757,7 +916,11 @@ def locate(data, secret, decoder):
     which is the decoded secret when the file holds an escaped form of it.
     """
     encodings = ["utf-8"]
-    if "UTF16" in (decoder or "").upper():
+    if data[:2] == b"\xff\xfe":
+        encodings = ["utf-16-le"]
+    elif data[:2] == b"\xfe\xff":
+        encodings = ["utf-16-be"]
+    elif "UTF16" in (decoder or "").upper():
         encodings = ["utf-16-le", "utf-16-be"]
     variants = [secret]
     if "\n" in secret:
@@ -789,10 +952,17 @@ def load_for_edit(path, cache):
     if path in cache:
         return cache[path]
     result = (None, u"")
+    name = os.path.basename(path)
     if os.path.islink(path):
         result = (None, u"symbolic link - fix the target file instead")
     elif not os.path.isfile(path):
         result = (None, u"file not found (moved or deleted during the scan)")
+    elif is_example_env_file(name):
+        result = (None, u"example/template env file - replace the value with a placeholder by hand")
+    elif is_lockfile(name):
+        result = (None, u"generated lock file - regenerate it without the secret")
+    elif name.lower().endswith(".pdf"):
+        result = (None, u"PDF - rewriting bytes would corrupt it; rebuild it without the secret")
     else:
         try:
             size = os.path.getsize(path)
@@ -800,7 +970,7 @@ def load_for_edit(path, cache):
                 result = (None, u"file is larger than %d MB" % (MAX_FILE_BYTES // (1024 * 1024)))
             else:
                 data = read_bytes(path)
-                if b"\x00" in data:
+                if b"\x00" in data and data[:2] not in UTF16_BOMS:
                     result = (None, u"binary or archive file - delete it or rebuild it without the secret")
                 else:
                     result = (data, u"")
@@ -810,12 +980,15 @@ def load_for_edit(path, cache):
     return result
 
 
-def build_plan(findings, root, store, args, env_plaintext):
+def build_plan(findings, root, store, args, env_plaintext, exclude_res=(), decryptor=None):
     plan = Plan(root, store)
     cache = {}
     seen = {}
     ordered = sorted(findings, key=lambda f: (f.path, f.line, f.raw))
     for finding in ordered:
+        if exclude_res and is_excluded(finding.path, exclude_res):
+            plan.ignored += 1   # TruffleHog did not honour the exclude (Windows paths); we do
+            continue
         data, reason = load_for_edit(finding.path, cache)
         if data is None:
             plan.skipped.append((finding.path, finding.detector, reason))
@@ -847,20 +1020,28 @@ def build_plan(findings, root, store, args, env_plaintext):
                           % finding.decoder)
             plan.skipped.append((finding.path, finding.detector, reason))
 
-    # Secrets found inside env files: is the secret the value of KEY=... ?
+    # Secrets found inside env files: which KEY=... entries hold the secret? Every one of
+    # them must be encrypted, so each becomes an item of its own.
     text_cache = {}
+    twins = []
     for item in plan.items:
         if not is_env_file(os.path.basename(item.path)):
             item.kind = "source"
             continue
         if item.path not in text_cache:
             text_cache[item.path] = list(parse_env_entries(to_text(cache[item.path][0])))
-        for key, value, line in text_cache[item.path]:
-            if value_holds(value, item.secret) and not value.startswith(ENCRYPTED_PREFIX):
-                item.kind, item.key, item.store, item.line = "env", key, item.path, line
-                break
-        if item.kind is None:
+        holders = [(key, line) for key, value, line in text_cache[item.path]
+                   if value_holds(value, item.secret) and not value.startswith(ENCRYPTED_PREFIX)]
+        if not holders:
             item.kind = "source"   # e.g. a secret in a comment of the .env file
+            continue
+        item.kind, item.key, item.store, item.line = "env", holders[0][0], item.path, holders[0][1]
+        for key, line in holders[1:]:
+            twin = Item(item.path, item.offset, line, item.detector, item.verified, item.secret,
+                        item.secret_bytes, item.encoding, item.extra)
+            twin.kind, twin.key, twin.store = "env", key, item.path
+            twins.append(twin)
+    plan.items.extend(twins)
 
     # --env-all: every other plaintext key in env files becomes an item too.
     if args.env_all:
@@ -877,38 +1058,77 @@ def build_plan(findings, root, store, args, env_plaintext):
             covered.add((path, key))
 
     plan.items.sort(key=lambda it: (it.path, it.line, it.offset))
-    assign_names(plan)
+    assign_names(plan, decryptor)
+
+    # A value dotenvx cannot store exactly must not be moved: the mangled copy would be
+    # the only one left. Hand those over for manual attention instead.
+    keep = []
+    for item in plan.items:
+        if item.kind == "source" and item.new_entry and not quote_env_value(item.secret)[1]:
+            plan.skipped.append((item.path, item.detector,
+                                 u"dotenvx cannot store this value exactly (%s) - move it into %s by hand"
+                                 % (inexact_reason(item.secret), plan.rel(plan.store))))
+            continue
+        keep.append(item)
+    plan.items = keep
     for number, item in enumerate(plan.items, 1):
         item.number = number
     return plan
 
 
-def assign_names(plan):
-    """Decide the env var name and storage file for every 'source' item."""
-    taken = {}        # name -> secret it holds
-    by_secret = {}    # secret -> (name, env file)
+UNKNOWN = object()   # an encrypted store value we could not decrypt here
+
+
+def assign_names(plan, decryptor=None):
+    """Decide the env var name and storage file for every 'source' item.
+
+    A secret that already sits in the store under some key - in plaintext, or
+    encrypted where the private key lets us check - is reused under that key,
+    so a second run (after --no-rewrite, a crash or a failed rewrite) does not
+    pile up KEY_2, KEY_3 duplicates. A name that is taken by a different value
+    gets a numeric suffix, and the listing says why.
+    """
     store_entries = []
     if os.path.isfile(plan.store):
         try:
             store_entries = list(parse_env_entries(read_text(plan.store)))
         except (IOError, OSError):
             store_entries = []
+    by_secret = {}
+    for item in plan.items:
+        if item.kind == "env":
+            by_secret.setdefault(item.secret, (item.key, item.path))
+    pending = [item for item in plan.items if item.kind == "source" and item.secret not in by_secret]
+
+    # What the store holds, by key (last definition wins, as it does for dotenvx):
+    # plaintext as written, encrypted values decrypted when we can.
+    values = OrderedDict()
+    plaintext_keys = set()
     for key, value, _ in store_entries:
-        taken.setdefault(key, value)
+        if value.startswith(ENCRYPTED_PREFIX):
+            if pending and decryptor is not None:
+                decrypted, _reason = decryptor(plan.store, key)
+                values[key] = UNKNOWN if decrypted is None else decrypted
+            else:
+                values[key] = UNKNOWN
+            plaintext_keys.discard(key)
+        else:
+            values[key] = value
+            plaintext_keys.add(key)
+    taken = dict(values)
     for item in plan.items:
         if item.kind == "env":
             taken[item.key] = item.secret
-            by_secret.setdefault(item.secret, (item.key, item.path))
+
     for item in plan.items:
         if item.kind != "source":
             continue
         if item.secret in by_secret:
             item.key, item.store = by_secret[item.secret]
             continue
-        same_value = [key for key, value, _ in store_entries if value == item.secret]
+        same_value = [key for key, value in values.items() if value == item.secret]
         if same_value:
             item.key, item.store = same_value[0], plan.store
-            plan.extra_env_keys.setdefault(plan.store, []).append(same_value[0])
         else:
             contexts = [other.context for other in plan.items
                         if other.secret == item.secret and other.context]
@@ -917,8 +1137,20 @@ def assign_names(plan):
             while name in taken and taken[name] != item.secret:
                 name = u"%s_%d" % (base, counter)
                 counter += 1
+            if name != base:
+                if taken[base] is UNKNOWN:
+                    item.note = u"%s holds an encrypted value that could not be decrypted here" % base
+                else:
+                    item.note = u"%s already holds a different value" % base
             taken[name] = item.secret
             item.key, item.store, item.new_entry = name, plan.store, True
+        # Plaintext entries of the store that hold this secret (equal to it, or containing
+        # it) must be encrypted along, or the secret would stay readable there.
+        for key in plaintext_keys:
+            if value_holds(values[key], item.secret):
+                extra = plan.extra_env_keys.setdefault(plan.store, [])
+                if key not in extra:
+                    extra.append(key)
         by_secret[item.secret] = (item.key, item.store)
 
 
@@ -942,10 +1174,11 @@ def action_text(item, plan, args):
     if item.kind == "env":
         return u"encrypt in place"
     placeholder = args.placeholder.replace("NAME", item.key)
+    why = u" (%s)" % item.note if item.note else u""
     if args.no_rewrite:
-        return u"store encrypted in %s (file left as is)" % store
+        return u"store encrypted in %s (file left as is)%s" % (store, why)
     if item.new_entry:
-        return u"move to %s, replace with %s" % (store, placeholder)
+        return u"move to %s, replace with %s%s" % (store, placeholder, why)
     return u"replace with %s (value already in %s)" % (placeholder, store)
 
 
@@ -972,6 +1205,9 @@ def print_report(plan, args, style, verified_any):
         for path, detector, reason in plan.skipped:
             say(u"  %-18s %s" % (detector, plan.rel(path)))
             say(u"  %-18s %s" % (u"", style.dim(reason)))
+    if plan.ignored:
+        say(u"")
+        say(style.dim(u"Ignored %d finding(s) inside excluded folders (.git, node_modules, ...)." % plan.ignored))
     say(u"")
     if plan.encrypted:
         say(style.bold(u"Already encrypted with dotenvx (left as is): %d" % len(plan.encrypted)))
@@ -997,7 +1233,13 @@ def print_report(plan, args, style, verified_any):
 
 
 def ask(prompt):
-    sys.stdout.write(prompt)
+    if sys.stdin is None or sys.stdout is None:
+        return u""
+    try:
+        sys.stdout.write(prompt)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+        sys.stdout.write(prompt.encode(encoding, "replace").decode(encoding, "replace"))
     sys.stdout.flush()
     try:
         answer = read_line()
@@ -1011,7 +1253,8 @@ def confirm(plan, args, style):
     """Interactive y/N/select prompt. Returns the list of items to process."""
     if args.yes:
         return list(plan.items)
-    if not sys.stdin.isatty():
+    interactive = sys.stdin is not None and hasattr(sys.stdin, "isatty") and sys.stdin.isatty()
+    if not interactive:
         say(style.dim(u"(stdin is not a terminal; pass --yes to encrypt without asking)"))
     while True:
         answer = ask(style.bold(u"Encrypt these %d secret(s) now? [y/N/s]  (s = choose which): "
@@ -1061,58 +1304,231 @@ def dotenvx_encrypt(dotenvx, env_path, keys, root, args):
         raise ToolError(u"dotenvx exited with status %d: %s" % (code, detail[-1] if detail else u""))
 
 
-def encrypt_env_file(env_path, job, dotenvx, root, args):
-    """Append new entries (if any), encrypt the keys, verify. Restores the file on failure."""
-    existed = os.path.isfile(env_path)
-    original = read_bytes(env_path) if existed else None
-    inexact = []
+def decrypt_env_value(dotenvx, env_path, key, root, args):
+    """Ask dotenvx for the stored value of key: (value, u"") or (None, reason).
+
+    --overload makes the file win over a variable of the same name in our own
+    environment (dotenvx otherwise prefers the environment, even for `get`), and
+    every keys file that may hold the private key is passed with -fk, because on
+    its own dotenvx only looks next to the env file. An undecryptable value comes
+    back as the ciphertext with exit status 0, so the text is checked, not the code."""
+    cmd = [dotenvx, "get", key, "-f", env_path, "--overload"]
+    for keys_file in discover_keys_files([env_path], root):
+        cmd.extend(["-fk", keys_file])
+    if args.verbose:
+        say(u"  $ " + u" ".join(cmd))
     try:
-        if job["new"]:
-            data = original if original is not None else b""
-            if not existed:
-                folder = os.path.dirname(env_path)
-                if folder and not os.path.isdir(folder):
-                    os.makedirs(folder)
-                data = (u"# Created by sweep_and_secure.py; values are encrypted with dotenvx "
-                        u"(https://dotenvx.com)\n").encode("utf-8")
-            newline = b"\r\n" if b"\r\n" in data else b"\n"
-            if data and not data.endswith(b"\n"):
-                data += newline
-            for key, value in job["new"]:
-                quoted, exact = quote_env_value(value)
-                if not exact:
-                    inexact.append(key)
-                data += (u"%s=%s" % (key, quoted)).encode("utf-8") + newline
-            write_bytes(env_path, data)
+        code, out, err = run_command(cmd, cwd=root, extra_env={"DOTENVX_NO_TELEMETRY": "1"})
+    except (OSError, IOError) as exc:
+        return None, u"could not run dotenvx get: %s" % to_text(str(exc))
+    if code != 0:
+        detail = (err.strip() or out.strip()).splitlines()
+        return None, u"dotenvx get %s failed: %s" % (key, detail[-1] if detail else u"status %d" % code)
+    value = out
+    if value.endswith(u"\n"):
+        value = value[:-1]
+    if value.endswith(u"\r"):
+        value = value[:-1]
+    if value.startswith(ENCRYPTED_PREFIX):
+        return None, u"no private key for %s is available here" % key
+    return value, u""
+
+
+def make_decryptor(dotenvx, root, args):
+    """A cached decrypt_env_value(env_path, key) bound to this run's tools."""
+    cache = {}
+
+    def decryptor(env_path, key):
+        ident = (env_path, key)
+        if ident not in cache:
+            cache[ident] = decrypt_env_value(dotenvx, env_path, key, root, args)
+        return cache[ident]
+    return decryptor
+
+
+def make_staging_dir(root):
+    """A scratch folder for the copy dotenvx works on: under the swept root when we
+    may (so that a crash leaves it where the next run cleans it up), else in the
+    system temp folder."""
+    try:
+        return tempfile.mkdtemp(prefix=TEMP_PREFIX, dir=root)
+    except (IOError, OSError):
+        return tempfile.mkdtemp(prefix=TEMP_PREFIX)
+
+
+def adopt_keys_file(staging, env_path):
+    """dotenvx 1.x writes .env.keys next to the file it encrypts, i.e. into the
+    staging folder; move those keys next to the real env file, merging them into
+    a keys file that is already there. Returns that file, or None if nothing was
+    written into the staging folder (dotenvx 2.x writes to the cwd instead)."""
+    staged = os.path.join(staging, ".env.keys")
+    if not os.path.isfile(staged):
+        return None
+    target = os.path.join(os.path.dirname(os.path.abspath(env_path)), ".env.keys")
+    new_lines = read_bytes(staged).splitlines()
+    if os.path.isfile(target):
+        merged = read_bytes(target).splitlines()
+        for line in new_lines:
+            if line.strip() and not line.lstrip().startswith(b"#") and line not in merged:
+                merged.append(line)
+    else:
+        merged = new_lines
+    write_bytes(target, b"\n".join(merged) + b"\n")
+    try:
+        os.chmod(target, 0o600)
+    except (IOError, OSError):
+        pass
+    return target
+
+
+KEYS_HINT_LINE_RE = re.compile(br"^([ \t]*DOTENV_PUBLIC_KEY\w*[ \t]*=.*#[ \t]*-fk[ \t]+)(\S+)", re.M)
+
+
+def fix_keys_hint(data, staged_dir, env_dir):
+    """dotenvx writes '# -fk <path to .env.keys>' relative to the file it encrypted,
+    i.e. to the staging folder; re-point it at the same keys file from the real
+    location of the env file."""
+    def fix(match):
+        hint = to_text(match.group(2))
+        if os.path.isabs(hint):
+            return match.group(0)
+        target = os.path.normpath(os.path.join(staged_dir, hint))
+        try:
+            new_hint = slash_path(os.path.relpath(target, env_dir))
+        except ValueError:  # different drive on Windows
+            new_hint = slash_path(target)
+        return match.group(1) + to_bytes(new_hint)
+    return KEYS_HINT_LINE_RE.sub(fix, data)
+
+
+def verify_decrypts(decryptor, env_path, job, keys, before):
+    """Decrypt every key we touched and compare. Returns (problems, unverifiable):
+    problems are (key, detail) pairs that must fail the file; unverifiable lists the
+    keys for which no private key is at hand (dotenvx can encrypt with a public key
+    alone, which is what a teammate's clone has)."""
+    problems, unverifiable = [], []
+    written = dict(job["new"])
+    for key in keys:
+        value, reason = decryptor(env_path, key)
+        if value is None:
+            if reason.startswith(u"no private key"):
+                unverifiable.append(key)
+            else:
+                problems.append((key, reason))
+            continue
+        if key in written:
+            if value != written[key]:
+                problems.append((key, u"decrypts to something other than the value we stored"))
+            continue
+        # A key that was already in the file: the secret TruffleHog found must be in the
+        # decrypted value. dotenvx expands $NAME and backslash escapes of the original
+        # text on the way out, so such entries can only be checked for being decryptable.
+        wanted = [item.secret for item in job["items"] if item.kind == "env" and item.key == key]
+        raw = before.get(key, u"")
+        if wanted and "$" not in raw and "\\" not in raw and not all(value_holds(value, w) for w in wanted):
+            problems.append((key, u"decrypts to something that does not contain the secret TruffleHog found"))
+    return problems, unverifiable
+
+
+def encrypt_env_file(env_path, job, dotenvx, root, args, decryptor=None, journal=None):
+    """Store and encrypt the keys of one env file without ever writing plaintext to it.
+
+    The file (or a fresh header for a new one) is copied into a staging folder
+    under the swept root, keeping its exact name because dotenvx derives the
+    DOTENV_*_KEY variable names from it; the new entries are appended to the copy;
+    dotenvx encrypts the copy; the result is checked (every key is "encrypted:", no
+    entry still holds a secret in plaintext, and each value decrypts back to what we
+    stored where a private key is at hand); only then is the copy installed over the
+    real file in one atomic rename. If anything fails, the real file has not been
+    touched. Returns (ok, note, warnings).
+    """
+    warnings = []
+    try:
+        staging = make_staging_dir(root)
+    except (IOError, OSError) as exc:
+        return False, u"cannot create a staging folder: %s" % to_text(str(exc)), warnings
+    try:
+        existed = os.path.isfile(env_path)
+        original = read_bytes(env_path) if existed else b""
+        copy = os.path.join(staging, os.path.basename(env_path))
+        data = original
+        if not existed:
+            data = (u"# Created by sweep_and_secure.py; values are encrypted with dotenvx "
+                    u"(https://dotenvx.com)\n").encode("utf-8")
+        if data.startswith(b"\xef\xbb\xbf"):
+            # dotenvx reads past a UTF-8 byte order mark, but once it has prepended its public-key
+            # header the mark sits in the middle of the file, where other dotenv readers choke on
+            # it (the entry behind it is lost). The mark has no business in a .env file: drop it.
+            data = data[3:]
+            warnings.append(u"removed the UTF-8 byte order mark from the start of the file")
+        newline = b"\r\n" if b"\r\n" in data else b"\n"
+        if data and not data.endswith(b"\n"):
+            data += newline
+        for key, value in job["new"]:
+            quoted, exact = quote_env_value(value)
+            if not exact:  # build_plan keeps these out of the plan; never store a mangled value
+                raise ToolError(u"%s cannot be written to a .env file exactly: %s"
+                                % (key, inexact_reason(value)))
+            data += (u"%s=%s" % (key, quoted)).encode("utf-8") + newline
+        with io.open(copy, "wb") as fh:
+            fh.write(data)
+        before = dict((key, value) for key, value, _ in parse_env_entries(to_text(data)))
         keys = []
         for key in job["keys"]:
             if key not in keys:
                 keys.append(key)
-        dotenvx_encrypt(dotenvx, env_path, keys, root, args)
+        dotenvx_encrypt(dotenvx, copy, keys, root, args)
+        adopt_keys_file(staging, env_path)
+        result = read_bytes(copy)
         entries = {}
-        for key, value, _ in parse_env_entries(read_text(env_path)):
+        for key, value, _ in parse_env_entries(to_text(result)):
             entries[key] = value
         not_done = [key for key in keys if not entries.get(key, u"").startswith(ENCRYPTED_PREFIX)]
         if not_done:
             raise ToolError(u"dotenvx finished but these keys are still plaintext: " + u", ".join(not_done))
+        secrets = [value for _, value in job["new"]] + [item.secret for item in job["items"]]
+        leftover = sorted(set(key for key, value in entries.items()
+                              if not value.startswith(ENCRYPTED_PREFIX)
+                              and any(value_holds(value, secret) for secret in secrets if secret)))
+        if leftover:
+            raise ToolError(u"dotenvx finished but these entries still hold a secret in plaintext: "
+                            + u", ".join(leftover))
+        if decryptor is not None:
+            problems, unverifiable = verify_decrypts(decryptor, copy, job, keys, before)
+            if problems:
+                raise ToolError(u"verification failed: " + u"; ".join(u"%s %s" % p for p in problems))
+            if unverifiable:
+                warnings.append(u"could not verify %s: no private key for this file is available here;"
+                                u" check the values where it is" % u", ".join(unverifiable))
+        result = fix_keys_hint(result, staging, os.path.dirname(os.path.abspath(env_path)))
+        folder = os.path.dirname(env_path)
+        if folder and not os.path.isdir(folder):
+            os.makedirs(folder)
+        write_bytes(env_path, result)   # atomic, and the only write to the real path
+        if journal is not None:
+            journal.add("env", env_path, keys)
     except (ToolError, IOError, OSError) as exc:
-        restore_file(env_path, original)
-        return False, to_text(str(exc)), inexact
-    except KeyboardInterrupt:  # Ctrl-C while dotenvx runs: never leave staged plaintext behind
-        restore_file(env_path, original)
-        raise
-    return True, u"", inexact
+        return False, to_text(str(exc)), warnings
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return True, u"", warnings
 
 
-def restore_file(path, original):
-    """Put a file back the way it was: original bytes, or gone if it did not exist."""
-    if original is not None:
-        write_bytes(path, original)
-    elif os.path.isfile(path):
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+class Journal(object):
+    """What this run changed on disk, so that an interrupted or failed run can say so."""
+
+    def __init__(self):
+        self.events = []   # (kind, path, detail)
+
+    def add(self, kind, path, detail=None):
+        self.events.append((kind, path, detail))
+
+    def paths(self, kind):
+        out = []
+        for event_kind, path, _ in self.events:
+            if event_kind == kind and path not in out:
+                out.append(path)
+        return out
 
 
 def rewrite_source(path, items, args):
@@ -1132,7 +1548,7 @@ def rewrite_source(path, items, args):
     return total
 
 
-def execute(plan, chosen, dotenvx, args, style):
+def execute(plan, chosen, dotenvx, args, style, decryptor=None, journal=None):
     env_jobs = OrderedDict()
 
     def job_for(path):
@@ -1190,13 +1606,12 @@ def execute(plan, chosen, dotenvx, args, style):
                 keys.append(key)
         if not keys:
             continue
-        ok, note, inexact = encrypt_env_file(env_path, job, dotenvx, plan.root, args)
+        ok, note, warnings = encrypt_env_file(env_path, job, dotenvx, plan.root, args, decryptor, journal)
         if ok:
             say(u"  %s %s: encrypted %d key(s): %s" % (style.ok("[ok]"), plan.rel(env_path), len(keys),
                                                       u", ".join(keys)))
-            for key in inexact:
-                say(u"  %s %s: %s contains quotes and $ signs; check it with: dotenvx get %s -f %s"
-                    % (style.warn("[!!]"), plan.rel(env_path), key, key, plan.rel(env_path)))
+            for warning in warnings:
+                say(u"  %s %s: %s" % (style.warn("[!!]"), plan.rel(env_path), warning))
         else:
             failed_stores.add(env_path)
             say(u"  %s %s: %s" % (style.bad("[!!]"), plan.rel(env_path), note))
@@ -1225,6 +1640,8 @@ def execute(plan, chosen, dotenvx, args, style):
             say(u"  %s %s: %s" % (style.bad("[!!]"), plan.rel(path), to_text(str(exc))))
             continue
         names = u", ".join(sorted(set(item.key for item in items if item.status == "done")))
+        if total and journal is not None:
+            journal.add("source", path, names)
         say(u"  %s %s: replaced %d occurrence(s) of %d secret(s) with placeholders (%s)"
             % (style.ok("[ok]"), plan.rel(path), total,
                len([it for it in items if it.status == "done"]), names))
@@ -1268,6 +1685,27 @@ def discover_keys_files(env_paths, root):
     return found
 
 
+def keys_file_for(env_path, keys_files):
+    """The keys file holding the private key of env_path: dotenvx names the key after
+    the env file (DOTENV_PRIVATE_KEY_PRODUCTION for .env.production), so look for the
+    name that matches the public key the env file carries."""
+    if not keys_files:
+        return None
+    try:
+        match = re.search(r"^\s*DOTENV_PUBLIC_KEY(\w*)\s*=", read_text(env_path), re.M)
+    except (IOError, OSError):
+        match = None
+    if match:
+        wanted = u"DOTENV_PRIVATE_KEY" + match.group(1)
+        for keys_file in keys_files:
+            try:
+                if re.search(r"^\s*%s\s*=" % re.escape(wanted), read_text(keys_file), re.M):
+                    return keys_file
+            except (IOError, OSError):
+                continue
+    return keys_files[0]
+
+
 def git_ignores(git_root, path):
     """Ask git whether path is ignored: True / False, or None when git cannot tell."""
     git = which("git")
@@ -1287,23 +1725,36 @@ def ensure_gitignore(git_root, keys_files):
 
     Asks git itself (`git check-ignore`) so nested .gitignore files and negated
     rules are honoured; without git, falls back to looking for a matching line.
+    The files need not exist yet: this runs before dotenvx writes them.
     """
     ignore_path = os.path.join(git_root, ".gitignore")
-    existing = read_text(ignore_path) if os.path.isfile(ignore_path) else u""
+    if os.path.islink(ignore_path):
+        ignore_path = os.path.realpath(ignore_path)
+    existing = read_bytes(ignore_path) if os.path.isfile(ignore_path) else b""
+    names = []
+    for keys_file in keys_files:
+        try:
+            name = slash_path(os.path.relpath(keys_file, git_root))
+        except ValueError:
+            name = slash_path(keys_file)
+        if name not in names:
+            names.append(name)
     verdicts = [git_ignores(git_root, keys_file) for keys_file in keys_files]
     if verdicts and all(verdict is True for verdict in verdicts):
-        return False, u"git already ignores %s" % u", ".join(os.path.basename(k) for k in keys_files)
+        return False, u"git already ignores %s" % u", ".join(names)
     if any(verdict is None for verdict in verdicts):
-        patterns = set(line.strip() for line in existing.splitlines())
+        patterns = set(line.strip() for line in to_text(existing).splitlines())
         if patterns & set([".env.keys", ".env.keys*", ".env*", ".env.*", "*.keys", "/.env.keys", "**/.env.keys"]):
             return False, u".gitignore already ignores .env.keys"
-    data = to_bytes(existing)
+    newline = b"\r\n" if b"\r\n" in existing else b"\n"
+    data = existing
     if data and not data.endswith(b"\n"):
-        data += b"\n"
+        data += newline
     # Appended last, so it wins over any earlier negated rule in this file.
-    data += b"\n# dotenvx private decryption keys - never commit (added by sweep_and_secure.py)\n.env.keys*\n"
+    data += newline + b"# dotenvx private decryption keys - never commit (added by sweep_and_secure.py)" + newline
+    data += b".env.keys*" + newline
     write_bytes(ignore_path, data)
-    still_visible = [os.path.basename(k) for k in keys_files if git_ignores(git_root, k) is False]
+    still_visible = [name for name, keys_file in zip(names, keys_files) if git_ignores(git_root, keys_file) is False]
     if still_visible:
         return True, (u"added .env.keys* to %s, but git STILL does not ignore %s - look for a negated"
                       u" rule in a nested .gitignore" % (ignore_path, u", ".join(still_visible)))
@@ -1347,12 +1798,17 @@ def print_next_steps(plan, chosen, keys_files, args, style):
                u" the environment." % len(set(item.path for item in stored_only)))
     if env_touched:
         bullet(u"Run your app through dotenvx so the values are decrypted at run time:")
+        needs_fk = False
         for env_path in env_touched:
             rel = plan.rel(env_path)
-            if rel == ".env":
-                say(u"       dotenvx run -- <your command>")
-            else:
-                say(u"       dotenvx run -f %s -- <your command>" % rel)
+            command = u"dotenvx run" if rel == ".env" else u"dotenvx run -f %s" % rel
+            keys_file = keys_file_for(env_path, keys_files)
+            if keys_file and os.path.dirname(keys_file) != os.path.dirname(env_path):
+                command += u" -fk %s" % plan.rel(keys_file)
+                needs_fk = True
+            say(u"       %s -- <your command>" % command)
+        if needs_fk:
+            say(u"     (dotenvx only looks for .env.keys next to the env file; -fk points it at the one it wrote)")
     if keys_files:
         bullet(u"The private decryption key lives in %s." % u", ".join(plan.rel(k) for k in keys_files))
         say(u"     NEVER commit it. Share it through a password manager or your CI's secret store")
@@ -1425,6 +1881,8 @@ def parse_args(argv):
                         help="ignore secrets shorter than N characters (default: 8)")
     parser.add_argument("--trufflehog", metavar="PATH", help="trufflehog executable (default: search PATH)")
     parser.add_argument("--dotenvx", metavar="PATH", help="dotenvx executable (default: search PATH)")
+    parser.add_argument("--no-version-check", action="store_true",
+                        help="use a tool even if its --version could not be read")
     parser.add_argument("-v", "--verbose", action="store_true", help="show the commands run and tool output")
     parser.add_argument("--no-color", action="store_true", help="plain output")
     parser.add_argument("--version", action="version", version="%(prog)s " + __version__)
@@ -1436,9 +1894,99 @@ def parse_args(argv):
     return args
 
 
+def protect_keys_files_early(git_root, root, chosen, style):
+    """Before anything is encrypted: make sure git will ignore the private key files
+    dotenvx is about to write, so that a crash half way cannot leave them exposed."""
+    candidates = [os.path.join(root, ".env.keys")]
+    for item in chosen:
+        if item.store:
+            candidate = os.path.join(os.path.dirname(item.store), ".env.keys")
+            if candidate not in candidates:
+                candidates.append(candidate)
+    try:
+        changed, message = ensure_gitignore(git_root, candidates)
+    except (IOError, OSError) as exc:
+        say(u"  %s could not update .gitignore: %s" % (style.warn("[!!]"), to_text(str(exc))))
+        return
+    say(u"  %s %s" % (style.ok("[ok]") if changed else style.dim("[--]"), message))
+
+
+def wrap_up(plan, chosen, journal, root, git_root, args, style, failed, error, scan_incomplete):
+    """After execute(), however it ended: protect the private key files, then say what
+    the state of the tree is - the normal summary and next steps, or exactly what an
+    interrupted or failed run left behind."""
+    env_paths = journal.paths("env")
+    for item in chosen:
+        if item.store and item.status in ("done", "stored") and item.store not in env_paths:
+            env_paths.append(item.store)
+    keys_files = discover_keys_files(env_paths, root)
+    if keys_files:
+        say(u"")
+        for keys_file in keys_files:
+            say(u"  %s private key file: %s" % (style.ok("[ok]"), plan.rel(keys_file)))
+            if git_root and git_tracked(git_root, keys_file):
+                say(u"  %s %s is TRACKED BY GIT. Remove it from the index now:  git rm --cached %s"
+                    % (style.bad("[!!]"), plan.rel(keys_file), plan.rel(keys_file)))
+        if git_root:
+            try:
+                changed, message = ensure_gitignore(git_root, keys_files)
+                if changed or u"STILL" in message:
+                    say(u"  %s %s" % (style.warn("[!!]") if u"STILL" in message else style.ok("[ok]"), message))
+            except (IOError, OSError) as exc:
+                say(u"  %s could not update .gitignore: %s" % (style.warn("[!!]"), to_text(str(exc))))
+        else:
+            say(u"  %s not a git repository: keep .env.keys out of any backups or shares you make."
+                % style.warn("[--]"))
+
+    if error is not None:
+        env_written = journal.paths("env")
+        source_written = journal.paths("source")
+        say(u"")
+        say(style.bad(u"Stopped early (%s). State of the tree:" % error))
+        if not env_written and not source_written:
+            say(u"  nothing was changed.")
+        for path in env_written:
+            say(u"  encrypted and saved:   %s" % plan.rel(path))
+        for path in source_written:
+            say(u"  placeholders written:  %s" % plan.rel(path))
+        pending = OrderedDict()
+        for item in chosen:
+            if item.kind == "source" and item.status == "planned" and item.store in env_written:
+                pending.setdefault(plan.rel(item.path), []).append(item.key)
+        for path, keys in pending.items():
+            say(u"  still plaintext:       %s (%s; the value is already stored encrypted)"
+                % (path, u", ".join(sorted(set(keys)))))
+        if pending:
+            say(u"  Run again to finish: stored values are recognised and reused, not duplicated.")
+        return
+
+    stored = set((item.store, item.key) for item in chosen if item.status in ("done", "stored"))
+    sources = [item for item in chosen if item.kind == "source"]
+    removed = sum(item.replaced for item in sources if item.status == "done")
+    removed_files = len(set(item.path for item in sources if item.status == "done"))
+    skipped = [item for item in sources if item.status == "skipped"]
+    parts = [u"%d secret(s) stored encrypted" % len(stored)]
+    if sources and not args.no_rewrite:
+        parts.append(u"%d plaintext occurrence(s) removed from %d file(s)" % (removed, removed_files))
+    if failed:
+        parts.append(u"%d failed" % len(failed))
+    if skipped:
+        parts.append(u"%d rewrite(s) skipped (text no longer present)" % len(skipped))
+    if plan.skipped:
+        parts.append(u"%d need manual attention (see above)" % len(plan.skipped))
+    summary = u"Done: " + u"; ".join(parts)
+    if scan_incomplete:
+        summary += u"; the TruffleHog scan was incomplete, run again"
+    say(u"")
+    say(style.bold(summary))
+    if any(item.status in ("done", "stored") for item in chosen):
+        print_next_steps(plan, chosen, keys_files, args, style)
+
+
 def main(argv=None):
     args = parse_args(argv)
     style = Style(colour_wanted(args.no_color))
+    configure_streams()
     root = os.path.abspath(fs_text(args.path))
     if not os.path.isdir(root):
         say(style.bad(u"[!!] %s is not a folder." % root), sys.stderr)
@@ -1447,6 +1995,8 @@ def main(argv=None):
     if not os.path.isabs(store):
         store = os.path.join(root, store)
     store = os.path.normpath(store)
+    if os.path.islink(store):
+        store = os.path.realpath(store)
 
     say(style.bold(u"sweep-and-secure %s" % __version__) + style.dim(u"  (TruffleHog + dotenvx)"))
     say(u"Folder: %s" % root)
@@ -1474,8 +2024,16 @@ def main(argv=None):
                       u" probably INCOMPLETE. What it did report is handled below; the exit code will be 1."
                       % code))
 
-    encrypted, plaintext = inventory_env_files(root, exclude_res)
-    plan = build_plan(findings, root, store, args, plaintext)
+    encrypted, plaintext, stale = inventory_env_files(root, exclude_res)
+    if stale:
+        names = u", ".join(slash_path(os.path.relpath(path, root)) for path in stale)
+        if args.dry_run:
+            say(style.dim(u"Leftover staging file(s) from an interrupted run would be removed: %s" % names))
+        else:
+            removed = remove_stale(stale)
+            say(style.dim(u"Removed %d leftover staging file(s) from an interrupted run: %s" % (len(removed), names)))
+    decryptor = make_decryptor(tools["dotenvx"]["path"], root, args)
+    plan = build_plan(findings, root, store, args, plaintext, exclude_res, decryptor)
     plan.encrypted = encrypted
     plan.plain_env = plaintext
     print_report(plan, args, style, any(f.verified for f in findings))
@@ -1495,43 +2053,24 @@ def main(argv=None):
         say(u"Nothing encrypted.")
         return 2
 
-    failed = execute(plan, chosen, tools["dotenvx"]["path"], args, style)
-
-    env_paths = []
-    for item in chosen:
-        if item.status in ("done", "stored") and item.store and item.store not in env_paths:
-            env_paths.append(item.store)
-    keys_files = discover_keys_files(env_paths, root)
+    journal = Journal()
     git_root = find_git_root(root)
-    if keys_files:
-        say(u"")
-        for keys_file in keys_files:
-            say(u"  %s private key file: %s" % (style.ok("[ok]"), plan.rel(keys_file)))
-            if git_root and git_tracked(git_root, keys_file):
-                say(u"  %s %s is TRACKED BY GIT. Remove it from the index now:  git rm --cached %s"
-                    % (style.bad("[!!]"), plan.rel(keys_file), plan.rel(keys_file)))
-        if git_root:
-            try:
-                changed, message = ensure_gitignore(git_root, keys_files)
-                say(u"  %s %s" % (style.ok("[ok]") if changed else style.dim("[--]"), message))
-            except (IOError, OSError) as exc:
-                say(u"  %s could not update .gitignore: %s" % (style.warn("[!!]"), to_text(str(exc))))
-        else:
-            say(u"  %s not a git repository: keep .env.keys out of any backups or shares you make."
-                % style.warn("[--]"))
-
-    done = [item for item in chosen if item.status in ("done", "stored")]
-    say(u"")
-    summary = u"Done: %d secret(s) encrypted" % len(done)
-    if failed:
-        summary += u", %d failed" % len(failed)
-    if plan.skipped:
-        summary += u", %d need manual attention (see above)" % len(plan.skipped)
-    if scan_incomplete:
-        summary += u"; the TruffleHog scan was incomplete, run again"
-    say(style.bold(summary))
-    if done:
-        print_next_steps(plan, chosen, keys_files, args, style)
+    if git_root:
+        protect_keys_files_early(git_root, root, chosen, style)
+    failed, error = [], None
+    try:
+        failed = execute(plan, chosen, tools["dotenvx"]["path"], args, style, decryptor, journal)
+    except KeyboardInterrupt:
+        error = u"interrupted"
+        raise
+    except Exception as exc:  # a bug or an unforeseen failure must not end in a bare traceback
+        error = u"unexpected error: %s" % to_text(repr(exc))
+        say(style.bad(u"[!!] %s" % error), sys.stderr)
+        traceback.print_exc()
+    finally:
+        wrap_up(plan, chosen, journal, root, git_root, args, style, failed, error, scan_incomplete)
+    if error is not None:
+        return 1
     return 1 if (failed or scan_incomplete) else 0
 
 
@@ -1539,5 +2078,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except KeyboardInterrupt:
-        say(u"\nInterrupted; nothing further was changed.", sys.stderr)
+        say(u"\nInterrupted.", sys.stderr)
         sys.exit(130)
