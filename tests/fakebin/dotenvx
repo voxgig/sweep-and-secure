@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""A stand-in for dotenvx used by the test-suite (no real cryptography!).
+
+It understands just enough of the real command line:
+
+    dotenvx --version
+    dotenvx encrypt -f FILE -k KEY [-k KEY ...]   KEY=value -> KEY="encrypted:<base64>"
+                                                  and writes ./.env.keys (in the cwd, like dotenvx 2.x)
+    dotenvx get KEY -f FILE                       prints the decoded value
+
+Environment knobs:
+    FAKE_DOTENVX_VERSION   version to report (default 2.0.0)
+    FAKE_DOTENVX_FAIL=1    encrypt exits with status 1 without touching anything
+    FAKE_DOTENVX_NOOP=1    encrypt exits with status 0 but changes nothing
+"""
+from __future__ import print_function
+
+import base64
+import io
+import os
+import re
+import sys
+
+ENTRY = re.compile(r"^(\s*(?:export\s+)?)([A-Za-z_][A-Za-z0-9_.\-]*)(\s*=\s*)(.*)$")
+
+
+def closing_quote(body, quote):
+    i = 0
+    while i < len(body):
+        if body[i] == "\\":
+            i += 2
+            continue
+        if body[i] == quote:
+            return i
+        i += 1
+    return -1
+
+
+def entries(lines):
+    """Yield (first_line_index, last_line_index, key, value)."""
+    i = 0
+    while i < len(lines):
+        match = ENTRY.match(lines[i])
+        if not match:
+            i += 1
+            continue
+        key, rest = match.group(2), match.group(4).strip()
+        start = i
+        if rest[:1] in ("'", '"', "`"):
+            quote, body = rest[0], rest[1:]
+            end = closing_quote(body, quote)
+            while end < 0 and i + 1 < len(lines):
+                i += 1
+                body += "\n" + lines[i]
+                end = closing_quote(body, quote)
+            value = body[:end] if end >= 0 else body
+        else:
+            value = rest.split("#", 1)[0].strip()
+        yield start, i, key, value
+        i += 1
+
+
+def options(argv, flags):
+    values, i = [], 0
+    while i < len(argv):
+        if argv[i] in flags and i + 1 < len(argv):
+            values.append(argv[i + 1])
+            i += 2
+        else:
+            i += 1
+    return values
+
+
+def encrypt(argv):
+    files = options(argv, ("-f", "--file", "--env-file")) or [".env"]
+    keys = options(argv, ("-k", "--key"))
+    if os.environ.get("FAKE_DOTENVX_FAIL"):
+        sys.stderr.write("fake dotenvx: simulated failure\n")
+        return 1
+    if os.environ.get("FAKE_DOTENVX_NOOP"):
+        return 0
+    keys_file = os.path.join(os.getcwd(), ".env.keys")
+    for path in files:
+        with io.open(path, encoding="utf-8") as fh:
+            lines = fh.read().split("\n")
+        found = dict((start, (end, key, value)) for start, end, key, value in entries(lines))
+        out, i = [], 0
+        while i < len(lines):
+            if i in found:
+                end, key, value = found[i]
+                wanted = (not keys or key in keys) and not key.startswith("DOTENV_")
+                if wanted and not value.startswith("encrypted:"):
+                    encoded = base64.b64encode(value.encode("utf-8")).decode("ascii")
+                    out.append('%s="encrypted:%s"' % (key, encoded))
+                    i = end + 1
+                    continue
+            out.append(lines[i])
+            i += 1
+        text = "\n".join(out)
+        if "DOTENV_PUBLIC_KEY" not in text:
+            hint = os.path.relpath(keys_file, os.path.dirname(os.path.abspath(path))).replace(os.sep, "/")
+            text = 'DOTENV_PUBLIC_KEY="02fake" # -fk %s\n%s' % (hint, text)
+        with io.open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        if not os.path.exists(keys_file):
+            with io.open(keys_file, "w", encoding="utf-8") as fh:
+                fh.write(u"DOTENV_PRIVATE_KEY=fakeprivatekey\n")
+        print("encrypted %s (fake)" % path)
+    return 0
+
+
+def get(argv):
+    key = argv[0]
+    path = (options(argv, ("-f", "--file", "--env-file")) or [".env"])[0]
+    with io.open(path, encoding="utf-8") as fh:
+        lines = fh.read().split("\n")
+    for _, _, name, value in entries(lines):
+        if name == key:
+            if value.startswith("encrypted:"):
+                value = base64.b64decode(value[len("encrypted:"):].encode("ascii")).decode("utf-8")
+            sys.stdout.write(value + "\n")
+            return 0
+    sys.stderr.write("fake dotenvx: %s not found in %s\n" % (key, path))
+    return 1
+
+
+def main(argv):
+    if "--version" in argv:
+        print(os.environ.get("FAKE_DOTENVX_VERSION", "2.0.0"))
+        return 0
+    if argv and argv[0] == "encrypt":
+        return encrypt(argv[1:])
+    if argv and argv[0] == "get":
+        return get(argv[1:])
+    sys.stderr.write("fake dotenvx: unsupported arguments %r\n" % (argv,))
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
