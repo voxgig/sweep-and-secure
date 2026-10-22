@@ -252,6 +252,50 @@ class EndToEndTests(unittest.TestCase):
             self.assertIn(needle, err)
         self.assertUnchanged()
 
+    def test_check_setup_reports_the_tools_and_runs_them_without_touching_the_tree(self):
+        scratch_before = set(name for name in os.listdir(tempfile.gettempdir())
+                             if name.startswith("sweep-and-secure-check-"))
+        code, out, err = run_script(self.tree.root, ["--check-setup"])
+        self.assertEqual(code, 0, out + err)
+        for needle in ("Python %d.%d" % sys.version_info[:2], "[ok] trufflehog  3.99.0", "[ok] dotenvx     2.0.0",
+                       "trufflehog  ran in a scratch folder: exit status 0, 1 file(s) scanned, no findings",
+                       "dotenvx     ran in a scratch folder: encrypted a value, decrypted it back, wrote .env.keys",
+                       "Setup looks good. Nothing was changed."):
+            self.assertIn(needle, out)
+        self.assertNotIn("Scanning with TruffleHog", out)   # the tree itself is never scanned
+        self.assertNotIn("Plaintext secrets", out)
+        self.assertUnchanged()
+        self.assertNoLeftovers()
+        self.assertFalse(os.path.exists(self.tree.path(".env.keys")))
+        scratch_after = set(name for name in os.listdir(tempfile.gettempdir())
+                            if name.startswith("sweep-and-secure-check-"))
+        self.assertEqual(scratch_after - scratch_before, set())   # the scratch folder was removed
+
+    def test_check_setup_reports_every_problem_and_exits_1(self):
+        empty = tempfile.mkdtemp(prefix="sweep-empty-")
+        try:
+            code, out, err = run_script(self.tree.root, ["--check-setup"], path=empty)
+        finally:
+            shutil.rmtree(empty, ignore_errors=True)
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("trufflehog is not installed", err)
+        self.assertIn("dotenvx is not installed", err)        # both are reported, not just the first
+        self.assertIn("https://dotenvx.com", err)
+        self.assertIn("Setup check failed: 2 problem(s)", out)
+        self.assertNotIn("Cannot continue", err)
+        # a tool that is found but fails its scratch run is a problem too; the other tool is still checked
+        code, out, err = run_script(self.tree.root, ["--check-setup"], extra_env={"FAKE_TRUFFLEHOG_FAIL": "1"})
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("trufflehog could not scan a scratch folder", err)
+        self.assertIn("dotenvx     ran in a scratch folder", out)
+        self.assertIn("Setup check failed: 1 problem(s)", out)
+        code, out, err = run_script(self.tree.root, ["--check-setup"], extra_env={"FAKE_DOTENVX_FAIL": "1"})
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("dotenvx could not encrypt a value in a scratch folder", err)
+        self.assertIn("trufflehog  ran in a scratch folder", out)
+        self.assertUnchanged()
+        self.assertNoLeftovers()
+
     def test_too_old_dotenvx_is_rejected(self):
         code, out, err = run_script(self.tree.root, ["--dry-run"], extra_env={"FAKE_DOTENVX_VERSION": "0.44.1"})
         self.assertEqual(code, 1)
@@ -271,7 +315,6 @@ class EndToEndTests(unittest.TestCase):
     def test_dry_run_lists_findings_with_types_and_already_encrypted_keys(self):
         code, out, err = run_script(self.tree.root, ["--dry-run"])
         self.assertEqual(code, 0, out + err)
-        self.assertIn("Plaintext secrets found: 11 in 8 file(s)", out)
         for needle in ("Stripe", "STRIPE_SECRET_KEY", "encrypt in place",
                        "AWS", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
                        "Postgres", "DATABASE_URL", "SlackWebhook", "SLACK_WEBHOOK",
@@ -281,11 +324,19 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("Already encrypted with dotenvx", out)
         self.assertIn("DB_PASSWORD", out)
         self.assertIn("config/.env.production", out)
-        self.assertIn("build/blob.txt.gz", out)          # archives: listed as not fixable without --quarantine
-        self.assertIn("build/keys.zip", out)
+        # an interactive run offers to quarantine the archives, and a dry run previews that
+        self.assertIn("move to .secrets-quarantine/build/blob.txt.gz", out)
+        self.assertIn("move to .secrets-quarantine/build/keys.zip", out)
+        self.assertIn("Archives holding secrets are offered for moving to .secrets-quarantine", out)
+        self.assertIn("Plaintext secrets found: 13 in 10 file(s)", out)
+        # a --yes run leaves them alone unless --quarantine is given, and the preview says so
+        code, out, err = run_script(self.tree.root, ["--dry-run", "--yes"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("Plaintext secrets found: 11 in 8 file(s)", out)
         self.assertIn("gzip archive with a secret inside", out)
         self.assertIn("zip archive with a secret inside", out)
         self.assertIn("pass --quarantine", out)
+        self.assertNotIn("offered for moving", out)
         self.assertTrue(re.search(r"Scanned \d+ file\(s\) in \d+:\d\d; TruffleHog reported \d+ finding\(s\)", out), out)
         self.assertNotIn("node_modules/pkg/.env", out)   # excluded by default
         self.assertIn("Other plaintext keys", out)       # PORT, APP_NAME, LOG_LEVEL
@@ -298,9 +349,28 @@ class EndToEndTests(unittest.TestCase):
     def test_answering_no_changes_nothing(self):
         code, out, err = run_script(self.tree.root, [], stdin_text="n\n")
         self.assertEqual(code, 2, out + err)
-        self.assertIn("Encrypt these 11 secret(s) now?", out)
+        self.assertIn("Encrypt 11 secret(s) and move 2 archive(s) to quarantine now?", out)
         self.assertIn("Nothing encrypted", out)
         self.assertUnchanged()
+
+    def test_interactive_yes_also_quarantines_archives_without_the_flag(self):
+        code, out, err = run_script(self.tree.root, [], stdin_text="y\n")
+        self.assertEqual(code, 0, out + err)
+        for rel in ("build/keys.zip", "build/blob.txt.gz"):
+            self.assertFalse(os.path.exists(self.tree.path(rel)), rel)
+            self.assertTrue(os.path.isfile(self.tree.path(".secrets-quarantine/" + rel)), rel)
+        self.assertIn("2 archive(s) moved to .secrets-quarantine", out)
+        self.assertIn("/.secrets-quarantine/", self.tree.read(".gitignore"))
+        self.assertTrue(encrypted("STRIPE_SECRET_KEY", self.tree.read(".env")))
+
+    def test_selecting_leaves_unpicked_archives_in_place(self):
+        _, listing, _ = run_script(self.tree.root, ["--dry-run"])
+        number = item_number(listing, "AWS", "AWS_SECRET_ACCESS_KEY")
+        code, out, err = run_script(self.tree.root, [], stdin_text="s\n%s\ny\n" % number)
+        self.assertEqual(code, 0, out + err)
+        self.assertTrue(os.path.isfile(self.tree.path("build/keys.zip")))
+        self.assertFalse(os.path.exists(self.tree.path(".secrets-quarantine")))
+        self.assertIn("${AWS_SECRET_ACCESS_KEY}", self.tree.read("src/settings.py"))
 
     def test_yes_encrypts_env_files_in_place_and_moves_other_secrets(self):
         code, out, err = run_script(self.tree.root, ["--yes"])
@@ -1163,6 +1233,16 @@ class RealToolsTests(unittest.TestCase):
         self.assertIn('AWS_ACCESS_KEY_ID = "${AWS_ACCESS_KEY_ID}"', self.tree.read("src/settings.py"))
         self.assertTrue(os.path.isfile(self.tree.path(".env.keys")))
         self.assertIn(".env.keys*", self.tree.read(".gitignore"))
+        self.assertEqual(self.tree.leftovers(), [])
+
+    def test_check_setup_passes_with_the_real_tools(self):
+        code, out, err = run_script(self.tree.root, ["--check-setup"], path=self.path)
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("[ok] trufflehog  3.", out)
+        self.assertIn("[ok] dotenvx ", out)
+        self.assertIn("trufflehog  ran in a scratch folder: exit status 0, 1 file(s) scanned, no findings", out)
+        self.assertIn("dotenvx     ran in a scratch folder: encrypted a value, decrypted it back, wrote .env.keys", out)
+        self.assertIn("Setup looks good", out)
         self.assertEqual(self.tree.leftovers(), [])
 
     def test_quoting_round_trips_through_real_dotenvx(self):

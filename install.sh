@@ -123,4 +123,4 @@ case ":${PATH:-}:" in
     *":$BINDIR:"*) ;;
     *) say "  $BINDIR is not on your PATH; add it, or run $BINDIR/$NAME directly." ;;
 esac
-say "Next: install TruffleHog and dotenvx (see https://github.com/$REPO#requirements), then run: $NAME --dry-run"
+say "Next: install TruffleHog and dotenvx (see https://github.com/$REPO#requirements), then check the setup with: $NAME --check-setup"

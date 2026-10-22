@@ -34,6 +34,7 @@ import hashlib
 import io
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -44,7 +45,7 @@ import time
 import traceback
 from collections import OrderedDict, deque
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 # --------------------------------------------------------------------------
 # Python 2 / 3 compatibility
@@ -667,7 +668,10 @@ def complain_about_tool(name, problem, style):
     say(u"", sys.stderr)
 
 
-def locate_tools(args, root, style):
+def locate_tools(args, root, style, keep_going=False):
+    """Find TruffleHog and dotenvx, print one [ok] line each and return them. A missing or
+    unusable tool is explained with install links and ends the run with exit code 1, unless
+    keep_going is set: the setup check then reports every tool and returns (found, problems)."""
     found = {}
     problems = 0
     for name, info in TOOLS.items():
@@ -691,11 +695,122 @@ def locate_tools(args, root, style):
         say(u"  %s %-11s %-10s %s" % (style.ok("[ok]"), name,
                                       ".".join(str(v) for v in version) if version else "?",
                                       style.dim(path)))
+    if keep_going:
+        return found, problems
     if problems:
         say(style.bad(u"Cannot continue: %d required tool(s) missing. Install them and run me again."
                       % problems), sys.stderr)
         sys.exit(1)
     return found
+
+
+# --------------------------------------------------------------------------
+# --check-setup: is this machine ready?
+# --------------------------------------------------------------------------
+
+def check_setup(args, root, style):
+    """Report Python, the two tools and git, then run TruffleHog and dotenvx in a scratch
+    folder the way a real run uses them. Nothing under root is read or written. Exit code
+    0 means a real run will find everything it needs; 1 names what is missing or broken."""
+    say(u"Python %s (%s) on %s" % (platform.python_version(), fs_text(sys.executable or u"?"), platform.platform()))
+    if sys.version_info < (3, 8):
+        say(u"  %s Python %d.%d is older than the versions this script is tested with (3.8 to 3.13)."
+            % (style.warn("[--]"), sys.version_info[0], sys.version_info[1]))
+    tools, problems = locate_tools(args, root, style, keep_going=True)
+    git = which("git")
+    if git:
+        version, text = tool_version(git)
+        say(u"  %s %-11s %-10s %s" % (style.ok("[ok]"), "git",
+                                      ".".join(str(v) for v in version) if version else "?",
+                                      style.dim(u"%s  (optional: keeps .env.keys out of commits)" % fs_text(git))))
+    else:
+        say(u"  %s %-11s %s" % (style.warn("[--]"), "git",
+                                style.dim(u"not found  (optional: .gitignore is still written; git cannot confirm it)")))
+    scratch = None
+    try:
+        try:
+            scratch = tempfile.mkdtemp(prefix="sweep-and-secure-check-")
+        except (IOError, OSError) as exc:
+            say(style.bad(u"[!!] cannot create a scratch folder in the system temp folder: %s"
+                          % to_text(str(exc))), sys.stderr)
+            problems += 1
+        if scratch and "trufflehog" in tools:
+            problems += 0 if check_trufflehog(tools["trufflehog"]["path"], scratch, args, style) else 1
+        if scratch and "dotenvx" in tools:
+            problems += 0 if check_dotenvx(tools["dotenvx"]["path"], scratch, args, style) else 1
+    finally:
+        if scratch:
+            shutil.rmtree(scratch, ignore_errors=True)
+    say(u"")
+    if problems:
+        say(style.bad(u"Setup check failed: %d problem(s), see above. Nothing was changed." % problems))
+        return 1
+    say(style.ok(u"Setup looks good.") + u" Nothing was changed. Next: %s --dry-run in a project folder."
+        % (os.path.basename(sys.argv[0]) if sys.argv and sys.argv[0] else "sweep-and-secure"))
+    return 0
+
+
+def check_trufflehog(binary, scratch, args, style):
+    """Scan a scratch folder holding one harmless file with the exact TruffleHog command a
+    run uses. Proves the binary runs here and accepts the options; the file count proves the
+    progress signal (its per-file log lines) is understood."""
+    probe = os.path.join(scratch, "probe.txt")
+    try:
+        with io.open(probe, "w", encoding="utf-8") as fh:
+            fh.write(u"sweep-and-secure setup check: this file holds no secret\n")
+    except (IOError, OSError) as exc:
+        say(style.bad(u"[!!] trufflehog check skipped: cannot write %s (%s)" % (probe, to_text(str(exc)))),
+            sys.stderr)
+        return False
+    progress = ScanProgress(stream=None)
+    try:
+        findings, code = run_trufflehog(binary, scratch, list(ALWAYS_EXCLUDES), args, progress)
+    except ToolError as exc:
+        say(style.bad(u"[!!] trufflehog could not scan a scratch folder: %s" % to_text(str(exc))), sys.stderr)
+        return False
+    if progress.files < 1:
+        say(style.bad(u"[!!] trufflehog scanned the scratch folder but did not report the file in it;"
+                      u" its progress output is not what this version of the script understands"
+                      u" (the scan would still run, but without a live file count)."), sys.stderr)
+        return False
+    if findings:
+        say(style.bad(u"[!!] trufflehog reported %d finding(s) in a file that holds no secret; check the"
+                      u" installed version" % len(findings)), sys.stderr)
+        return False
+    say(u"  %s trufflehog  ran in a scratch folder: exit status %d, %d file(s) scanned, no findings"
+        % (style.ok("[ok]"), code, progress.files))
+    return True
+
+
+def check_dotenvx(dotenvx, scratch, args, style):
+    """Encrypt a throw-away value into a scratch .env through encrypt_env_file, exactly as a
+    run does (staging copy, dotenvx encrypt, decrypt-and-compare, atomic install), and
+    confirm the private key file appeared next to it."""
+    env_path = os.path.join(scratch, ".env")
+    job = {"new": [(u"SWEEP_AND_SECURE_CHECK", u"setup check value")], "keys": [u"SWEEP_AND_SECURE_CHECK"],
+           "items": []}
+    decryptor = make_decryptor(dotenvx, scratch, args)
+    ok, note, warnings = encrypt_env_file(env_path, job, dotenvx, scratch, args, decryptor)
+    if not ok:
+        say(style.bad(u"[!!] dotenvx could not encrypt a value in a scratch folder: %s" % note), sys.stderr)
+        return False
+    if warnings:
+        say(style.bad(u"[!!] dotenvx encrypted a value in a scratch folder but it could not be checked: %s"
+                      % u"; ".join(warnings)), sys.stderr)
+        return False
+    keys_file = os.path.join(scratch, ".env.keys")
+    if not os.path.isfile(keys_file):
+        say(style.bad(u"[!!] dotenvx encrypted a value but wrote no .env.keys next to the file (looked for %s)"
+                      % keys_file), sys.stderr)
+        return False
+    value, reason = decrypt_env_value(dotenvx, env_path, u"SWEEP_AND_SECURE_CHECK", scratch, args)
+    if value != u"setup check value":
+        say(style.bad(u"[!!] dotenvx get did not return the value that was encrypted: %s"
+                      % (reason or u"got something else")), sys.stderr)
+        return False
+    say(u"  %s dotenvx     ran in a scratch folder: encrypted a value, decrypted it back, wrote .env.keys"
+        % style.ok("[ok]"))
+    return True
 
 
 # --------------------------------------------------------------------------
@@ -1020,6 +1135,7 @@ class Plan(object):
         self.root = root
         self.store = store
         self.quarantine = quarantine   # folder archives with secrets are moved to, or None
+        self.quarantine_flagged = True # False when it is only offered because the run is interactive
         self.items = []
         self.skipped = []            # (path, detector, reason)
         self.encrypted = []          # (path, key, line) already encrypted
@@ -1445,6 +1561,9 @@ def print_report(plan, args, style, verified_any):
             say(line)
         if verified_any:
             say(style.dim(u"  * = TruffleHog verified this credential is live"))
+        if any(item.kind == "quarantine" for item in plan.items) and not plan.quarantine_flagged:
+            say(style.dim(u"  Archives holding secrets are offered for moving to %s; answer s to leave them in"
+                          u" place. A --yes run moves them only with --quarantine." % plan.rel(plan.quarantine)))
     if plan.skipped:
         say(u"")
         say(style.warn(u"Found but cannot fix automatically: %d" % len(plan.skipped)))
@@ -1502,9 +1621,16 @@ def confirm(plan, args, style):
     interactive = sys.stdin is not None and hasattr(sys.stdin, "isatty") and sys.stdin.isatty()
     if not interactive:
         say(style.dim(u"(stdin is not a terminal; pass --yes to encrypt without asking)"))
+    secrets = len([item for item in plan.items if item.kind != "quarantine"])
+    archives = len(plan.items) - secrets
+    if archives and secrets:
+        question = u"Encrypt %d secret(s) and move %d archive(s) to quarantine now?" % (secrets, archives)
+    elif archives:
+        question = u"Move %d archive(s) to quarantine now?" % archives
+    else:
+        question = u"Encrypt these %d secret(s) now?" % secrets
     while True:
-        answer = ask(style.bold(u"Encrypt these %d secret(s) now? [y/N/s]  (s = choose which): "
-                                % len(plan.items))).lower()
+        answer = ask(style.bold(question + u" [y/N/s]  (s = choose which): ")).lower()
         if answer in ("y", "yes"):
             return list(plan.items)
         if answer in ("", "n", "no", "q", "quit"):
@@ -1520,8 +1646,9 @@ def confirm(plan, args, style):
             chosen = [item for item in plan.items if item.number in numbers]
             if not chosen:
                 continue
-            say(u"Selected: " + u", ".join(u"#%d %s" % (it.number, it.key) for it in chosen))
-            if ask(u"Encrypt these %d? [Y/n]: " % len(chosen)).lower() in ("", "y", "yes"):
+            say(u"Selected: " + u", ".join(u"#%d %s" % (it.number, it.key if it.kind != "quarantine"
+                                                           else plan.rel(it.path)) for it in chosen))
+            if ask(u"Go ahead with these %d? [Y/n]: " % len(chosen)).lower() in ("", "y", "yes"):
                 return chosen
             continue
         say(style.warn(u"Please answer y (yes), n (no) or s (select)."))
@@ -2138,8 +2265,9 @@ def parse_args(argv):
     parser.add_argument("--no-rewrite", action="store_true",
                         help="store secrets encrypted but leave the source files untouched")
     parser.add_argument("--quarantine", action="store_true",
-                        help="move archives (zip, tar, gz ...) that hold secrets out of the tree into the "
-                             "quarantine folder, keeping their relative paths")
+                        help="with --yes, also move archives (zip, tar, gz ...) that hold secrets out of the tree "
+                             "into the quarantine folder, keeping their relative paths (interactive runs offer "
+                             "this anyway)")
     parser.add_argument("--quarantine-dir", metavar="DIR", default=None,
                         help="the quarantine folder (default: %s inside the swept folder); implies --quarantine"
                              % QUARANTINE_DEFAULT)
@@ -2161,6 +2289,9 @@ def parse_args(argv):
                         help="use a tool even if its --version could not be read")
     parser.add_argument("-v", "--verbose", action="store_true", help="show the commands run and tool output")
     parser.add_argument("--no-color", action="store_true", help="plain output")
+    parser.add_argument("--check-setup", action="store_true",
+                        help="check that Python, TruffleHog and dotenvx are in place and run both tools in a "
+                             "scratch folder; exit 0 if a real run would work, 1 otherwise; nothing is scanned")
     parser.add_argument("--version", action="version", version="sweep-and-secure " + __version__)
     args = parser.parse_args(argv)
     if "NAME" not in args.placeholder:
@@ -2301,11 +2432,16 @@ def main(argv=None):
         return 1
 
     say(style.bold(u"sweep-and-secure %s" % __version__) + style.dim(u"  (TruffleHog + dotenvx)"))
+    if args.check_setup:
+        return check_setup(args, root, style)
     say(u"Folder: %s" % root)
     tools = locate_tools(args, root, style)
 
+    # Archives holding secrets are offered for quarantine whenever the run asks before
+    # acting; a --yes run (scripts, CI) moves them only when told to with --quarantine.
+    quarantine_flagged = bool(args.quarantine or args.quarantine_dir)
     quarantine = None
-    if args.quarantine or args.quarantine_dir:
+    if quarantine_flagged or not args.yes:
         quarantine = fs_text(args.quarantine_dir or QUARANTINE_DEFAULT)
         if not os.path.isabs(quarantine):
             quarantine = os.path.join(root, quarantine)
@@ -2356,6 +2492,7 @@ def main(argv=None):
     plan = build_plan(findings, root, store, args, plaintext, exclude_res, decryptor, quarantine)
     plan.encrypted = encrypted
     plan.plain_env = plaintext
+    plan.quarantine_flagged = quarantine_flagged
     print_report(plan, args, style, any(f.verified for f in findings))
 
     if not plan.items:
