@@ -6,6 +6,9 @@ tree, with the stand-ins for trufflehog and dotenvx from tests/fakebin on the
 PATH, so neither real tool is needed. Works on Python 2.7 and 3.x:
 
     python -m unittest discover -s tests -v
+
+Set SWEEP_TEST_REAL_TOOLS=1 with the real trufflehog and dotenvx on your PATH to
+also run the tier that exercises the real tools (RealToolsTests).
 """
 from __future__ import absolute_import, print_function
 
@@ -24,9 +27,15 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 SCRIPT = os.path.join(REPO, "sweep_and_secure.py")
 FAKEBIN = os.path.join(HERE, "fakebin")
+FAKE_DOTENVX = os.path.join(FAKEBIN, "dotenvx")
 
 sys.path.insert(0, REPO)
 import sweep_and_secure as sas  # noqa: E402
+
+try:
+    from StringIO import StringIO  # Python 2
+except ImportError:
+    from io import StringIO
 
 # Realistic-looking but entirely made-up credentials. They are assembled from
 # fragments at run time so that this file itself never contains a secret-shaped
@@ -34,6 +43,7 @@ import sweep_and_secure as sas  # noqa: E402
 # repository should trip over the test-suite.
 GITHUB_TOKEN = "ghp_" + "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij"
 STRIPE_KEY = "sk_live_" + "4eC39HqLyjWDarjtT1zdp7dcXYZ123"
+STRIPE_KEY_2 = "sk_live_" + "9zY8xW7vU6tS5rQ4pO3nM2lK1jI0hGfE"
 AWS_ID = "AKIA" + "QYLPMN5HHHFPZAM2"
 AWS_SECRET = "1tUm636uS1yOEcfP5pvfqJ/" + "ml36mF7AkyHsEU0IU"
 SLACK = "https://hooks.slack.com/" + "services/T0A1B2C3D4/B0E5F6G7H8/aBcDeFgHiJkLmNoPqRsTuVwX"
@@ -46,6 +56,9 @@ PEM = ("-----BEGIN " + "PRIVATE KEY-----\n"
 # in config/service_account.json; the context from any occurrence names the variable.
 PEM_KEY = "PRIVATE_KEY"
 PEM_FALLBACK_KEY = "PRIVATE_KEY_" + hashlib.sha256(PEM.encode("utf-8")).hexdigest()[:6].upper()
+# Values the fake "Password" detector flags; they probe dotenvx's quoting rules.
+PWD_APOS_DOLLAR = "PWD-" + "it's$ecret123"         # apostrophe and $: storable in backticks with \$
+PWD_APOS_BACKSLASH = "PWD-" + "it's\\path12345"    # apostrophe and backslash: not storable exactly
 
 FILES = {
     ".env": "PORT=3000\nSTRIPE_SECRET_KEY=%s\nAPP_NAME=demo\n" % STRIPE_KEY,
@@ -64,15 +77,21 @@ FILES = {
     "docs/deploy_key.pem": PEM + "\n",
     "node_modules/pkg/.env": "TOKEN=%s\n" % GITHUB_TOKEN,
 }
+ENCRYPTED_LINE = r'^%s=[\'"`]?encrypted:'   # dotenvx keeps the quote style of the line it rewrites
+
+
+def encrypted(key, text):
+    return re.search(ENCRYPTED_LINE % re.escape(key), text, re.M) is not None
 
 
 class ProjectTree(object):
     """A temporary project folder seeded with planted secrets."""
 
-    def __init__(self):
+    def __init__(self, files=FILES, git=True):
         self.root = tempfile.mkdtemp(prefix="sweep-test-")
-        os.mkdir(os.path.join(self.root, ".git"))
-        for rel, content in FILES.items():
+        if git:
+            os.mkdir(os.path.join(self.root, ".git"))
+        for rel, content in files.items():
             self.write(rel, content.encode("utf-8"))
         os.mkdir(os.path.join(self.root, "build"))
         with gzip.open(os.path.join(self.root, "build", "blob.txt.gz"), "wb") as fh:
@@ -93,39 +112,66 @@ class ProjectTree(object):
         with io.open(self.path(rel), "rb") as fh:
             return fh.read().decode("utf-8")
 
+    def read_bytes(self, rel):
+        with io.open(self.path(rel), "rb") as fh:
+            return fh.read()
+
     def snapshot(self):
         files = {}
         for dirpath, _, filenames in os.walk(self.root):
             for name in filenames:
                 path = os.path.join(dirpath, name)
+                if os.path.islink(path):
+                    files[os.path.relpath(path, self.root)] = os.readlink(path)
+                    continue
                 with io.open(path, "rb") as fh:
                     files[os.path.relpath(path, self.root)] = fh.read()
         return files
+
+    def leftovers(self):
+        found = []
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            found.extend(n for n in dirnames + filenames if n.startswith(sas.TEMP_PREFIX))
+        return found
 
     def cleanup(self):
         shutil.rmtree(self.root, ignore_errors=True)
 
 
-def run_script(root, args, stdin_text="", extra_env=None, path=None):
+FAKE_KNOBS = ("TRUFFLEHOG_BIN", "DOTENVX_BIN", "FAKE_DOTENVX_FAIL", "FAKE_DOTENVX_NOOP", "FAKE_DOTENVX_CORRUPT",
+              "FAKE_TRUFFLEHOG_FAIL", "FAKE_TRUFFLEHOG_PARTIAL", "FAKE_DOTENVX_VERSION")
+
+
+def clean_env(extra_env=None, path=None):
     env = dict(os.environ)
     env["PATH"] = (FAKEBIN + os.pathsep + env.get("PATH", "")) if path is None else path
     env["NO_COLOR"] = "1"
-    for name in ("TRUFFLEHOG_BIN", "DOTENVX_BIN", "FAKE_DOTENVX_FAIL", "FAKE_DOTENVX_NOOP",
-                 "FAKE_TRUFFLEHOG_FAIL", "FAKE_DOTENVX_VERSION"):
+    for name in FAKE_KNOBS:
         env.pop(name, None)
     if extra_env:
         env.update(extra_env)
+    return env
+
+
+def run_script(root, args, stdin_text="", extra_env=None, path=None):
+    env = clean_env(extra_env, path)
     proc = subprocess.Popen([sys.executable, SCRIPT, root] + list(args), cwd=root, env=env,
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     out, err = proc.communicate(stdin_text.encode("utf-8"))
     return proc.returncode, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
 
 
-def fake_dotenvx_get(root, key, env_file=".env"):
-    proc = subprocess.Popen([os.path.join(FAKEBIN, "dotenvx"), "get", key, "-f", env_file], cwd=root,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+def dotenvx_get(root, key, env_file=".env", keys_file=None, binary=None):
+    """What dotenvx (the stand-in by default) decrypts for key; --overload makes the
+    file win over our own environment, as the script does when it verifies."""
+    cmd = [sys.executable, FAKE_DOTENVX] if binary is None else [binary]
+    cmd += ["get", key, "-f", env_file, "--overload"]
+    if keys_file:
+        cmd += ["-fk", keys_file]
+    proc = subprocess.Popen(cmd, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     out, _ = proc.communicate()
-    return out.decode("utf-8")[:-1]  # drop the trailing newline print() adds
+    out = out.decode("utf-8")
+    return out[:-1] if out.endswith("\n") else out
 
 
 def item_number(listing, detector, key, where=None):
@@ -136,6 +182,40 @@ def item_number(listing, detector, key, where=None):
             if where is None or where in match.group(4):
                 return match.group(1)
     raise AssertionError("no listed item for %s %s in:\n%s" % (detector, key, listing))
+
+
+class InProcess(object):
+    """Run sas.main() in this process with the fake tools on PATH, capturing output,
+    so that a test can monkeypatch a function to fail half way."""
+
+    def __init__(self, root, args, patches=None):
+        self.root, self.args, self.patches = root, list(args), patches or {}
+        self.out = self.err = u""
+        self.code = None
+        self.exception = None
+
+    def run(self):
+        saved = {name: getattr(sas, name) for name in self.patches}
+        saved_env = dict(os.environ)
+        saved_streams = sys.stdout, sys.stderr
+        os.environ.update(clean_env())
+        out, err = StringIO(), StringIO()
+        sys.stdout, sys.stderr = out, err
+        try:
+            for name, value in self.patches.items():
+                setattr(sas, name, value)
+            try:
+                self.code = sas.main([self.root] + self.args + ["--no-color"])
+            except BaseException as exc:  # noqa: B902 - the test wants to see KeyboardInterrupt
+                self.exception = exc
+        finally:
+            sys.stdout, sys.stderr = saved_streams
+            for name, value in saved.items():
+                setattr(sas, name, value)
+            os.environ.clear()
+            os.environ.update(saved_env)
+        self.out, self.err = out.getvalue(), err.getvalue()
+        return self
 
 
 class EndToEndTests(unittest.TestCase):
@@ -151,6 +231,9 @@ class EndToEndTests(unittest.TestCase):
         after = self.tree.snapshot()
         for rel in rels or self.before.keys():
             self.assertEqual(after.get(rel.replace("/", os.sep)), self.before[rel.replace("/", os.sep)], rel)
+
+    def assertNoLeftovers(self):
+        self.assertEqual(self.tree.leftovers(), [])
 
     def test_missing_tools_are_reported_with_links(self):
         empty = tempfile.mkdtemp(prefix="sweep-empty-")
@@ -170,6 +253,16 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("too old", err)
         self.assertIn("https://dotenvx.com", err)
+
+    def test_tool_that_cannot_report_a_version_is_refused_unless_asked(self):
+        code, out, err = run_script(self.tree.root, ["--dry-run"], extra_env={"FAKE_DOTENVX_VERSION": "nonsense"})
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("did not report a usable version", err)
+        self.assertIn("--no-version-check", err)
+        code, out, err = run_script(self.tree.root, ["--dry-run", "--no-version-check"],
+                                    extra_env={"FAKE_DOTENVX_VERSION": "nonsense"})
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("Dry run", out)
 
     def test_dry_run_lists_findings_with_types_and_already_encrypted_keys(self):
         code, out, err = run_script(self.tree.root, ["--dry-run"])
@@ -207,9 +300,10 @@ class EndToEndTests(unittest.TestCase):
         env = self.tree.read(".env")
         self.assertNotIn(STRIPE_KEY, env)
         self.assertIn("PORT=3000", env)                  # unflagged key left alone
+        self.assertIn("DOTENV_PUBLIC_KEY=", env)
         for key in ("STRIPE_SECRET_KEY", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
                     "DATABASE_URL", "SLACK_WEBHOOK", "GITHUB_TOKEN", PEM_KEY):
-            self.assertTrue(re.search(r'^%s="encrypted:' % re.escape(key), env, re.M), key + "\n" + env)
+            self.assertTrue(encrypted(key, env), key + "\n" + env)
         settings = self.tree.read("src/settings.py")
         self.assertIn('AWS_ACCESS_KEY_ID = "${AWS_ACCESS_KEY_ID}"', settings)
         self.assertIn('AWS_SECRET_ACCESS_KEY = "${AWS_SECRET_ACCESS_KEY}"', settings)
@@ -225,17 +319,20 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn('"private_key": "${%s}"' % PEM_KEY, self.tree.read("config/service_account.json"))
         self.assertEqual(self.tree.read("docs/db.md"), "Connect with ${DATABASE_URL}. Read replica: [${DATABASE_URL}]\n")
         # decrypt round trip through the stand-in, including the multi-line and extended values
-        self.assertEqual(fake_dotenvx_get(self.tree.root, "AWS_SECRET_ACCESS_KEY"), AWS_SECRET)
-        self.assertEqual(fake_dotenvx_get(self.tree.root, "DATABASE_URL"), PG_URL)
-        self.assertEqual(fake_dotenvx_get(self.tree.root, PEM_KEY), PEM)   # real newlines, not "\n" text
-        self.assertEqual(fake_dotenvx_get(self.tree.root, "STRIPE_SECRET_KEY"), STRIPE_KEY)
+        self.assertEqual(dotenvx_get(self.tree.root, "AWS_SECRET_ACCESS_KEY"), AWS_SECRET)
+        self.assertEqual(dotenvx_get(self.tree.root, "DATABASE_URL"), PG_URL)
+        self.assertEqual(dotenvx_get(self.tree.root, PEM_KEY), PEM)   # real newlines, not "\n" text
+        self.assertEqual(dotenvx_get(self.tree.root, "STRIPE_SECRET_KEY"), STRIPE_KEY)
         self.assertTrue(os.path.isfile(self.tree.path(".env.keys")))
         self.assertIn(".env.keys*", self.tree.read(".gitignore"))
         self.assertUnchanged("node_modules/pkg/.env", "build/blob.txt.gz", "config/.env.production")
-        self.assertIn("Done: 11 secret(s) encrypted, 1 need manual attention", out)
+        self.assertIn("Done: 7 secret(s) stored encrypted; 11 plaintext occurrence(s) removed from 7 file(s);"
+                      " 1 need manual attention", out)
         self.assertIn("Next steps", out)
         self.assertIn("dotenvx run -- <your command>", out)
+        self.assertNotIn("-fk", out)                     # .env and .env.keys share a folder
         self.assertIn("howtorotate.com/docs/tutorials/stripe/", out)
+        self.assertNoLeftovers()
 
     def test_select_a_single_item(self):
         _, listing, _ = run_script(self.tree.root, ["--dry-run"])
@@ -246,7 +343,7 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("${AWS_SECRET_ACCESS_KEY}", settings)
         self.assertIn(AWS_ID, settings)                  # not selected: left in place
         env = self.tree.read(".env")
-        self.assertIn('AWS_SECRET_ACCESS_KEY="encrypted:', env)
+        self.assertTrue(encrypted("AWS_SECRET_ACCESS_KEY", env), env)
         self.assertNotIn("AWS_ACCESS_KEY_ID", env)
         self.assertIn("STRIPE_SECRET_KEY=%s" % STRIPE_KEY, env)   # in-place item not selected
         self.assertUnchanged("src/client.js", "docs/notes.md", "config/app.json")
@@ -258,7 +355,7 @@ class EndToEndTests(unittest.TestCase):
         number = item_number(listing, "SlackWebhook", "SLACK_WEBHOOK", where="docs/notes.md")
         code, out, err = run_script(self.tree.root, [], stdin_text="s\n%s\n\n" % number)  # empty = default yes
         self.assertEqual(code, 0, out + err)
-        self.assertEqual(fake_dotenvx_get(self.tree.root, "SLACK_WEBHOOK"), SLACK)
+        self.assertEqual(dotenvx_get(self.tree.root, "SLACK_WEBHOOK"), SLACK)
         self.assertIn("${SLACK_WEBHOOK}", self.tree.read("docs/notes.md"))
         self.assertUnchanged("config/app.json", "src/settings.py")
 
@@ -272,8 +369,8 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("('${STRIPE_SECRET_KEY}')", self.tree.read("src/client.js"))
         env = self.tree.read(".env")
         self.assertNotIn(STRIPE_KEY, env)
-        self.assertIn('STRIPE_SECRET_KEY="encrypted:', env)
-        self.assertEqual(fake_dotenvx_get(self.tree.root, "STRIPE_SECRET_KEY"), STRIPE_KEY)
+        self.assertTrue(encrypted("STRIPE_SECRET_KEY", env), env)
+        self.assertEqual(dotenvx_get(self.tree.root, "STRIPE_SECRET_KEY"), STRIPE_KEY)
         self.assertUnchanged("src/settings.py", "config/app.json")
 
     def test_partial_trufflehog_failure_is_handled_but_fails_the_run(self):
@@ -285,7 +382,7 @@ class EndToEndTests(unittest.TestCase):
         code, out, err = run_script(self.tree.root, ["--yes"], extra_env={"FAKE_TRUFFLEHOG_PARTIAL": "1"})
         self.assertEqual(code, 1, out + err)
         self.assertIn("scan was incomplete", out)
-        self.assertIn('STRIPE_SECRET_KEY="encrypted:', self.tree.read(".env"))  # what was found is fixed
+        self.assertTrue(encrypted("STRIPE_SECRET_KEY", self.tree.read(".env")))  # what was found is fixed
 
     def test_bad_selection_input_is_rejected(self):
         code, out, err = run_script(self.tree.root, [], stdin_text="maybe\ns\n0 99\n\nn\n")
@@ -294,19 +391,32 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("Could not understand", out)
         self.assertUnchanged()
 
-    def test_dotenvx_failure_restores_env_file_and_leaves_sources_alone(self):
+    def test_dotenvx_failure_leaves_every_file_alone(self):
         code, out, err = run_script(self.tree.root, ["--yes"], extra_env={"FAKE_DOTENVX_FAIL": "1"})
         self.assertEqual(code, 1, out + err)
         self.assertIn("simulated failure", out)
         self.assertIn("could not be stored encrypted", out)
         self.assertUnchanged(".env", "src/settings.py", "src/client.js", "docs/notes.md",
                              "config/app.json", "docs/deploy_key.pem")
+        self.assertNoLeftovers()                         # the staging folder is gone
+        self.assertIn(".env.keys*", self.tree.read(".gitignore"))   # protected before anything ran
 
     def test_dotenvx_that_changes_nothing_is_caught(self):
         code, out, err = run_script(self.tree.root, ["--yes"], extra_env={"FAKE_DOTENVX_NOOP": "1"})
         self.assertEqual(code, 1, out + err)
         self.assertIn("still plaintext", out)
         self.assertUnchanged(".env", "src/settings.py")
+        self.assertNoLeftovers()
+
+    def test_a_value_dotenvx_stored_wrongly_is_caught_before_any_rewrite(self):
+        # FAKE_DOTENVX_CORRUPT makes the stand-in store a mangled value, as the real dotenvx
+        # does for some quoting; decrypting and comparing must catch it and nothing may change.
+        code, out, err = run_script(self.tree.root, ["--yes"], extra_env={"FAKE_DOTENVX_CORRUPT": "1"})
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("verification failed", out)
+        self.assertIn("decrypts to something other than the value we stored", out)
+        self.assertUnchanged(".env", "src/settings.py", "src/client.js", "docs/notes.md", "config/app.json")
+        self.assertNoLeftovers()
 
     def test_trufflehog_failure_is_reported(self):
         code, out, err = run_script(self.tree.root, ["--yes"], extra_env={"FAKE_TRUFFLEHOG_FAIL": "1"})
@@ -319,12 +429,14 @@ class EndToEndTests(unittest.TestCase):
         code, out, err = run_script(self.tree.root, ["--yes", "--env-all"])
         self.assertEqual(code, 0, out + err)
         env = self.tree.read(".env")
-        self.assertIn('PORT="encrypted:', env)
-        self.assertIn('APP_NAME="encrypted:', env)
+        self.assertTrue(encrypted("PORT", env), env)
+        self.assertTrue(encrypted("APP_NAME", env), env)
         production = self.tree.read("config/.env.production")
-        self.assertIn('LOG_LEVEL="encrypted:', production)
+        self.assertTrue(encrypted("LOG_LEVEL", production), production)
         self.assertIn('DB_PASSWORD="encrypted:QUJD"', production)   # already encrypted: untouched
-        self.assertEqual(fake_dotenvx_get(self.tree.root, "PORT"), "3000")
+        self.assertEqual(dotenvx_get(self.tree.root, "PORT"), "3000")
+        # that file carries someone else's public key: dotenvx can encrypt with it, we cannot check
+        self.assertIn("could not verify LOG_LEVEL: no private key", out)
 
     def test_placeholder_template_and_no_rewrite(self):
         code, out, err = run_script(self.tree.root, ["--yes", "--placeholder", "process.env.NAME"])
@@ -336,21 +448,131 @@ class EndToEndTests(unittest.TestCase):
             code, out, err = run_script(fresh.root, ["--yes", "--no-rewrite"])
             self.assertEqual(code, 0, out + err)
             self.assertEqual(fresh.read("src/settings.py"), FILES["src/settings.py"])
-            self.assertIn('AWS_SECRET_ACCESS_KEY="encrypted:', fresh.read(".env"))
+            self.assertTrue(encrypted("AWS_SECRET_ACCESS_KEY", fresh.read(".env")))
             self.assertIn("--no-rewrite left the plaintext", out)
         finally:
             fresh.cleanup()
+
+    def test_rerun_after_no_rewrite_reuses_the_stored_keys(self):
+        code, out, err = run_script(self.tree.root, ["--yes", "--no-rewrite"])
+        self.assertEqual(code, 0, out + err)
+        code, out, err = run_script(self.tree.root, ["--yes"])
+        self.assertEqual(code, 0, out + err)
+        env = self.tree.read(".env")
+        self.assertNotIn("_2=", env)                     # no AWS_ACCESS_KEY_ID_2 and friends
+        self.assertEqual(len(re.findall(r"^AWS_ACCESS_KEY_ID=", env, re.M)), 1)
+        self.assertIn("(value already in .env)", out)
+        self.assertIn('AWS_ACCESS_KEY_ID = "${AWS_ACCESS_KEY_ID}"', self.tree.read("src/settings.py"))
+        self.assertEqual(dotenvx_get(self.tree.root, "AWS_ACCESS_KEY_ID"), AWS_ID)
+
+    def test_a_name_taken_by_a_different_value_gets_a_suffix_and_says_why(self):
+        self.tree.write(".env", ("PORT=3000\nSTRIPE_SECRET_KEY=%s\nAWS_ACCESS_KEY_ID=something-else\n"
+                                 % STRIPE_KEY).encode("utf-8"))
+        code, out, err = run_script(self.tree.root, ["--dry-run"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("AWS_ACCESS_KEY_ID_2", out)
+        self.assertIn("AWS_ACCESS_KEY_ID already holds a different value", out)
 
     def test_custom_env_file_receives_moved_secrets(self):
         code, out, err = run_script(self.tree.root, ["--yes", "--env-file", "config/secrets.env"])
         self.assertEqual(code, 0, out + err)
         secrets = self.tree.read("config/secrets.env")
-        self.assertIn('AWS_ACCESS_KEY_ID="encrypted:', secrets)
+        self.assertTrue(encrypted("AWS_ACCESS_KEY_ID", secrets), secrets)
         self.assertIn("Created by sweep_and_secure.py", secrets)
         env = self.tree.read(".env")
-        self.assertIn('STRIPE_SECRET_KEY="encrypted:', env)   # in place, as before
+        self.assertTrue(encrypted("STRIPE_SECRET_KEY", env), env)   # in place, as before
         self.assertNotIn("AWS_ACCESS_KEY_ID", env)
-        self.assertIn("dotenvx run -f config/secrets.env -- <your command>", out)
+        # dotenvx keeps the private key in the swept folder and only looks next to the env
+        # file on its own, so the advice must say where the key is
+        self.assertIn("dotenvx run -f config/secrets.env -fk .env.keys -- <your command>", out)
+        self.assertIn("-fk points it at the one it wrote", out)
+        self.assertEqual(dotenvx_get(self.tree.root, "AWS_ACCESS_KEY_ID", "config/secrets.env", ".env.keys"), AWS_ID)
+        self.assertTrue(dotenvx_get(self.tree.root, "AWS_ACCESS_KEY_ID", "config/secrets.env").startswith("encrypted:"))
+
+    def test_same_secret_under_two_env_keys_encrypts_both(self):
+        self.tree.write(".env", ("PORT=3000\nDB_PASSWORD=%s\nPOSTGRES_PASSWORD=%s\nALSO=\"x-%s-y\"\n"
+                                 % (STRIPE_KEY_2, STRIPE_KEY_2, STRIPE_KEY_2)).encode("utf-8"))
+        code, out, err = run_script(self.tree.root, ["--yes"])
+        self.assertEqual(code, 0, out + err)
+        env = self.tree.read(".env")
+        self.assertNotIn(STRIPE_KEY_2, env)
+        for key in ("DB_PASSWORD", "POSTGRES_PASSWORD", "ALSO"):
+            self.assertTrue(encrypted(key, env), key + "\n" + env)
+        self.assertEqual(dotenvx_get(self.tree.root, "POSTGRES_PASSWORD"), STRIPE_KEY_2)
+        self.assertEqual(dotenvx_get(self.tree.root, "ALSO"), "x-%s-y" % STRIPE_KEY_2)
+        self.assertIn("encrypt in place", out)
+
+    def test_a_value_dotenvx_cannot_store_exactly_is_left_for_manual_attention(self):
+        self.tree.write("docs/pw.md", ("login: %s\nadmin: %s\n" % (PWD_APOS_DOLLAR, PWD_APOS_BACKSLASH)).encode("utf-8"))
+        code, out, err = run_script(self.tree.root, ["--yes"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("dotenvx cannot store this value exactly (it contains both an apostrophe and a backslash)", out)
+        pw = self.tree.read("docs/pw.md")
+        self.assertIn(PWD_APOS_BACKSLASH, pw)            # left alone
+        self.assertNotIn(PWD_APOS_DOLLAR, pw)            # moved
+        self.assertIn("${LOGIN}", pw)                   # named after its context, "login:"
+        self.assertEqual(dotenvx_get(self.tree.root, "LOGIN"), PWD_APOS_DOLLAR)
+
+    def test_bom_env_file_is_encrypted_in_place_and_loses_its_bom(self):
+        self.tree.write(".env", b"\xef\xbb\xbfSTRIPE_SECRET_KEY=" + STRIPE_KEY.encode("utf-8") + b"\nPORT=3000\n")
+        code, out, err = run_script(self.tree.root, ["--yes"])
+        self.assertEqual(code, 0, out + err)
+        self.assertTrue(re.search(r"STRIPE_SECRET_KEY\s+\S+\s+\.env:1\s+encrypt in place", out), out)
+        raw = self.tree.read_bytes(".env")
+        self.assertFalse(raw.startswith(b"\xef\xbb\xbf"))
+        self.assertNotIn(STRIPE_KEY, raw.decode("utf-8"))
+        self.assertEqual(len(re.findall(r"^STRIPE_SECRET_KEY=", raw.decode("utf-8"), re.M)), 1)
+        self.assertIn("removed the UTF-8 byte order mark", out)
+        self.assertEqual(dotenvx_get(self.tree.root, "STRIPE_SECRET_KEY"), STRIPE_KEY)
+
+    @unittest.skipUnless(hasattr(os, "symlink") and os.name != "nt", "symlinks")
+    def test_symlinked_env_store_is_written_through_not_replaced(self):
+        self.tree.write("shared/real.env", b"PORT=1\n")
+        os.remove(self.tree.path(".env"))
+        os.symlink(os.path.join("shared", "real.env"), self.tree.path(".env"))
+        code, out, err = run_script(self.tree.root, ["--yes"])
+        self.assertEqual(code, 0, out + err)
+        self.assertTrue(os.path.islink(self.tree.path(".env")))
+        self.assertTrue(encrypted("AWS_ACCESS_KEY_ID", self.tree.read("shared/real.env")))
+
+    def test_example_env_files_are_left_for_manual_attention(self):
+        self.tree.write(".env.example", ("STRIPE_SECRET_KEY=%s\nPORT=1\n" % STRIPE_KEY).encode("utf-8"))
+        code, out, err = run_script(self.tree.root, ["--dry-run", "--env-all"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("example/template env file", out)
+        self.assertNotIn(".env.example:1", out)          # not a numbered item
+        self.assertNotIn(".env.example: PORT", out)      # not in the --env-all inventory either
+
+    def test_lock_files_and_pdfs_are_left_for_manual_attention(self):
+        self.tree.write("package-lock.json", ('{"resolved": "https://npm.pkg.github.com/x?token=%s"}\n'
+                                              % GITHUB_TOKEN).encode("utf-8"))
+        self.tree.write("docs/report.pdf", ("%%PDF-1.4 token %s\n" % GITHUB_TOKEN).encode("utf-8"))
+        code, out, err = run_script(self.tree.root, ["--dry-run"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("generated lock file", out)
+        self.assertIn("PDF - rewriting bytes would corrupt it", out)
+
+    def test_utf16_source_file_is_rewritten_in_its_own_encoding(self):
+        text = u"token = '%s'\r\n" % GITHUB_TOKEN
+        self.tree.write("src/legacy.txt", b"\xff\xfe" + text.encode("utf-16-le"))
+        code, out, err = run_script(self.tree.root, ["--yes"])
+        self.assertEqual(code, 0, out + err)
+        raw = self.tree.read_bytes("src/legacy.txt")
+        self.assertEqual(raw[:2], b"\xff\xfe")
+        self.assertEqual(raw[2:].decode("utf-16-le"), u"token = '${GITHUB_TOKEN}'\r\n")
+
+    def test_stale_staging_leftovers_are_removed_and_never_scanned(self):
+        self.tree.write(".sweep-and-secure-abc123", ("STRIPE_SECRET_KEY=%s\n" % STRIPE_KEY_2).encode("utf-8"))
+        self.tree.write(".sweep-and-secure-dir/.env", ("STRIPE_SECRET_KEY=%s\n" % STRIPE_KEY_2).encode("utf-8"))
+        code, out, err = run_script(self.tree.root, ["--dry-run"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("would be removed", out)
+        self.assertNotIn(".sweep-and-secure-abc123:", out)   # not treated as a source file
+        self.assertTrue(os.path.exists(self.tree.path(".sweep-and-secure-abc123")))
+        code, out, err = run_script(self.tree.root, ["--yes"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("Removed 2 leftover staging file(s)", out)
+        self.assertNoLeftovers()
 
     def test_nothing_found_is_a_clean_exit(self):
         clean = tempfile.mkdtemp(prefix="sweep-clean-")
@@ -364,6 +586,69 @@ class EndToEndTests(unittest.TestCase):
         finally:
             shutil.rmtree(clean, ignore_errors=True)
 
+    def test_non_utf8_console_does_not_break_the_run(self):
+        # dotenvx prints non-ASCII glyphs; with -v they are echoed. An ASCII-only stdout
+        # (Windows pipe, LANG=C) must not turn into a traceback half way through.
+        code, out, err = run_script(self.tree.root, ["--yes", "-v"], extra_env={"PYTHONIOENCODING": "ascii"})
+        self.assertEqual(code, 0, out + err)
+        self.assertNotIn("Traceback", err)
+        self.assertIn("Done:", out)
+        self.assertIn("${AWS_ACCESS_KEY_ID}", self.tree.read("src/settings.py"))
+
+
+class InterruptionTests(unittest.TestCase):
+    """What a run that dies half way leaves behind, and what it says about it."""
+
+    def setUp(self):
+        self.tree = ProjectTree()
+
+    def tearDown(self):
+        self.tree.cleanup()
+
+    def test_interrupt_after_encryption_protects_the_key_file_and_reports_the_state(self):
+        def interrupted(*args, **kwargs):
+            raise KeyboardInterrupt()
+        run = InProcess(self.tree.root, ["--yes"], {"rewrite_source": interrupted}).run()
+        self.assertIsInstance(run.exception, KeyboardInterrupt)
+        self.assertIn(".env.keys*", self.tree.read(".gitignore"))          # protected before encrypting
+        self.assertTrue(encrypted("AWS_ACCESS_KEY_ID", self.tree.read(".env")))
+        self.assertIn("Stopped early (interrupted). State of the tree:", run.out)
+        self.assertIn("encrypted and saved:   .env", run.out)
+        self.assertIn("still plaintext:       src/settings.py", run.out)
+        self.assertIn("Run again to finish", run.out)
+        self.assertEqual(self.tree.leftovers(), [])
+
+    def test_unexpected_exception_reports_the_state_and_exits_1(self):
+        def broken(*args, **kwargs):
+            raise RuntimeError("boom")
+        run = InProcess(self.tree.root, ["--yes"], {"rewrite_source": broken}).run()
+        self.assertIsNone(run.exception)
+        self.assertEqual(run.code, 1)
+        self.assertIn("unexpected error", run.out)
+        self.assertIn("RuntimeError", run.err)
+        self.assertIn("State of the tree", run.out)
+        self.assertIn(".env.keys*", self.tree.read(".gitignore"))
+
+    def test_interrupt_during_dotenvx_leaves_the_env_file_and_no_staging_behind(self):
+        real_encrypt = sas.dotenvx_encrypt
+
+        def interrupted(*args, **kwargs):
+            raise KeyboardInterrupt()
+
+        try:
+            existing = self.tree.path(".env")
+            args = sas.parse_args([self.tree.root, "--yes"])
+            job = {"keys": ["NEW_KEY"], "new": [("NEW_KEY", "value")], "items": []}
+            sas.dotenvx_encrypt = interrupted
+            self.assertRaises(KeyboardInterrupt, sas.encrypt_env_file, existing, job, "dotenvx", self.tree.root, args)
+            self.assertEqual(self.tree.read(".env"), FILES[".env"])
+            missing = self.tree.path("new.env")
+            self.assertRaises(KeyboardInterrupt, sas.encrypt_env_file, missing, job, "dotenvx", self.tree.root, args)
+            self.assertFalse(os.path.exists(missing))
+            self.assertEqual(self.tree.leftovers(), [])
+        finally:
+            sas.dotenvx_encrypt = real_encrypt
+
 
 class UnitTests(unittest.TestCase):
 
@@ -375,14 +660,21 @@ class UnitTests(unittest.TestCase):
                          [("A", "1"), ("B", "two\nlines"), ("C", "single # not a comment"),
                           ("D", "plain"), ("E", "x"), ("F", "")])
         self.assertEqual([line for _, _, line in entries], [1, 2, 4, 5, 6, 9])
+        self.assertEqual([k for k, _, _ in sas.parse_env_entries(u"\ufeffFIRST=1\nSECOND=2\n")], ["FIRST", "SECOND"])
 
-    def test_quote_env_value_prefers_literal_single_quotes(self):
+    def test_quote_env_value_follows_dotenvx_rules(self):
+        # measured against dotenvx 2.38: see the docstring of quote_env_value
         self.assertEqual(sas.quote_env_value("pa$$ #w\\n"), ("'pa$$ #w\\n'", True))
+        self.assertEqual(sas.quote_env_value(PEM), ("'" + PEM + "'", True))
         self.assertEqual(sas.quote_env_value("it's"), ("`it's`", True))
-        self.assertEqual(sas.quote_env_value("it's `x`"), ('"it\'s `x`"', True))
-        quoted, exact = sas.quote_env_value("it's `x` \"$y\"")
-        self.assertFalse(exact)
-        self.assertTrue(quoted.startswith('"'))
+        self.assertEqual(sas.quote_env_value("it's $ecret"), ("`it's \\$ecret`", True))
+        self.assertEqual(sas.quote_env_value("it's `x` and $y"), ('"it\'s `x` and \\$y"', True))
+        for value in ("it's `x` \"$y\"", "it's a\\path", "it's \\$lit", "a'b`c\"d"):
+            quoted, exact = sas.quote_env_value(value)
+            self.assertFalse(exact, value)
+            self.assertTrue(quoted.startswith('"'))
+        self.assertIn("backslash", sas.inexact_reason("it's a\\path"))
+        self.assertIn("backtick", sas.inexact_reason("a'b`c\"d"))
 
     def test_choose_name(self):
         self.assertEqual(sas.choose_name("Github", "token", "x"), "GITHUB_TOKEN")
@@ -457,6 +749,9 @@ class UnitTests(unittest.TestCase):
         self.assertEqual(found[0][0], b"-----BEGIN X-----\\nabc\\n-----END X-----")  # replaced in the file
         self.assertEqual(found[0][3], "-----BEGIN X-----\nabc\n-----END X-----")      # stored in .env
         self.assertEqual(sas.locate(b"nothing here", "missing-secret", "PLAIN"), [])
+        utf16 = b"\xff\xfe" + u"k = 'secret-value-123'".encode("utf-16-le")
+        found = sas.locate(utf16, "secret-value-123", "PLAIN")
+        self.assertEqual([(token, enc) for token, enc, _, _ in found], [(u"secret-value-123".encode("utf-16-le"), "utf-16-le")])
 
     def test_trim_url_tail(self):
         self.assertEqual(sas.trim_url_tail(b"postgres://h/db.", b"postgres://h"), b"postgres://h/db")
@@ -465,38 +760,16 @@ class UnitTests(unittest.TestCase):
         self.assertEqual(sas.trim_url_tail(b"postgres://h.", b"postgres://h."), b"postgres://h.")
 
     def test_find_tool_returns_an_absolute_path(self):
-        self.assertTrue(os.path.isabs(sas.find_tool("dotenvx", os.path.join(FAKEBIN, "dotenvx"), REPO)))
+        found = sas.find_tool("dotenvx", FAKE_DOTENVX, REPO)
+        self.assertTrue(os.path.isabs(found))
+        self.assertEqual(os.path.splitext(found)[0], FAKE_DOTENVX)   # Windows picks dotenvx.cmd
         cwd = os.getcwd()
         os.chdir(HERE)
         try:
             found = sas.find_tool("dotenvx", os.path.join("fakebin", "dotenvx"), REPO)
         finally:
             os.chdir(cwd)
-        self.assertEqual(found, os.path.join(FAKEBIN, "dotenvx"))
-
-    def test_interrupt_during_dotenvx_restores_the_env_file(self):
-        folder = tempfile.mkdtemp(prefix="sweep-unit-")
-        real_encrypt = sas.dotenvx_encrypt
-
-        def interrupted(*args, **kwargs):
-            raise KeyboardInterrupt()
-
-        try:
-            existing = os.path.join(folder, ".env")
-            with io.open(existing, "wb") as fh:
-                fh.write(b"PORT=3000\n")
-            args = sas.parse_args([folder, "--yes"])
-            job = {"keys": ["NEW_KEY"], "new": [("NEW_KEY", "value")], "items": []}
-            sas.dotenvx_encrypt = interrupted
-            self.assertRaises(KeyboardInterrupt, sas.encrypt_env_file, existing, job, "dotenvx", folder, args)
-            with io.open(existing, "rb") as fh:
-                self.assertEqual(fh.read(), b"PORT=3000\n")
-            missing = os.path.join(folder, "new.env")
-            self.assertRaises(KeyboardInterrupt, sas.encrypt_env_file, missing, job, "dotenvx", folder, args)
-            self.assertFalse(os.path.exists(missing))
-        finally:
-            sas.dotenvx_encrypt = real_encrypt
-            shutil.rmtree(folder, ignore_errors=True)
+        self.assertEqual(os.path.splitext(found)[0], FAKE_DOTENVX)
 
     def test_write_bytes_replaces_atomically_and_keeps_the_mode(self):
         folder = tempfile.mkdtemp(prefix="sweep-unit-")
@@ -514,6 +787,77 @@ class UnitTests(unittest.TestCase):
         finally:
             shutil.rmtree(folder, ignore_errors=True)
 
+    @unittest.skipUnless(hasattr(os, "symlink") and os.name != "nt", "symlinks")
+    def test_write_bytes_writes_through_a_symlink(self):
+        folder = tempfile.mkdtemp(prefix="sweep-unit-")
+        try:
+            target = os.path.join(folder, "real.env")
+            link = os.path.join(folder, ".env")
+            with io.open(target, "wb") as fh:
+                fh.write(b"old")
+            os.symlink("real.env", link)
+            sas.write_bytes(link, b"new")
+            self.assertTrue(os.path.islink(link))
+            with io.open(target, "rb") as fh:
+                self.assertEqual(fh.read(), b"new")
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_write_bytes_falls_back_to_in_place_and_restores_on_failure(self):
+        folder = tempfile.mkdtemp(prefix="sweep-unit-")
+        real_mkstemp = sas.tempfile.mkstemp
+
+        def no_temp_files(*args, **kwargs):
+            raise OSError(13, "Permission denied")
+
+        try:
+            path = os.path.join(folder, "file.txt")
+            with io.open(path, "wb") as fh:
+                fh.write(b"original")
+            sas.tempfile.mkstemp = no_temp_files
+            sas.write_bytes(path, b"replaced")
+            with io.open(path, "rb") as fh:
+                self.assertEqual(fh.read(), b"replaced")
+            self.assertRaises(TypeError, sas.write_bytes, path, u"not bytes")   # write fails half way
+            with io.open(path, "rb") as fh:
+                self.assertEqual(fh.read(), b"replaced")                        # old content is back
+        finally:
+            sas.tempfile.mkstemp = real_mkstemp
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_say_never_raises(self):
+        stream = io.TextIOWrapper(io.BytesIO(), encoding="ascii")
+        sas.say(u"\u25c8 glyph \u26c9", stream)
+        stream.seek(0)
+        self.assertEqual(stream.read(), u"? glyph ?\n")
+        sas.say(u"nowhere", None)   # pythonw: no stdout at all
+        closed = io.StringIO()
+        closed.close()
+        sas.say(u"closed", closed)
+
+    def test_run_command_kills_the_child_when_interrupted(self):
+        events = []
+
+        class FakeProcess(object):
+            returncode = 0
+
+            def communicate(self, data):
+                raise KeyboardInterrupt()
+
+            def kill(self):
+                events.append("kill")
+
+            def wait(self):
+                events.append("wait")
+
+        real_popen = sas.subprocess.Popen
+        sas.subprocess.Popen = lambda *args, **kwargs: FakeProcess()
+        try:
+            self.assertRaises(KeyboardInterrupt, sas.run_command, ["dotenvx", "encrypt"])
+        finally:
+            sas.subprocess.Popen = real_popen
+        self.assertEqual(events, ["kill", "wait"])
+
     @unittest.skipUnless(sas.which("git"), "git is not installed")
     def test_ensure_gitignore_asks_git_and_wins_over_negated_rules(self):
         folder = tempfile.mkdtemp(prefix="sweep-git-")
@@ -524,15 +868,21 @@ class UnitTests(unittest.TestCase):
                 fh.write(b"DOTENV_PRIVATE_KEY=fake\n")
             ignore = os.path.join(folder, ".gitignore")
             with io.open(ignore, "wb") as fh:
-                fh.write(b".env.keys*\n!.env.keys\n")        # a line matches, but git re-includes the file
+                fh.write(b".env.keys*\r\n!.env.keys\r\n")        # a line matches, but git re-includes the file
             self.assertFalse(sas.git_ignores(folder, keys))
             changed, message = sas.ensure_gitignore(folder, [keys])
             self.assertTrue(changed, message)
             self.assertNotIn("STILL", message)
             self.assertTrue(sas.git_ignores(folder, keys))
+            with io.open(ignore, "rb") as fh:
+                self.assertNotIn(b"\n.env.keys*\n", fh.read())   # keeps the file's CRLF line ends
             changed, message = sas.ensure_gitignore(folder, [keys])
             self.assertFalse(changed, message)
             self.assertIn("already ignores", message)
+            # a keys file that does not exist yet can be protected ahead of time
+            future = os.path.join(folder, "config", ".env.keys")
+            changed, message = sas.ensure_gitignore(folder, [future])
+            self.assertFalse(changed, message)
         finally:
             shutil.rmtree(folder, ignore_errors=True)
 
@@ -541,6 +891,74 @@ class UnitTests(unittest.TestCase):
             self.assertTrue(sas.is_env_file(name), name)
         for name in (".env.keys", ".env.keys.bak", ".env.vault", ".envrc", "environment.py", "env", "settings.py"):
             self.assertFalse(sas.is_env_file(name), name)
+        for name in (".env.example", ".env.sample", ".env.template", ".env.dist", "example.env", ".env.Example"):
+            self.assertTrue(sas.is_example_env_file(name), name)
+        for name in (".env", ".env.production", "prod.env", "example.txt"):
+            self.assertFalse(sas.is_example_env_file(name), name)
+        self.assertTrue(sas.is_lockfile("package-lock.json"))
+        self.assertTrue(sas.is_lockfile("Cargo.lock"))
+        self.assertFalse(sas.is_lockfile("lock.py"))
+
+    def test_is_excluded_accepts_either_separator(self):
+        rules = [re.compile(p) for p in sas.DEFAULT_EXCLUDES]
+        self.assertTrue(sas.is_excluded("/p/node_modules/x/.env", rules))
+        self.assertTrue(sas.is_excluded("C:\\p\\node_modules\\x\\.env".replace("\\", os.sep), rules))
+        self.assertTrue(sas.is_excluded("/p/.sweep-and-secure-abc", rules))
+        self.assertTrue(sas.is_excluded("/p/.env.keys", rules))
+        self.assertFalse(sas.is_excluded("/p/src/.env", rules))
+
+    def test_build_plan_ignores_findings_in_excluded_paths(self):
+        folder = tempfile.mkdtemp(prefix="sweep-unit-")
+        try:
+            path = os.path.join(folder, "node_modules", "pkg", "index.js")
+            os.makedirs(os.path.dirname(path))
+            with io.open(path, "wb") as fh:
+                fh.write(("const t = '%s';\n" % GITHUB_TOKEN).encode("utf-8"))
+            finding = sas.Finding(path, 1, "Github", GITHUB_TOKEN, "", False, "PLAIN", {})
+            args = sas.parse_args([folder, "--yes"])
+            rules = [re.compile(p) for p in sas.DEFAULT_EXCLUDES]
+            plan = sas.build_plan([finding], folder, os.path.join(folder, ".env"), args, [], rules)
+            self.assertEqual((plan.ignored, plan.items, plan.skipped), (1, [], []))
+            plan = sas.build_plan([finding], folder, os.path.join(folder, ".env"), args, [], [])
+            self.assertEqual(len(plan.items), 1)
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_fix_keys_hint_repoints_at_the_same_keys_file(self):
+        staged = os.path.join(os.sep, "proj", ".sweep-and-secure-x")
+        data = b'DOTENV_PUBLIC_KEY_PRODUCTION="02ab" # -fk ../.env.keys\nK=encrypted:x\n'
+        fixed = sas.fix_keys_hint(data, staged, os.path.join(os.sep, "proj", "config"))
+        self.assertEqual(fixed, b'DOTENV_PUBLIC_KEY_PRODUCTION="02ab" # -fk ../.env.keys\nK=encrypted:x\n')
+        fixed = sas.fix_keys_hint(data, staged, os.path.join(os.sep, "proj"))
+        self.assertEqual(fixed, b'DOTENV_PUBLIC_KEY_PRODUCTION="02ab" # -fk .env.keys\nK=encrypted:x\n')
+        self.assertEqual(sas.fix_keys_hint(b"no hint here\n", staged, os.sep), b"no hint here\n")
+
+    def test_cli_entry_point_returns_exit_codes(self):
+        real_main = sas.main
+        saved = sys.stderr
+        try:
+            sas.main = lambda argv=None: 0
+            self.assertEqual(sas.cli([]), 0)
+
+            def interrupted(argv=None):
+                raise KeyboardInterrupt()
+            sas.main = interrupted
+            sys.stderr = StringIO()
+            self.assertEqual(sas.cli([]), 130)
+            self.assertIn("Interrupted", sys.stderr.getvalue())
+        finally:
+            sas.main = real_main
+            sys.stderr = saved
+
+    @unittest.skipUnless(sys.version_info >= (3, 11), "tomllib")
+    def test_pyproject_console_script_points_at_a_real_function(self):
+        import tomllib
+        with io.open(os.path.join(REPO, "pyproject.toml"), "rb") as fh:
+            project = tomllib.load(fh)["project"]
+        module, function = project["scripts"]["sweep-and-secure"].split(":")
+        self.assertEqual(module, "sweep_and_secure")
+        self.assertTrue(callable(getattr(sas, function)))
+        self.assertEqual(project["dynamic"], ["version"])
 
     def test_mask_never_reveals_much(self):
         self.assertEqual(sas.mask(STRIPE_KEY), "sk_l...23")
@@ -555,6 +973,67 @@ class UnitTests(unittest.TestCase):
         self.assertEqual(finding.path, os.path.join(os.sep, "root", "src", "a.py"))
         self.assertEqual((finding.line, finding.detector, finding.verified), (3, "AWS", True))
         self.assertIsNone(sas.Finding.from_json({"SourceMetadata": {"Data": {"Git": {"commit": "x"}}}}, "/r"))
+
+
+REAL_TOOLS = os.environ.get("SWEEP_TEST_REAL_TOOLS") and sas.which("trufflehog") and sas.which("dotenvx")
+
+
+@unittest.skipUnless(REAL_TOOLS, "set SWEEP_TEST_REAL_TOOLS=1 with trufflehog and dotenvx on PATH")
+class RealToolsTests(unittest.TestCase):
+    """The same script against the real TruffleHog and dotenvx. The real TruffleHog
+    does not flag the test fixture's toy PEM key or GitHub token, so these tests
+    only assert on the credentials it does detect."""
+
+    def setUp(self):
+        self.tree = ProjectTree()
+        self.tree.write("config/.env.staging", ("STRIPE_KEY=%s\n" % STRIPE_KEY_2).encode("utf-8"))
+        self.tree.write(".env", ("PORT=3000\nSTRIPE_SECRET_KEY=%s\nDB_PASSWORD=%s\nPOSTGRES_PASSWORD=%s\n"
+                                 % (STRIPE_KEY, STRIPE_KEY_2, STRIPE_KEY_2)).encode("utf-8"))
+        self.path = os.pathsep.join(p for p in os.environ.get("PATH", "").split(os.pathsep) if p != FAKEBIN)
+        self.dotenvx = sas.which("dotenvx")
+
+    def tearDown(self):
+        self.tree.cleanup()
+
+    def get(self, key, env_file=".env", keys_file=None):
+        return dotenvx_get(self.tree.root, key, env_file, keys_file, binary=self.dotenvx)
+
+    def test_full_run_round_trips_and_reruns_cleanly(self):
+        code, first, err = run_script(self.tree.root, ["--yes", "--no-rewrite"], path=self.path)
+        self.assertEqual(code, 0, first + err)
+        # the nested env file was encrypted by this first run, so its advice is printed here
+        self.assertIn("dotenvx run -f config/.env.staging -fk .env.keys -- <your command>", first)
+        code, out, err = run_script(self.tree.root, ["--yes"], path=self.path)
+        self.assertEqual(code, 0, out + err)
+        env = self.tree.read(".env")
+        for secret in (STRIPE_KEY, STRIPE_KEY_2, AWS_ID, AWS_SECRET, SLACK, PG_URL):
+            self.assertNotIn(secret, env)
+            self.assertNotIn(secret, self.tree.read("src/settings.py") + self.tree.read("config/app.json"))
+        self.assertNotIn("_2=", env)
+        for key, want in (("STRIPE_SECRET_KEY", STRIPE_KEY), ("DB_PASSWORD", STRIPE_KEY_2),
+                          ("POSTGRES_PASSWORD", STRIPE_KEY_2), ("AWS_ACCESS_KEY_ID", AWS_ID),
+                          ("AWS_SECRET_ACCESS_KEY", AWS_SECRET), ("DATABASE_URL", PG_URL), ("SLACK_WEBHOOK", SLACK)):
+            self.assertEqual(self.get(key), want, key)
+        self.assertEqual(self.get("STRIPE_KEY", "config/.env.staging", ".env.keys"), STRIPE_KEY_2)
+        self.assertIn("(value already in .env)", out)   # the re-run recognised the stored values
+        self.assertIn('AWS_ACCESS_KEY_ID = "${AWS_ACCESS_KEY_ID}"', self.tree.read("src/settings.py"))
+        self.assertTrue(os.path.isfile(self.tree.path(".env.keys")))
+        self.assertIn(".env.keys*", self.tree.read(".gitignore"))
+        self.assertEqual(self.tree.leftovers(), [])
+
+    def test_quoting_round_trips_through_real_dotenvx(self):
+        values = {"PLAIN": "pa$$word${HOME} #x", "PEM": PEM, "APOS": "it's#a$ecret", "APOS_TICK": "it's `x` $HOME",
+                  "APOS_DQ": "it's \"q\" $y", "UNI": u"p\u00e4ss \u2713"}
+        lines = []
+        for key, value in values.items():
+            quoted, exact = sas.quote_env_value(value)
+            self.assertTrue(exact, key)
+            lines.append(u"%s=%s" % (key, quoted))
+        self.tree.write("quoting.env", (u"\n".join(lines) + u"\n").encode("utf-8"))
+        cmd = [self.dotenvx, "encrypt", "-f", "quoting.env"] + sum([["-k", k] for k in values], [])
+        subprocess.check_call(cmd, cwd=self.tree.root, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        for key, value in values.items():
+            self.assertEqual(self.get(key, "quoting.env"), value, key)
 
 
 if __name__ == "__main__":

@@ -29,16 +29,19 @@ DETECTORS = [
     ("PrivateKey", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"), {}),
     # Like the real detector, report the URL without the database path.
     ("Postgres", re.compile(r"postgres://[^\s\"'<>:@]+:[^\s\"'<>@]+@[^\s\"'<>/]+"), {}),
+    # A made-up credential format whose value may contain quotes, $ and backslashes, so
+    # that the test-suite can exercise dotenvx's quoting rules.
+    ("Password", re.compile(r"PWD-[A-Za-z0-9$'`\"\\]{8,}"), {}),
 ]
 AWS_ID = re.compile(r"\bAKIA[0-9A-Z]{16}\b")
 AWS_SECRET = re.compile(r"(?<![A-Za-z0-9/+=])[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])")
 
 
-def emit(path, text, offset, detector, raw, raw_v2, extra):
+def emit(path, text, offset, detector, raw, raw_v2, extra, decoder="PLAIN"):
     obj = {
         "SourceMetadata": {"Data": {"Filesystem": {"file": path, "line": text.count("\n", 0, offset) + 1}}},
         "SourceID": 1, "SourceType": 15, "SourceName": "trufflehog - filesystem",
-        "DetectorType": 0, "DetectorName": detector, "DecoderName": "PLAIN",
+        "DetectorType": 0, "DetectorName": detector, "DecoderName": decoder,
         "Verified": False, "Raw": raw, "RawV2": raw_v2, "Redacted": raw[:6] + "...",
         "ExtraData": extra or None,
     }
@@ -53,13 +56,18 @@ def scan_file(path):
             data = gzip.GzipFile(fileobj=io.BytesIO(data)).read()
         except (IOError, OSError, EOFError):
             return
-    text = data.decode("utf-8", "replace")
+    decoder = "PLAIN"
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):  # like TruffleHog's UTF16 decoder
+        text = data.decode("utf-16", "replace").lstrip(u"\ufeff")
+        decoder = "UTF16"
+    else:
+        text = data.decode("utf-8", "replace")
     for detector, pattern, extra in DETECTORS:
         for match in pattern.finditer(text):
             raw = match.group(0)
             if detector == "PrivateKey":  # like the real detector: report the decoded key
                 raw = raw.replace("\\n", "\n")
-            emit(path, text, match.start(), detector, raw, "", extra)
+            emit(path, text, match.start(), detector, raw, "", extra, decoder)
     ids = list(AWS_ID.finditer(text))
     if ids:
         secrets = [m.group(0) for m in AWS_SECRET.finditer(text) if not m.group(0).startswith("AKIA")]

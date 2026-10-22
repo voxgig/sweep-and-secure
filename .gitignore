@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
 .env.keys*
+# packaging artefacts
+build/
+dist/
+*.egg-info/
