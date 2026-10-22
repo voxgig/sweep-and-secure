@@ -129,6 +129,7 @@ Folder: /home/me/empty
   [ok] trufflehog  3.99.3     /usr/local/bin/trufflehog
   [ok] dotenvx     2.38.2     /usr/local/bin/dotenvx
 Scanning with TruffleHog (this can take a while on big trees) ...
+  Scanned 0 file(s) in 0:02; TruffleHog reported 0 finding(s).
 
 TruffleHog found no plaintext secrets to encrypt.
 
@@ -164,6 +165,12 @@ sweep-and-secure some/dir   # sweep a different folder
 Without installing, `python sweep_and_secure.py ...` (or
 `chmod +x sweep_and_secure.py && ./sweep_and_secure.py`) does the same.
 
+While TruffleHog runs, a status line shows how many files it has scanned, how
+many findings it has reported so far and the time spent, redrawn in place on a
+terminal and printed as a heartbeat line every 15 seconds when the output is a
+pipe or a CI log, so a long scan is visibly alive rather than hung. It ends with
+`Scanned N file(s) in M:SS; TruffleHog reported K finding(s).`
+
 The run is interactive: it first lists every secret TruffleHog found (the
 detector type, the key or variable name it will use, a masked preview, where it
 is, and what will happen to it), then the keys that are already encrypted with
@@ -176,7 +183,8 @@ dotenvx, then asks. Answer `y` to encrypt everything listed, `n` to stop, or
 | --- | --- |
 | a dotenv file (`.env`, `.env.production`, `prod.env`, ...), as the value of `KEY=...` | `dotenvx encrypt -k KEY` encrypts that key in place: `KEY="encrypted:..."`. Every key whose value holds the secret is encrypted, not just the first |
 | anywhere else (source code, JSON, YAML, Markdown, certificates, ...) | the value is added to the project's `.env` (`--env-file` to change) and encrypted there; the plaintext in the file is replaced by `${KEY}` (`--placeholder` to change) |
-| a binary or archive file, a symlink, a secret TruffleHog had to decode first, a PDF, a generated lock file (`package-lock.json`, `poetry.lock`, ...), an example env file (`.env.example`, `.env.sample`, ...) | listed under "cannot fix automatically" for you to deal with by hand |
+| an archive TruffleHog looked inside (`.zip`, `.jar`, `.tar.gz`, ...) | listed under "cannot fix automatically", unless `--quarantine` is given: then the whole archive is moved out of the tree into the quarantine folder, keeping its relative path, and the folder's `MANIFEST.txt` records where it came from |
+| a binary file, a symlink, a secret TruffleHog had to decode first, a PDF, a generated lock file (`package-lock.json`, `poetry.lock`, ...), an example env file (`.env.example`, `.env.sample`, ...) | listed under "cannot fix automatically" for you to deal with by hand |
 | a value dotenvx cannot store exactly (it contains an apostrophe together with a backslash, or with both a backtick and a double quote) | listed under "cannot fix automatically"; moving it would corrupt it |
 
 Variable names come from the code around the secret (`AWS_SECRET_ACCESS_KEY = "..."`,
@@ -265,6 +273,20 @@ file in a sub-folder the "Next steps" give the command with `-fk`
 - `--no-rewrite`: store the secrets encrypted but leave the source files as they
   are. A later run without the flag recognises the stored values and only does
   the rewriting; it does not store them twice.
+- `--quarantine`: move every archive that TruffleHog found a secret inside
+  (zip, jar, tar, gz, bz2, xz, 7z, rar, zstd ...) out of the tree into the
+  quarantine folder, `.secrets-quarantine` inside the swept folder by default,
+  keeping its relative path (`build/keys.zip` becomes
+  `.secrets-quarantine/build/keys.zip`, with a numeric suffix if that name is
+  taken). The folder's `MANIFEST.txt` gets a line per file with the time, the
+  original path and the detectors. The folder is added to `.gitignore` before
+  anything is moved and is never scanned afterwards. Archives appear as numbered
+  items ("move to ..."), so `s` lets you pick which to move. Other binary files
+  are not moved; they stay under "cannot fix automatically".
+- `--quarantine-dir DIR`: use DIR as the quarantine folder instead (relative to
+  the swept folder, or absolute, including a folder outside the tree); implies
+  `--quarantine`. A folder inside the tree is excluded from the scan for that
+  run. Reserved names and the swept folder itself are refused.
 - `--placeholder TEMPLATE`: the text that replaces a secret in a source file,
   with `NAME` standing for the variable name. Default `${NAME}`;
   `process.env.NAME`, `os.environ["NAME"]` or `<NAME>` are common alternatives.

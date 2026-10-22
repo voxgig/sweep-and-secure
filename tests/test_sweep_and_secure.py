@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -96,6 +97,9 @@ class ProjectTree(object):
         os.mkdir(os.path.join(self.root, "build"))
         with gzip.open(os.path.join(self.root, "build", "blob.txt.gz"), "wb") as fh:
             fh.write(("token %s inside an archive\n" % GITHUB_TOKEN).encode("utf-8"))
+        with zipfile.ZipFile(os.path.join(self.root, "build", "keys.zip"), "w") as archive:
+            archive.writestr("config/prod.env", "STRIPE_SECRET_KEY=%s\n" % STRIPE_KEY)
+            archive.writestr("readme.txt", "nothing here\n")
 
     def path(self, rel):
         return os.path.join(self.root, rel.replace("/", os.sep))
@@ -277,8 +281,12 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("Already encrypted with dotenvx", out)
         self.assertIn("DB_PASSWORD", out)
         self.assertIn("config/.env.production", out)
-        self.assertIn("build/blob.txt.gz", out)          # archive: listed as not fixable
-        self.assertIn("binary or archive", out)
+        self.assertIn("build/blob.txt.gz", out)          # archives: listed as not fixable without --quarantine
+        self.assertIn("build/keys.zip", out)
+        self.assertIn("gzip archive with a secret inside", out)
+        self.assertIn("zip archive with a secret inside", out)
+        self.assertIn("pass --quarantine", out)
+        self.assertTrue(re.search(r"Scanned \d+ file\(s\) in \d+:\d\d; TruffleHog reported \d+ finding\(s\)", out), out)
         self.assertNotIn("node_modules/pkg/.env", out)   # excluded by default
         self.assertIn("Other plaintext keys", out)       # PORT, APP_NAME, LOG_LEVEL
         self.assertIn("PORT", out)
@@ -325,9 +333,9 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(dotenvx_get(self.tree.root, "STRIPE_SECRET_KEY"), STRIPE_KEY)
         self.assertTrue(os.path.isfile(self.tree.path(".env.keys")))
         self.assertIn(".env.keys*", self.tree.read(".gitignore"))
-        self.assertUnchanged("node_modules/pkg/.env", "build/blob.txt.gz", "config/.env.production")
+        self.assertUnchanged("node_modules/pkg/.env", "build/blob.txt.gz", "build/keys.zip", "config/.env.production")
         self.assertIn("Done: 7 secret(s) stored encrypted; 11 plaintext occurrence(s) removed from 7 file(s);"
-                      " 1 need manual attention", out)
+                      " 2 need manual attention", out)
         self.assertIn("Next steps", out)
         self.assertIn("dotenvx run -- <your command>", out)
         self.assertNotIn("-fk", out)                     # .env and .env.keys share a folder
@@ -593,6 +601,51 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(code, 0, out + err)
         self.assertIn("Removed 2 leftover staging file(s)", out)
         self.assertNoLeftovers()
+
+    def test_quarantine_moves_archives_holding_secrets_out_of_the_tree(self):
+        _, listing, _ = run_script(self.tree.root, ["--dry-run", "--quarantine"])
+        self.assertIn("move to .secrets-quarantine/build/keys.zip", listing)
+        self.assertIn("move to .secrets-quarantine/build/blob.txt.gz", listing)
+        self.assertTrue(os.path.isfile(self.tree.path("build/keys.zip")))     # a dry run moves nothing
+        code, out, err = run_script(self.tree.root, ["--yes", "--quarantine"])
+        self.assertEqual(code, 0, out + err)
+        for rel in ("build/keys.zip", "build/blob.txt.gz"):
+            self.assertFalse(os.path.exists(self.tree.path(rel)), rel)
+            self.assertEqual(self.tree.read_bytes(".secrets-quarantine/" + rel), self.before[rel.replace("/", os.sep)])
+        manifest = self.tree.read(".secrets-quarantine/MANIFEST.txt")
+        self.assertIn("build/keys.zip  <- build/keys.zip  (Stripe)", manifest)
+        self.assertIn("build/blob.txt.gz  <- build/blob.txt.gz  (Github)", manifest)
+        self.assertIn("2 archive(s) moved to .secrets-quarantine", out)
+        self.assertIn("/.secrets-quarantine/", self.tree.read(".gitignore"))
+        self.assertIn("moved to .secrets-quarantine (see its MANIFEST.txt", out)
+        # the quarantine folder is never scanned, with or without the flag
+        for extra in ([], ["--quarantine"], ["--no-default-excludes"]):
+            code, out, err = run_script(self.tree.root, ["--dry-run"] + extra)
+            self.assertEqual(code, 0, out + err)
+            self.assertNotIn(".secrets-quarantine/build", out)
+            self.assertNotIn("keys.zip", out)
+
+    def test_quarantine_into_a_custom_folder_keeps_existing_files(self):
+        self.tree.write("q/build/keys.zip", b"earlier copy")
+        code, out, err = run_script(self.tree.root, ["--dry-run", "--quarantine-dir", "q"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("move to q/build/keys.zip", out)   # --quarantine-dir alone implies --quarantine
+        self.assertNotIn("q/build/keys.zip:", out)       # the custom folder itself is not scanned
+        code, out, err = run_script(self.tree.root, ["--yes", "--quarantine-dir", "q"])
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self.tree.read_bytes("q/build/keys.zip"), b"earlier copy")
+        self.assertTrue(os.path.isfile(self.tree.path("q/build/keys.zip.1")))
+        self.assertFalse(os.path.exists(self.tree.path("build/keys.zip")))
+        self.assertIn("/q/", self.tree.read(".gitignore"))
+        code, out, err = run_script(self.tree.root, ["--dry-run", "--quarantine-dir", "q"])
+        self.assertEqual(code, 0, out + err)
+        self.assertNotIn("q/build", out)                 # still excluded once the files are in there
+
+    def test_quarantine_refuses_reserved_folders(self):
+        for name in (".sweep-and-secure-q", ".env.keys", "."):
+            code, out, err = run_script(self.tree.root, ["--dry-run", "--quarantine-dir", name])
+            self.assertEqual(code, 1, name + "\n" + out + err)
+            self.assertIn("cannot be used", err)
 
     def test_nothing_found_is_a_clean_exit(self):
         clean = tempfile.mkdtemp(prefix="sweep-clean-")
@@ -966,6 +1019,54 @@ class UnitTests(unittest.TestCase):
             self.assertEqual(stale, [other])
         finally:
             shutil.rmtree(folder, ignore_errors=True)
+
+    def test_archive_kind(self):
+        folder = tempfile.mkdtemp(prefix="sweep-unit-")
+        try:
+            def write(name, data):
+                path = os.path.join(folder, name)
+                with io.open(path, "wb") as fh:
+                    fh.write(data)
+                return path
+            self.assertEqual(sas.archive_kind(write("a.bin", b"PK\x03\x04rest")), "zip")
+            self.assertEqual(sas.archive_kind(write("b.dat", b"\x1f\x8b\x08")), "gzip")
+            self.assertEqual(sas.archive_kind(write("c.tar", b"\x00" * 257 + b"ustar\x00")), "tar")
+            self.assertEqual(sas.archive_kind(write("d.jar", b"not really")), "jar")   # by name
+            self.assertIsNone(sas.archive_kind(write("e.txt", b"plain text\n")))
+            self.assertIsNone(sas.archive_kind(os.path.join(folder, "missing")))
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_scan_progress_counts_and_draws(self):
+        out = StringIO()
+        progress = sas.ScanProgress(stream=out, is_tty=False, heartbeat=0)
+        progress.saw_stderr(b'{"msg":"scanning file","path":"/a"}\n')
+        progress.saw_stderr(b'{"msg":"scanning file","path":"/b"}\n')
+        progress.saw_stderr(b'{"msg":"finished scanning"}\n')
+        progress.saw_stdout(b'{"DetectorName":"AWS"}\n')
+        progress.saw_stdout(b'not json\n')
+        progress.tick()
+        self.assertEqual((progress.files, progress.findings), (2, 1))
+        self.assertIn("2 file(s), 1 finding(s) so far", out.getvalue())
+        self.assertTrue(out.getvalue().endswith("\n"))                      # heartbeat lines
+        tty = StringIO()
+        progress = sas.ScanProgress(stream=tty, is_tty=True, heartbeat=0)
+        progress.REDRAW = 0
+        progress.tick()
+        self.assertTrue(tty.getvalue().startswith("\r  scanning ..."))       # redrawn in place
+        progress.finish()
+        self.assertTrue(tty.getvalue().endswith("\r"))                        # and cleared
+        sas.ScanProgress(stream=None).tick()                                   # silent mode never writes
+
+    def test_run_streaming_delivers_lines_as_they_come(self):
+        seen = []
+        code, out, err = sas.run_streaming(
+            [sys.executable, "-c", "import sys; print('{\"a\":1}'); sys.stderr.write('log\\n'); sys.exit(3)"],
+            None, lambda line: seen.append(("out", line)), lambda line: seen.append(("err", line)), lambda: None)
+        self.assertEqual(code, 3)
+        self.assertEqual([l.strip() for l in out], [b'{"a":1}'])
+        self.assertEqual([l.strip() for l in err], [b"log"])
+        self.assertEqual(sorted(k for k, _ in seen), ["err", "out"])
 
     def test_fix_keys_hint_repoints_at_the_same_keys_file(self):
         staged = os.path.join(os.sep, "proj", ".sweep-and-secure-x")
