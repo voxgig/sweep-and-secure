@@ -7,23 +7,22 @@ what it found, and -- once you say yes -- encrypts them with
 
 ```
 $ python sweep_and_secure.py
-sweep-and-secure 1.2.0  (TruffleHog + dotenvx)
+sweep-and-secure 1.3.0  (TruffleHog + dotenvx)
 Folder: /home/me/shop
   [ok] trufflehog  3.99.3     /usr/local/bin/trufflehog
   [ok] dotenvx     2.38.2     /usr/local/bin/dotenvx
 Scanning with TruffleHog (this can take a while on big trees) ...
+  Scanned 212 file(s) in 0:05; TruffleHog reported 6 finding(s).
 
-Plaintext secrets found: 5 in 4 file(s)
+Plaintext secrets found: 6 in 5 file(s)
   #  Type          Key / name             Secret     Where                Action
   1  Stripe        STRIPE_SECRET_KEY      sk_l...23  .env:2               encrypt in place
-  2  SlackWebhook  SLACK_WEBHOOK          http...wX  config/app.json:4    move to .env, replace with ${SLACK_WEBHOOK}
-  3  SlackWebhook  SLACK_WEBHOOK          http...wX  docs/notes.md:3      replace with ${SLACK_WEBHOOK} (value already in .env)
-  4  AWS           AWS_ACCESS_KEY_ID      AKIA...M2  src/settings.py:4    move to .env, replace with ${AWS_ACCESS_KEY_ID}
-  5  AWS           AWS_SECRET_ACCESS_KEY  1tUm...IU  src/settings.py:5    move to .env, replace with ${AWS_SECRET_ACCESS_KEY}
-
-Found but cannot fix automatically: 1
-  Github             build/blob.txt.gz
-                     binary or archive file - delete it or rebuild it without the secret
+  2  Github        -                      ghp_...3f  build/blob.txt.gz    move to .secrets-quarantine/build/blob.txt.gz
+  3  SlackWebhook  SLACK_WEBHOOK          http...wX  config/app.json:4    move to .env, replace with ${SLACK_WEBHOOK}
+  4  SlackWebhook  SLACK_WEBHOOK          http...wX  docs/notes.md:3      replace with ${SLACK_WEBHOOK} (value already in .env)
+  5  AWS           AWS_ACCESS_KEY_ID      AKIA...M2  src/settings.py:4    move to .env, replace with ${AWS_ACCESS_KEY_ID}
+  6  AWS           AWS_SECRET_ACCESS_KEY  1tUm...IU  src/settings.py:5    move to .env, replace with ${AWS_SECRET_ACCESS_KEY}
+  Archives holding secrets are offered for moving to .secrets-quarantine; answer s to leave them in place. A --yes run moves them only with --quarantine.
 
 Already encrypted with dotenvx (left as is): 1
   Key          Where
@@ -32,18 +31,20 @@ Already encrypted with dotenvx (left as is): 1
 Other plaintext keys in env files: 2  (not flagged by TruffleHog; add --env-all to encrypt them too)
   .env: PORT, APP_NAME
 
-Encrypt these 5 secret(s) now? [y/N/s]  (s = choose which): y
+Encrypt 5 secret(s) and move 1 archive(s) to quarantine now? [y/N/s]  (s = choose which): y
   [ok] added .env.keys* to /home/me/shop/.gitignore
+  [ok] added /.secrets-quarantine/ to /home/me/shop/.gitignore
 
 Encrypting ...
   [ok] .env: encrypted 4 key(s): STRIPE_SECRET_KEY, SLACK_WEBHOOK, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
   [ok] config/app.json: replaced 1 occurrence(s) of 1 secret(s) with placeholders (SLACK_WEBHOOK)
   [ok] docs/notes.md: replaced 1 occurrence(s) of 1 secret(s) with placeholders (SLACK_WEBHOOK)
   [ok] src/settings.py: replaced 2 occurrence(s) of 2 secret(s) with placeholders (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
+  [ok] build/blob.txt.gz: moved to .secrets-quarantine/build/blob.txt.gz
 
   [ok] private key file: .env.keys
 
-Done: 4 secret(s) stored encrypted; 4 plaintext occurrence(s) removed from 3 file(s); 1 need manual attention (see above)
+Done: 4 secret(s) stored encrypted; 4 plaintext occurrence(s) removed from 3 file(s); 1 archive(s) moved to .secrets-quarantine
 
 Next steps
   ...
@@ -58,7 +59,7 @@ route suits you. Each gives you a `sweep-and-secure` command.
 
 ```
 pipx install git+https://github.com/voxgig/sweep-and-secure            # latest from the default branch
-pipx install git+https://github.com/voxgig/sweep-and-secure@v1.2.0     # a specific release
+pipx install git+https://github.com/voxgig/sweep-and-secure@v1.3.0     # a specific release
 pipx run --spec git+https://github.com/voxgig/sweep-and-secure sweep-and-secure --dry-run   # try it without installing
 uvx --from git+https://github.com/voxgig/sweep-and-secure sweep-and-secure --dry-run
 ```
@@ -72,7 +73,7 @@ curl -sSfL https://github.com/voxgig/sweep-and-secure/releases/latest/download/i
 ```
 
 `-b DIR` chooses the folder (default: `/usr/local/bin` when writable, otherwise
-`~/.local/bin`), `-v v1.2.0` a specific release. The installer is `install.sh`
+`~/.local/bin`), `-v v1.3.0` a specific release. The installer is `install.sh`
 in this repository and is attached to every release, so you can read it first.
 
 **By hand**: download `sweep_and_secure.py` from the
@@ -109,46 +110,53 @@ cannot be executed from here); `--no-version-check` overrides that.
 Three commands check an install without changing anything, in increasing depth.
 
 ```
-sweep-and-secure --version    # sweep-and-secure 1.2.0
-sweep-and-secure --help       # the option reference (see Options below)
+sweep-and-secure --version      # sweep-and-secure 1.3.0
+sweep-and-secure --help         # the option reference (see Options below)
+sweep-and-secure --check-setup  # are TruffleHog and dotenvx in place, and do they run?
 ```
 
-These two run before TruffleHog and dotenvx are installed and exit at once with
-code 0, so they prove only that the script is on your `PATH` and that Python
-runs it. If you installed with pipx or uv and the command is not found, run
-`pipx ensurepath` (or `uv tool update-shell`) and open a new shell.
+The first two run before TruffleHog and dotenvx are installed and exit at once
+with code 0, so they prove only that the script is on your `PATH` and that
+Python runs it. If you installed with pipx or uv and the command is not found,
+run `pipx ensurepath` (or `uv tool update-shell`) and open a new shell.
 
-The full check is a dry run. It finds the two tools, reports their versions and
-locations, scans the folder and lists what a real run would do, and changes
-nothing. In an empty folder it looks like this:
+`--check-setup` is the check to run once the two tools are installed. It prints
+the Python it runs under, finds TruffleHog, dotenvx and git (optional) the way a
+real run does and shows their versions and locations, then runs both tools in a
+scratch folder under the system temp folder: TruffleHog scans a file that holds
+no secret, and dotenvx encrypts a throw-away value and decrypts it back, through
+the same code a real run uses. Nothing in the current folder is read or written,
+and the scratch folder is removed afterwards.
 
 ```
-$ mkdir empty && cd empty && sweep-and-secure --dry-run
-sweep-and-secure 1.2.0  (TruffleHog + dotenvx)
-Folder: /home/me/empty
+$ sweep-and-secure --check-setup
+sweep-and-secure 1.3.0  (TruffleHog + dotenvx)
+Python 3.12.3 (/home/me/.local/share/pipx/venvs/sweep-and-secure/bin/python) on Linux-6.8.0-x86_64-with-glibc2.39
   [ok] trufflehog  3.99.3     /usr/local/bin/trufflehog
   [ok] dotenvx     2.38.2     /usr/local/bin/dotenvx
-Scanning with TruffleHog (this can take a while on big trees) ...
-  Scanned 0 file(s) in 0:02; TruffleHog reported 0 finding(s).
+  [ok] git         2.43.0     /usr/bin/git  (optional: keeps .env.keys out of commits)
+  Scanned 1 file(s) in 0:02; TruffleHog reported 0 finding(s).
+  [ok] trufflehog  ran in a scratch folder: exit status 0, 1 file(s) scanned, no findings
+  [ok] dotenvx     ran in a scratch folder: encrypted a value, decrypted it back, wrote .env.keys
 
-TruffleHog found no plaintext secrets to encrypt.
-
-No dotenvx-encrypted keys found in env files yet.
-
-Nothing to encrypt.
+Setup looks good. Nothing was changed. Next: sweep-and-secure --dry-run in a project folder.
 ```
 
-Exit code 0 means everything is in place. If a tool is missing or too old the
-run stops before scanning, prints install links and exits 1; `--trufflehog PATH`
-and `--dotenvx PATH` (or the `TRUFFLEHOG_BIN` and `DOTENVX_BIN` environment
-variables) point it at a copy that is not on your `PATH`. A dry run in your real
-project is just as safe and shows the listing a real run would start with.
+Exit code 0 means a real run will find everything it needs. A tool that is
+missing, too old, or fails its scratch run is reported with install links and
+the exit code is 1; every tool is checked before the verdict, so one report
+lists everything that is wrong. `--trufflehog PATH` and `--dotenvx PATH` (or the
+`TRUFFLEHOG_BIN` and `DOTENVX_BIN` environment variables) point the check, like
+a run, at a copy that is not on your `PATH`.
+
+The last step is a dry run in your real project: `sweep-and-secure --dry-run`
+scans the folder and lists what a real run would do, and changes nothing.
 
 To check a downloaded `sweep_and_secure.py` against the published checksums,
 from the folder it was downloaded into (the curl installer does this for you):
 
 ```
-curl -sSfL -O https://github.com/voxgig/sweep-and-secure/releases/download/v1.2.0/SHA256SUMS
+curl -sSfL -O https://github.com/voxgig/sweep-and-secure/releases/download/v1.3.0/SHA256SUMS
 grep ' sweep_and_secure.py$' SHA256SUMS | sha256sum -c -      # macOS: ... | shasum -a 256 -c -
 ```
 
@@ -160,6 +168,7 @@ sweep-and-secure            # scan, list, ask, encrypt
 sweep-and-secure --dry-run  # scan and list only
 sweep-and-secure --yes      # no questions (scripts, CI)
 sweep-and-secure some/dir   # sweep a different folder
+sweep-and-secure --check-setup  # are TruffleHog and dotenvx in place? (see Checking the install)
 ```
 
 Without installing, `python sweep_and_secure.py ...` (or
@@ -174,8 +183,9 @@ pipe or a CI log, so a long scan is visibly alive rather than hung. It ends with
 The run is interactive: it first lists every secret TruffleHog found (the
 detector type, the key or variable name it will use, a masked preview, where it
 is, and what will happen to it), then the keys that are already encrypted with
-dotenvx, then asks. Answer `y` to encrypt everything listed, `n` to stop, or
-`s` to pick items by number (`1 3 5-7`).
+dotenvx, then asks. Answer `y` to do everything listed (encrypt the secrets and
+move archives that hold secrets into the quarantine folder), `n` to stop, or `s`
+to pick items by number (`1 3 5-7`).
 
 ### What happens to a secret
 
@@ -183,7 +193,7 @@ dotenvx, then asks. Answer `y` to encrypt everything listed, `n` to stop, or
 | --- | --- |
 | a dotenv file (`.env`, `.env.production`, `prod.env`, ...), as the value of `KEY=...` | `dotenvx encrypt -k KEY` encrypts that key in place: `KEY="encrypted:..."`. Every key whose value holds the secret is encrypted, not just the first |
 | anywhere else (source code, JSON, YAML, Markdown, certificates, ...) | the value is added to the project's `.env` (`--env-file` to change) and encrypted there; the plaintext in the file is replaced by `${KEY}` (`--placeholder` to change) |
-| an archive TruffleHog looked inside (`.zip`, `.jar`, `.tar.gz`, ...) | listed under "cannot fix automatically", unless `--quarantine` is given: then the whole archive is moved out of the tree into the quarantine folder, keeping its relative path, and the folder's `MANIFEST.txt` records where it came from |
+| an archive TruffleHog looked inside (`.zip`, `.jar`, `.tar.gz`, ...) | the whole archive is moved out of the tree into the quarantine folder (`.secrets-quarantine` in the swept folder, `--quarantine-dir` to change), keeping its relative path; the folder's `MANIFEST.txt` records where it came from. An interactive run lists the archive as a numbered item ("move to ..."), so `s` can leave it in place; a `--yes` run moves archives only when `--quarantine` is given and otherwise lists them under "cannot fix automatically" |
 | a binary file, a symlink, a secret TruffleHog had to decode first, a PDF, a generated lock file (`package-lock.json`, `poetry.lock`, ...), an example env file (`.env.example`, `.env.sample`, ...) | listed under "cannot fix automatically" for you to deal with by hand |
 | a value dotenvx cannot store exactly (it contains an apostrophe together with a backslash, or with both a backtick and a double quote) | listed under "cannot fix automatically"; moving it would corrupt it |
 
@@ -254,7 +264,9 @@ file in a sub-folder the "Next steps" give the command with `-fk`
   is found (1 only if the scan itself failed), so it suits install checks and
   CI audits.
 - `-y`, `--yes`: encrypt everything listed without asking; use it in scripts
-  and CI. Without it the question is asked even when stdin is not a terminal
+  and CI. Archives that hold secrets are moved to quarantine only if
+  `--quarantine` is also given, so an unattended run never relocates files it
+  was not told to. Without it the question is asked even when stdin is not a terminal
   and the answer is read from there: a piped `y` is accepted, and no input at
   all (end of file) counts as no, so the run lists the findings and exits 2.
 - `--env-file PATH`: the dotenv file that receives secrets moved out of other
@@ -273,16 +285,17 @@ file in a sub-folder the "Next steps" give the command with `-fk`
 - `--no-rewrite`: store the secrets encrypted but leave the source files as they
   are. A later run without the flag recognises the stored values and only does
   the rewriting; it does not store them twice.
-- `--quarantine`: move every archive that TruffleHog found a secret inside
-  (zip, jar, tar, gz, bz2, xz, 7z, rar, zstd ...) out of the tree into the
-  quarantine folder, `.secrets-quarantine` inside the swept folder by default,
-  keeping its relative path (`build/keys.zip` becomes
+- `--quarantine`: with `--yes`, also move every archive that TruffleHog found a
+  secret inside (zip, jar, tar, gz, bz2, xz, 7z, rar, zstd ...) out of the tree
+  into the quarantine folder, `.secrets-quarantine` inside the swept folder by
+  default, keeping its relative path (`build/keys.zip` becomes
   `.secrets-quarantine/build/keys.zip`, with a numeric suffix if that name is
   taken). The folder's `MANIFEST.txt` gets a line per file with the time, the
   original path and the detectors. The folder is added to `.gitignore` before
-  anything is moved and is never scanned afterwards. Archives appear as numbered
-  items ("move to ..."), so `s` lets you pick which to move. Other binary files
-  are not moved; they stay under "cannot fix automatically".
+  anything is moved and is never scanned afterwards. An interactive run offers
+  this without the flag: archives appear as numbered items ("move to ..."), `y`
+  includes them and `s` lets you leave them out. Other binary files are never
+  moved; they stay under "cannot fix automatically".
 - `--quarantine-dir DIR`: use DIR as the quarantine folder instead (relative to
   the swept folder, or absolute, including a folder outside the tree); implies
   `--quarantine`. A folder inside the tree is excluded from the scan for that
@@ -304,6 +317,11 @@ file in a sub-folder the "Next steps" give the command with `-fk`
   read. That is normally refused because it usually means the file cannot be
   executed from here (a POSIX shell script found on Windows, for instance), and
   the failure would otherwise surface half way through a run.
+- `--check-setup`: report the Python in use, find both tools (and git) as a run
+  would, run each in a scratch folder under the system temp folder, and exit:
+  0 when a real run would work, 1 when something is missing or broken, with
+  install links. Nothing is scanned and nothing in the folder is touched; see
+  "Checking the install".
 
 **Output**
 
@@ -321,7 +339,7 @@ file in a sub-folder the "Next steps" give the command with `-fk`
 | code | meaning |
 | --- | --- |
 | 0 | done, or nothing to do; also every dry run whose scan completed |
-| 1 | a tool is missing or unusable; the scan failed or was cut short; an encryption or its verification failed; or an unexpected error stopped the run, in which case the state of the tree is printed |
+| 1 | a tool is missing or unusable (also `--check-setup`'s verdict when a tool is missing or fails its scratch run); the scan failed or was cut short; an encryption or its verification failed; or an unexpected error stopped the run, in which case the state of the tree is printed |
 | 2 | you answered no, or gave no answer: stdin was not a terminal, nothing was piped in and `--yes` was not given |
 | 130 | interrupted with Ctrl-C; what had already been changed is printed |
 
@@ -345,8 +363,9 @@ file in a sub-folder the "Next steps" give the command with `-fk`
 * TruffleHog only knows the credential formats it has detectors for; a plain
   `DB_PASSWORD=hunter2` in a `.env` file is listed under "other plaintext keys"
   and is encrypted only with `--env-all`.
-* Secrets inside binaries, archives (TruffleHog looks inside them), PDFs, lock
-  files or base64-encoded text are reported but not rewritten.
+* Secrets inside binaries, PDFs, lock files or base64-encoded text are reported
+  but not rewritten. Archives (TruffleHog looks inside them) are not rewritten
+  either; they can only be moved to the quarantine folder as a whole.
 * dotenvx expands `$NAME` and backslash escapes in double-quoted and backtick
   values and keeps `\"` and `\\` as they are, so a value containing an apostrophe
   together with a backslash (or with a backtick and a double quote) cannot be
@@ -375,7 +394,7 @@ with the current TruffleHog and dotenvx, and a packaging job that builds the
 wheel, runs the console script and exercises `install.sh`.
 
 To release: set `__version__` in `sweep_and_secure.py`, merge, then either push
-a matching tag (`git tag v1.2.0 && git push origin v1.2.0`) or run the release
+a matching tag (`git tag v1.3.0 && git push origin v1.3.0`) or run the release
 workflow from the Actions tab with the version, which creates the tag for you.
 The workflow (`.github/workflows/release.yml`) checks that the tag matches the
 version, runs the tests, builds the sdist and wheel, and publishes a GitHub
