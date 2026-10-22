@@ -42,13 +42,21 @@ PEM = ("-----BEGIN " + "PRIVATE KEY-----\n"
        "MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC7\n"
        "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\n"
        "-----END " + "PRIVATE KEY-----")
-PEM_KEY = "PRIVATE_KEY_" + hashlib.sha256(PEM.encode("utf-8")).hexdigest()[:6].upper()
+# The key appears bare in docs/deploy_key.pem (no name to derive) and as "private_key"
+# in config/service_account.json; the context from any occurrence names the variable.
+PEM_KEY = "PRIVATE_KEY"
+PEM_FALLBACK_KEY = "PRIVATE_KEY_" + hashlib.sha256(PEM.encode("utf-8")).hexdigest()[:6].upper()
 
 FILES = {
     ".env": "PORT=3000\nSTRIPE_SECRET_KEY=%s\nAPP_NAME=demo\n" % STRIPE_KEY,
     ".gitignore": "node_modules/\n",
     "config/.env.production": 'DOTENV_PUBLIC_KEY="02abc"\nDB_PASSWORD="encrypted:QUJD"\nLOG_LEVEL=info\n',
     "config/app.json": '{\n  "name": "demo",\n  "slack_webhook": "%s"\n}\n' % SLACK,
+    # the same PEM key as docs/deploy_key.pem, but JSON-escaped on one line
+    "config/service_account.json": ('{\n  "type": "service_account",\n  "private_key": "%s"\n}\n'
+                                    % PEM.replace("\n", "\\n")),
+    # URLs in prose, followed by punctuation that is not part of the URL
+    "docs/db.md": "Connect with %s. Read replica: [%s]\n" % (PG_URL, PG_URL),
     "src/settings.py": ('DEBUG = True\nAWS_ACCESS_KEY_ID = "%s"\nAWS_SECRET_ACCESS_KEY = "%s"\n'
                         'DATABASE_URL = "%s"\n' % (AWS_ID, AWS_SECRET, PG_URL)),
     "src/client.js": "const token = '%s';\nconst stripe = require('stripe')('%s');\n" % (GITHUB_TOKEN, STRIPE_KEY),
@@ -166,11 +174,12 @@ class EndToEndTests(unittest.TestCase):
     def test_dry_run_lists_findings_with_types_and_already_encrypted_keys(self):
         code, out, err = run_script(self.tree.root, ["--dry-run"])
         self.assertEqual(code, 0, out + err)
-        self.assertIn("Plaintext secrets found: 9", out)
+        self.assertIn("Plaintext secrets found: 11 in 8 file(s)", out)
         for needle in ("Stripe", "STRIPE_SECRET_KEY", "encrypt in place",
                        "AWS", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
                        "Postgres", "DATABASE_URL", "SlackWebhook", "SLACK_WEBHOOK",
-                       "PrivateKey", PEM_KEY, "Github", "GITHUB_TOKEN", "src/settings.py:2"):
+                       "PrivateKey", PEM_KEY, "Github", "GITHUB_TOKEN", "src/settings.py:2",
+                       "config/service_account.json:3", "docs/db.md:1"):
             self.assertIn(needle, out)
         self.assertIn("Already encrypted with dotenvx", out)
         self.assertIn("DB_PASSWORD", out)
@@ -188,7 +197,7 @@ class EndToEndTests(unittest.TestCase):
     def test_answering_no_changes_nothing(self):
         code, out, err = run_script(self.tree.root, [], stdin_text="n\n")
         self.assertEqual(code, 2, out + err)
-        self.assertIn("Encrypt these 9 secret(s) now?", out)
+        self.assertIn("Encrypt these 11 secret(s) now?", out)
         self.assertIn("Nothing encrypted", out)
         self.assertUnchanged()
 
@@ -212,15 +221,18 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("${SLACK_WEBHOOK}", self.tree.read("docs/notes.md"))
         self.assertIn('"${SLACK_WEBHOOK}"', self.tree.read("config/app.json"))
         self.assertEqual(self.tree.read("docs/deploy_key.pem"), "${%s}\n" % PEM_KEY)
+        # the escaped copy of the key is replaced too, and the punctuation around URLs survives
+        self.assertIn('"private_key": "${%s}"' % PEM_KEY, self.tree.read("config/service_account.json"))
+        self.assertEqual(self.tree.read("docs/db.md"), "Connect with ${DATABASE_URL}. Read replica: [${DATABASE_URL}]\n")
         # decrypt round trip through the stand-in, including the multi-line and extended values
         self.assertEqual(fake_dotenvx_get(self.tree.root, "AWS_SECRET_ACCESS_KEY"), AWS_SECRET)
         self.assertEqual(fake_dotenvx_get(self.tree.root, "DATABASE_URL"), PG_URL)
-        self.assertEqual(fake_dotenvx_get(self.tree.root, PEM_KEY), PEM)
+        self.assertEqual(fake_dotenvx_get(self.tree.root, PEM_KEY), PEM)   # real newlines, not "\n" text
         self.assertEqual(fake_dotenvx_get(self.tree.root, "STRIPE_SECRET_KEY"), STRIPE_KEY)
         self.assertTrue(os.path.isfile(self.tree.path(".env.keys")))
         self.assertIn(".env.keys*", self.tree.read(".gitignore"))
         self.assertUnchanged("node_modules/pkg/.env", "build/blob.txt.gz", "config/.env.production")
-        self.assertIn("Done: 9 secret(s) encrypted, 1 need manual attention", out)
+        self.assertIn("Done: 11 secret(s) encrypted, 1 need manual attention", out)
         self.assertIn("Next steps", out)
         self.assertIn("dotenvx run -- <your command>", out)
         self.assertIn("howtorotate.com/docs/tutorials/stripe/", out)
@@ -249,6 +261,31 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(fake_dotenvx_get(self.tree.root, "SLACK_WEBHOOK"), SLACK)
         self.assertIn("${SLACK_WEBHOOK}", self.tree.read("docs/notes.md"))
         self.assertUnchanged("config/app.json", "src/settings.py")
+
+    def test_selecting_only_a_source_copy_also_encrypts_the_plaintext_env_key(self):
+        # The Stripe key sits in .env (plaintext) and in src/client.js. Choosing only the
+        # client.js item must still encrypt the .env entry its placeholder points at.
+        _, listing, _ = run_script(self.tree.root, ["--dry-run"])
+        number = item_number(listing, "Stripe", "STRIPE_SECRET_KEY", where="src/client.js")
+        code, out, err = run_script(self.tree.root, [], stdin_text="s\n%s\ny\n" % number)
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("('${STRIPE_SECRET_KEY}')", self.tree.read("src/client.js"))
+        env = self.tree.read(".env")
+        self.assertNotIn(STRIPE_KEY, env)
+        self.assertIn('STRIPE_SECRET_KEY="encrypted:', env)
+        self.assertEqual(fake_dotenvx_get(self.tree.root, "STRIPE_SECRET_KEY"), STRIPE_KEY)
+        self.assertUnchanged("src/settings.py", "config/app.json")
+
+    def test_partial_trufflehog_failure_is_handled_but_fails_the_run(self):
+        code, out, err = run_script(self.tree.root, ["--dry-run"], extra_env={"FAKE_TRUFFLEHOG_PARTIAL": "1"})
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("INCOMPLETE", out)
+        self.assertIn("Plaintext secrets found", out)
+        self.assertUnchanged()
+        code, out, err = run_script(self.tree.root, ["--yes"], extra_env={"FAKE_TRUFFLEHOG_PARTIAL": "1"})
+        self.assertEqual(code, 1, out + err)
+        self.assertIn("scan was incomplete", out)
+        self.assertIn('STRIPE_SECRET_KEY="encrypted:', self.tree.read(".env"))  # what was found is fixed
 
     def test_bad_selection_input_is_rejected(self):
         code, out, err = run_script(self.tree.root, [], stdin_text="maybe\ns\n0 99\n\nn\n")
@@ -358,6 +395,7 @@ class UnitTests(unittest.TestCase):
         self.assertEqual(sas.choose_name("Stripe", "DOTENV_THING", "x"), "APP_DOTENV_THING")
         self.assertTrue(re.match(r"^STRIPE_SECRET_[0-9A-F]{6}$", sas.choose_name("Stripe", None, "x")))
         self.assertTrue(re.match(r"^PRIVATE_KEY_[0-9A-F]{6}$", sas.choose_name("PrivateKey", None, "x")))
+        self.assertEqual(sas.choose_name("PrivateKey", None, PEM), PEM_FALLBACK_KEY)
         self.assertEqual(sas.choose_name("Stripe", "123abc", "x"), "STRIPE_123ABC")
 
     def test_detector_words(self):
@@ -395,14 +433,108 @@ class UnitTests(unittest.TestCase):
         short = sas.Finding("/p", 1, "X", "abcdefghij", "abcdefghij:5432", False, "PLAIN", {})
         self.assertEqual(sas.candidate_secrets(short), ["abcdefghij", "abcdefghij:5432"])
 
+    def test_candidate_secrets_keeps_boundary_characters_of_the_second_part(self):
+        secret = "abc/DEF+ghi/JKL=mno/PQR=="          # '/' and '=' at the edges are part of it
+        finding = sas.Finding("/p", 1, "X", "ID0123456789", "ID0123456789:" + secret, False, "PLAIN", {})
+        self.assertIn(secret, sas.candidate_secrets(finding))
+        finding = sas.Finding("/p", 1, "X", "ID0123456789", secret + ":ID0123456789", False, "PLAIN", {})
+        self.assertIn(secret, sas.candidate_secrets(finding))
+        finding = sas.Finding("/p", 1, "X", "ID0123456789", "ID0123456789" + secret, False, "PLAIN", {})
+        self.assertIn(secret, sas.candidate_secrets(finding))  # no delimiter at all
+
     def test_locate_extends_urls_and_handles_escaped_newlines(self):
         data = ('DATABASE_URL = "%s"\nOTHER = "%s"\n' % (PG_URL, PG_URL.replace("/app", "/test"))).encode("utf-8")
         found = sas.locate(data, PG_URL[:PG_URL.rindex("/")], "PLAIN")
-        self.assertEqual([token for token, _, _ in found],
+        self.assertEqual([token for token, _, _, _ in found],
                          [PG_URL.encode("utf-8"), PG_URL.replace("/app", "/test").encode("utf-8")])
+        self.assertEqual([canonical for _, _, _, canonical in found], [PG_URL, PG_URL.replace("/app", "/test")])
+        prose = ("See %s. Then [%s], (%s) and %s!" % (PG_URL, PG_URL, PG_URL, PG_URL)).encode("utf-8")
+        found = sas.locate(prose, PG_URL[:PG_URL.rindex("/")], "PLAIN")
+        self.assertEqual([token for token, _, _, _ in found], [PG_URL.encode("utf-8")] * 4)
         escaped = b'KEY="-----BEGIN X-----\\nabc\\n-----END X-----"'
-        self.assertEqual(len(sas.locate(escaped, "-----BEGIN X-----\nabc\n-----END X-----", "PLAIN")), 1)
+        found = sas.locate(escaped, "-----BEGIN X-----\nabc\n-----END X-----", "PLAIN")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0][0], b"-----BEGIN X-----\\nabc\\n-----END X-----")  # replaced in the file
+        self.assertEqual(found[0][3], "-----BEGIN X-----\nabc\n-----END X-----")      # stored in .env
         self.assertEqual(sas.locate(b"nothing here", "missing-secret", "PLAIN"), [])
+
+    def test_trim_url_tail(self):
+        self.assertEqual(sas.trim_url_tail(b"postgres://h/db.", b"postgres://h"), b"postgres://h/db")
+        self.assertEqual(sas.trim_url_tail(b"postgres://h/db],", b"postgres://h"), b"postgres://h/db")
+        self.assertEqual(sas.trim_url_tail(b"postgres://h/a(1)", b"postgres://h"), b"postgres://h/a(1)")
+        self.assertEqual(sas.trim_url_tail(b"postgres://h.", b"postgres://h."), b"postgres://h.")
+
+    def test_find_tool_returns_an_absolute_path(self):
+        self.assertTrue(os.path.isabs(sas.find_tool("dotenvx", os.path.join(FAKEBIN, "dotenvx"), REPO)))
+        cwd = os.getcwd()
+        os.chdir(HERE)
+        try:
+            found = sas.find_tool("dotenvx", os.path.join("fakebin", "dotenvx"), REPO)
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(found, os.path.join(FAKEBIN, "dotenvx"))
+
+    def test_interrupt_during_dotenvx_restores_the_env_file(self):
+        folder = tempfile.mkdtemp(prefix="sweep-unit-")
+        real_encrypt = sas.dotenvx_encrypt
+
+        def interrupted(*args, **kwargs):
+            raise KeyboardInterrupt()
+
+        try:
+            existing = os.path.join(folder, ".env")
+            with io.open(existing, "wb") as fh:
+                fh.write(b"PORT=3000\n")
+            args = sas.parse_args([folder, "--yes"])
+            job = {"keys": ["NEW_KEY"], "new": [("NEW_KEY", "value")], "items": []}
+            sas.dotenvx_encrypt = interrupted
+            self.assertRaises(KeyboardInterrupt, sas.encrypt_env_file, existing, job, "dotenvx", folder, args)
+            with io.open(existing, "rb") as fh:
+                self.assertEqual(fh.read(), b"PORT=3000\n")
+            missing = os.path.join(folder, "new.env")
+            self.assertRaises(KeyboardInterrupt, sas.encrypt_env_file, missing, job, "dotenvx", folder, args)
+            self.assertFalse(os.path.exists(missing))
+        finally:
+            sas.dotenvx_encrypt = real_encrypt
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_write_bytes_replaces_atomically_and_keeps_the_mode(self):
+        folder = tempfile.mkdtemp(prefix="sweep-unit-")
+        try:
+            path = os.path.join(folder, "settings.py")
+            with io.open(path, "wb") as fh:
+                fh.write(b"old")
+            os.chmod(path, 0o640)
+            sas.write_bytes(path, b"new content")
+            with io.open(path, "rb") as fh:
+                self.assertEqual(fh.read(), b"new content")
+            if os.name != "nt":
+                self.assertEqual(os.stat(path).st_mode & 0o777, 0o640)
+            self.assertEqual(os.listdir(folder), ["settings.py"])  # no temp file left behind
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    @unittest.skipUnless(sas.which("git"), "git is not installed")
+    def test_ensure_gitignore_asks_git_and_wins_over_negated_rules(self):
+        folder = tempfile.mkdtemp(prefix="sweep-git-")
+        try:
+            subprocess.check_call(["git", "init", "-q", folder])
+            keys = os.path.join(folder, ".env.keys")
+            with io.open(keys, "wb") as fh:
+                fh.write(b"DOTENV_PRIVATE_KEY=fake\n")
+            ignore = os.path.join(folder, ".gitignore")
+            with io.open(ignore, "wb") as fh:
+                fh.write(b".env.keys*\n!.env.keys\n")        # a line matches, but git re-includes the file
+            self.assertFalse(sas.git_ignores(folder, keys))
+            changed, message = sas.ensure_gitignore(folder, [keys])
+            self.assertTrue(changed, message)
+            self.assertNotIn("STILL", message)
+            self.assertTrue(sas.git_ignores(folder, keys))
+            changed, message = sas.ensure_gitignore(folder, [keys])
+            self.assertFalse(changed, message)
+            self.assertIn("already ignores", message)
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
 
     def test_is_env_file(self):
         for name in (".env", ".env.production", "prod.env", ".env.local", ".env.example"):

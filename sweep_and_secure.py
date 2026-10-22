@@ -35,6 +35,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -171,6 +172,9 @@ SECRETISH_WORDS = set("KEY TOKEN SECRET PASSWORD WEBHOOK URI URL DSN CREDENTIALS
 
 ENCRYPTED_PREFIX = "encrypted:"
 MIN_FRAGMENT_LENGTH = 16   # a RawV2 remainder must be at least this long to be trusted
+PAIR_DELIMITERS = (":", ";", ",", "|", "&")   # what TruffleHog puts between RawV2 parts
+URL_TAIL_PUNCTUATION = b".,;:!?"
+URL_CLOSERS = {b")": b"(", b"]": b"[", b"}": b"{"}
 MAX_FILE_BYTES = 64 * 1024 * 1024
 
 
@@ -261,8 +265,33 @@ def read_bytes(path):
 
 
 def write_bytes(path, data):
-    with io.open(path, "wb") as fh:
-        fh.write(data)
+    """Write data to path atomically (temp file + rename) so that an interrupt can
+    never leave a truncated file behind; the file's permission bits are kept."""
+    folder = os.path.dirname(path) or "."
+    try:
+        handle, tmp = tempfile.mkstemp(prefix=".sweep-and-secure-", dir=folder)
+    except (IOError, OSError):
+        with io.open(path, "wb") as fh:  # folder not writable for us: plain write
+            fh.write(data)
+        return
+    try:
+        with io.open(handle, "wb") as fh:
+            fh.write(data)
+        if os.path.exists(path):
+            try:
+                shutil.copymode(path, tmp)
+            except (IOError, OSError):
+                pass
+        replace = getattr(os, "replace", None)
+        if replace is None and os.name == "nt" and os.path.exists(path):  # Python 2 on Windows
+            os.remove(path)
+        (replace or os.rename)(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def read_text(path):
@@ -441,7 +470,8 @@ def find_tool(name, override, root):
     for candidate in candidates:
         found = which(candidate)
         if found:
-            return fs_text(found)
+            # absolute, because the tools are later run with the swept folder as cwd
+            return os.path.abspath(fs_text(found))
     return None
 
 
@@ -560,7 +590,10 @@ def run_trufflehog(binary, root, exclude_patterns, args):
     if args.verbose:
         say(u"  $ " + u" ".join(cmd))
     try:
-        code, out, err = run_command(cmd, cwd=root)
+        try:
+            code, out, err = run_command(cmd, cwd=root)
+        except (OSError, IOError) as exc:
+            raise ToolError(u"could not run %s: %s" % (binary, to_text(str(exc))))
     finally:
         if exclude_file:
             try:
@@ -637,8 +670,8 @@ class Item(object):
         self.line = line
         self.detector = detector
         self.verified = verified
-        self.secret = secret
-        self.secret_bytes = secret_bytes
+        self.secret = secret              # the value to store (decoded form)
+        self.secret_bytes = secret_bytes  # the bytes as they sit in the file (replaced)
         self.encoding = encoding
         self.extra = extra or {}
         self.context = None       # identifier guessed from the surrounding line
@@ -679,8 +712,14 @@ def candidate_secrets(finding):
             out.append(text)
     if finding.raw and finding.raw_v2 and finding.raw_v2 != finding.raw and finding.raw in finding.raw_v2:
         before, after = finding.raw_v2.split(finding.raw, 1)
+        # Drop only the one delimiter TruffleHog puts between the parts ("id:secret");
+        # characters such as '=' or '/' may be a real part of the credential.
+        before, after = before.strip(), after.strip()
+        if before[-1:] in PAIR_DELIMITERS:
+            before = before[:-1]
+        if after[:1] in PAIR_DELIMITERS:
+            after = after[1:]
         for fragment in (before, after):
-            fragment = fragment.strip(" \t\r\n:;,/|=&?")
             if (len(fragment) >= MIN_FRAGMENT_LENGTH and fragment not in out
                     and re.match(r"^[A-Za-z0-9+/=_.\-]+$", fragment)):
                 out.append(fragment)
@@ -695,8 +734,28 @@ def token_pattern(secret_bytes, secret_text, encoding):
     return re.compile(re.escape(secret_bytes))
 
 
+def trim_url_tail(token, needle):
+    """Drop sentence punctuation and unbalanced closing brackets that the URL
+    extension swallowed (`See https://x/y.` or `[https://x/y]`), never cutting
+    into the part TruffleHog itself reported."""
+    while len(token) > len(needle):
+        last = token[-1:]
+        if last in URL_TAIL_PUNCTUATION:
+            token = token[:-1]
+        elif last in URL_CLOSERS and token.count(URL_CLOSERS[last]) < token.count(last):
+            token = token[:-1]
+        else:
+            break
+    return token
+
+
 def locate(data, secret, decoder):
-    """Find every occurrence of secret in data. Returns [(token_bytes, encoding, offset)]."""
+    """Find every occurrence of secret in data.
+
+    Returns [(token_bytes, encoding, offset, canonical_text)]: token_bytes is what
+    sits in the file (and gets replaced), canonical_text is the value to store,
+    which is the decoded secret when the file holds an escaped form of it.
+    """
     encodings = ["utf-8"]
     if "UTF16" in (decoder or "").upper():
         encodings = ["utf-16-le", "utf-16-be"]
@@ -713,7 +772,13 @@ def locate(data, secret, decoder):
             if not needle or needle not in data:
                 continue
             pattern = token_pattern(needle, variant, encoding)
-            found = [(m.group(0), encoding, m.start()) for m in pattern.finditer(data)]
+            found = []
+            for match in pattern.finditer(data):
+                token = match.group(0)
+                if "://" in variant:
+                    token = trim_url_tail(token, needle)
+                canonical = token.decode(encoding, "replace") if variant == secret else secret
+                found.append((token, encoding, match.start(), canonical))
             if found:
                 return found
     return []
@@ -761,7 +826,7 @@ def build_plan(findings, root, store, args, env_plaintext):
             if len(candidate) < args.min_length:
                 too_short = True
                 continue
-            for token_bytes, encoding, offset in locate(data, candidate, finding.decoder):
+            for token_bytes, encoding, offset, canonical in locate(data, candidate, finding.decoder):
                 located = True
                 ident = (finding.path, token_bytes)
                 if ident in seen:
@@ -770,8 +835,7 @@ def build_plan(findings, root, store, args, env_plaintext):
                 line_start = data.rfind(b"\n", 0, offset) + 1
                 prefix = data[line_start:offset].decode(encoding, "replace")
                 item = Item(finding.path, offset, line, finding.detector, finding.verified,
-                            token_bytes.decode(encoding, "replace"), token_bytes, encoding,
-                            finding.extra)
+                            canonical, token_bytes, encoding, finding.extra)
                 item.context = guess_name_from_prefix(prefix)
                 seen[ident] = item
                 plan.items.append(item)
@@ -1032,15 +1096,23 @@ def encrypt_env_file(env_path, job, dotenvx, root, args):
         if not_done:
             raise ToolError(u"dotenvx finished but these keys are still plaintext: " + u", ".join(not_done))
     except (ToolError, IOError, OSError) as exc:
-        if original is not None:
-            write_bytes(env_path, original)
-        elif os.path.isfile(env_path):
-            try:
-                os.remove(env_path)
-            except OSError:
-                pass
+        restore_file(env_path, original)
         return False, to_text(str(exc)), inexact
+    except KeyboardInterrupt:  # Ctrl-C while dotenvx runs: never leave staged plaintext behind
+        restore_file(env_path, original)
+        raise
     return True, u"", inexact
+
+
+def restore_file(path, original):
+    """Put a file back the way it was: original bytes, or gone if it did not exist."""
+    if original is not None:
+        write_bytes(path, original)
+    elif os.path.isfile(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 def rewrite_source(path, items, args):
@@ -1078,26 +1150,31 @@ def execute(plan, chosen, dotenvx, args, style):
             job["keys"].append(item.key)
             job["new"].append((item.key, item.secret))
             job["items"].append(item)
-    # A placeholder must never point at a key that does not exist: when the item
-    # that was going to add the entry was not selected, add it here instead.
-    existing_keys = {}
+    # A placeholder must never point at a key that is missing or still plaintext:
+    # when the item that was going to add or encrypt that entry was not selected,
+    # take care of it here.
+    existing = {}
     for item in chosen:
         if item.kind != "source" or item.new_entry:
             continue
-        if item.store not in existing_keys:
-            keys_in_file = set()
+        if item.store not in existing:
+            values = {}
             if os.path.isfile(item.store):
                 try:
-                    keys_in_file = set(key for key, _, _ in parse_env_entries(read_text(item.store)))
+                    for key, value, _ in parse_env_entries(read_text(item.store)):
+                        values[key] = value
                 except (IOError, OSError):
                     pass
-            existing_keys[item.store] = keys_in_file
-        if item.key in existing_keys[item.store] or (item.store in env_jobs
-                                                      and item.key in env_jobs[item.store]["keys"]):
-            continue
+            existing[item.store] = values
+        values = existing[item.store]
+        if item.store in env_jobs and item.key in env_jobs[item.store]["keys"]:
+            continue  # a selected item already adds or encrypts it
+        if item.key in values and values[item.key].startswith(ENCRYPTED_PREFIX):
+            continue  # already encrypted
         job = job_for(item.store)
         job["keys"].append(item.key)
-        job["new"].append((item.key, item.secret))
+        if item.key not in values:
+            job["new"].append((item.key, item.secret))
         job["items"].append(item)
     for path, keys in plan.extra_env_keys.items():
         if any(item.store == path for item in chosen):
@@ -1191,18 +1268,45 @@ def discover_keys_files(env_paths, root):
     return found
 
 
-def ensure_gitignore(git_root):
-    """Make sure .env.keys* is ignored. Returns (changed, message)."""
+def git_ignores(git_root, path):
+    """Ask git whether path is ignored: True / False, or None when git cannot tell."""
+    git = which("git")
+    if not git:
+        return None
+    try:
+        code, _, _ = run_command([git, "check-ignore", "-q", "--no-index", "--", path], cwd=git_root)
+    except (OSError, IOError):
+        return None
+    if code in (0, 1):
+        return code == 0
+    return None
+
+
+def ensure_gitignore(git_root, keys_files):
+    """Make sure the private key file(s) are ignored by git. Returns (changed, message).
+
+    Asks git itself (`git check-ignore`) so nested .gitignore files and negated
+    rules are honoured; without git, falls back to looking for a matching line.
+    """
     ignore_path = os.path.join(git_root, ".gitignore")
     existing = read_text(ignore_path) if os.path.isfile(ignore_path) else u""
-    patterns = set(line.strip() for line in existing.splitlines())
-    if patterns & set([".env.keys", ".env.keys*", ".env*", ".env.*", "*.keys", "/.env.keys", "**/.env.keys"]):
-        return False, u".gitignore already ignores .env.keys"
+    verdicts = [git_ignores(git_root, keys_file) for keys_file in keys_files]
+    if verdicts and all(verdict is True for verdict in verdicts):
+        return False, u"git already ignores %s" % u", ".join(os.path.basename(k) for k in keys_files)
+    if any(verdict is None for verdict in verdicts):
+        patterns = set(line.strip() for line in existing.splitlines())
+        if patterns & set([".env.keys", ".env.keys*", ".env*", ".env.*", "*.keys", "/.env.keys", "**/.env.keys"]):
+            return False, u".gitignore already ignores .env.keys"
     data = to_bytes(existing)
     if data and not data.endswith(b"\n"):
         data += b"\n"
+    # Appended last, so it wins over any earlier negated rule in this file.
     data += b"\n# dotenvx private decryption keys - never commit (added by sweep_and_secure.py)\n.env.keys*\n"
     write_bytes(ignore_path, data)
+    still_visible = [os.path.basename(k) for k in keys_files if git_ignores(git_root, k) is False]
+    if still_visible:
+        return True, (u"added .env.keys* to %s, but git STILL does not ignore %s - look for a negated"
+                      u" rule in a nested .gitignore" % (ignore_path, u", ".join(still_visible)))
     return True, u"added .env.keys* to %s" % ignore_path
 
 
@@ -1291,7 +1395,7 @@ def parse_args(argv):
             "  secrets in other files    -> moved into the project's .env, encrypted, and the\n"
             "                               plaintext replaced by a placeholder like ${KEY}"),
         epilog=(
-            "exit codes: 0 done (or nothing to do), 1 missing tool / scan or encryption failed,\n"
+            "exit codes: 0 done (or nothing to do), 1 missing tool / scan incomplete or failed / encryption failed,\n"
             "            2 you said no (or no --yes while not interactive)\n"
             "\n"
             "TruffleHog: https://trufflesecurity.com/trufflehog     dotenvx: https://dotenvx.com"),
@@ -1364,8 +1468,11 @@ def main(argv=None):
     except ToolError as exc:
         say(style.bad(u"[!!] %s" % to_text(str(exc))), sys.stderr)
         return 1
-    if code != 0:
-        say(style.warn(u"[--] trufflehog exited with status %d but produced results; continuing." % code))
+    scan_incomplete = code != 0
+    if scan_incomplete:
+        say(style.bad(u"[!!] trufflehog exited with status %d after reporting some results, so the scan is"
+                      u" probably INCOMPLETE. What it did report is handled below; the exit code will be 1."
+                      % code))
 
     encrypted, plaintext = inventory_env_files(root, exclude_res)
     plan = build_plan(findings, root, store, args, plaintext)
@@ -1376,11 +1483,11 @@ def main(argv=None):
     if not plan.items:
         say(u"")
         say(u"Nothing to encrypt.")
-        return 0
+        return 1 if scan_incomplete else 0
     if args.dry_run:
         say(u"")
         say(style.dim(u"Dry run: nothing was changed."))
-        return 0
+        return 1 if scan_incomplete else 0
 
     say(u"")
     chosen = confirm(plan, args, style)
@@ -1405,7 +1512,7 @@ def main(argv=None):
                     % (style.bad("[!!]"), plan.rel(keys_file), plan.rel(keys_file)))
         if git_root:
             try:
-                changed, message = ensure_gitignore(git_root)
+                changed, message = ensure_gitignore(git_root, keys_files)
                 say(u"  %s %s" % (style.ok("[ok]") if changed else style.dim("[--]"), message))
             except (IOError, OSError) as exc:
                 say(u"  %s could not update .gitignore: %s" % (style.warn("[!!]"), to_text(str(exc))))
@@ -1420,10 +1527,12 @@ def main(argv=None):
         summary += u", %d failed" % len(failed)
     if plan.skipped:
         summary += u", %d need manual attention (see above)" % len(plan.skipped)
+    if scan_incomplete:
+        summary += u"; the TruffleHog scan was incomplete, run again"
     say(style.bold(summary))
     if done:
         print_next_steps(plan, chosen, keys_files, args, style)
-    return 1 if failed else 0
+    return 1 if (failed or scan_incomplete) else 0
 
 
 if __name__ == "__main__":

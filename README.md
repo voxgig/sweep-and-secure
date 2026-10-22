@@ -101,8 +101,10 @@ Nothing is rewritten until dotenvx has confirmed the value is stored encrypted;
 if dotenvx fails, the env file is restored and the source files are left alone.
 
 dotenvx writes the private key to `.env.keys` (dotenvx 2.x puts it in the swept
-folder; 1.x next to each env file). The script adds `.env.keys*` to your
-`.gitignore` and warns loudly if that file is already tracked by git.
+folder; 1.x next to each env file). The script asks `git check-ignore` whether
+that file is ignored, appends `.env.keys*` to your `.gitignore` if it is not,
+and warns loudly if the file is already tracked by git. Files are rewritten
+atomically, and an interrupted run restores any env file it was changing.
 
 ### Options
 
@@ -123,9 +125,9 @@ path                    folder to sweep (default: current folder)
 --no-color              plain output
 ```
 
-Exit codes: `0` done or nothing to do, `1` a tool is missing or a scan /
-encryption failed, `2` you said no (or stdin was not a terminal and `--yes`
-was not given).
+Exit codes: `0` done or nothing to do, `1` a tool is missing, the scan failed
+or was cut short, or an encryption failed, `2` you said no (or stdin was not a
+terminal and `--yes` was not given).
 
 ## After a run
 

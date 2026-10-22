@@ -8,7 +8,8 @@ It understands just enough of the real command line:
     trufflehog filesystem ROOT --json [--no-update] [--no-verification] [--exclude-paths FILE]
 
 and prints TruffleHog-shaped JSON lines for a handful of secret patterns.
-Set FAKE_TRUFFLEHOG_FAIL=1 to make it exit with status 1.
+Set FAKE_TRUFFLEHOG_FAIL=1 to make it exit with status 1 before scanning, or
+FAKE_TRUFFLEHOG_PARTIAL=1 to exit with status 1 after printing its findings.
 """
 from __future__ import print_function
 
@@ -55,7 +56,10 @@ def scan_file(path):
     text = data.decode("utf-8", "replace")
     for detector, pattern, extra in DETECTORS:
         for match in pattern.finditer(text):
-            emit(path, text, match.start(), detector, match.group(0), "", extra)
+            raw = match.group(0)
+            if detector == "PrivateKey":  # like the real detector: report the decoded key
+                raw = raw.replace("\\n", "\n")
+            emit(path, text, match.start(), detector, raw, "", extra)
     ids = list(AWS_ID.finditer(text))
     if ids:
         secrets = [m.group(0) for m in AWS_SECRET.finditer(text) if not m.group(0).startswith("AKIA")]
@@ -89,6 +93,9 @@ def main(argv):
             path = os.path.join(dirpath, name)
             if not excluded(path) and not os.path.islink(path):
                 scan_file(path)
+    if os.environ.get("FAKE_TRUFFLEHOG_PARTIAL"):  # results were printed, then it died
+        sys.stderr.write("fake trufflehog: simulated failure after partial results\n")
+        return 1
     sys.stderr.write('{"level":"info-0","msg":"finished scanning (fake)"}\n')
     return 0
 
