@@ -7,7 +7,7 @@ what it found, and -- once you say yes -- encrypts them with
 
 ```
 $ python sweep_and_secure.py
-sweep-and-secure 1.1.0  (TruffleHog + dotenvx)
+sweep-and-secure 1.2.0  (TruffleHog + dotenvx)
 Folder: /home/me/shop
   [ok] trufflehog  3.99.3     /usr/local/bin/trufflehog
   [ok] dotenvx     2.38.2     /usr/local/bin/dotenvx
@@ -58,7 +58,7 @@ route suits you. Each gives you a `sweep-and-secure` command.
 
 ```
 pipx install git+https://github.com/voxgig/sweep-and-secure            # latest from the default branch
-pipx install git+https://github.com/voxgig/sweep-and-secure@v1.1.0     # a specific release
+pipx install git+https://github.com/voxgig/sweep-and-secure@v1.2.0     # a specific release
 pipx run --spec git+https://github.com/voxgig/sweep-and-secure sweep-and-secure --dry-run   # try it without installing
 uvx --from git+https://github.com/voxgig/sweep-and-secure sweep-and-secure --dry-run
 ```
@@ -72,7 +72,7 @@ curl -sSfL https://github.com/voxgig/sweep-and-secure/releases/latest/download/i
 ```
 
 `-b DIR` chooses the folder (default: `/usr/local/bin` when writable, otherwise
-`~/.local/bin`), `-v v1.1.0` a specific release. The installer is `install.sh`
+`~/.local/bin`), `-v v1.2.0` a specific release. The installer is `install.sh`
 in this repository and is attached to every release, so you can read it first.
 
 **By hand**: download `sweep_and_secure.py` from the
@@ -109,7 +109,7 @@ cannot be executed from here); `--no-version-check` overrides that.
 Three commands check an install without changing anything, in increasing depth.
 
 ```
-sweep-and-secure --version    # sweep-and-secure 1.1.0
+sweep-and-secure --version    # sweep-and-secure 1.2.0
 sweep-and-secure --help       # the option reference (see Options below)
 ```
 
@@ -124,7 +124,7 @@ nothing. In an empty folder it looks like this:
 
 ```
 $ mkdir empty && cd empty && sweep-and-secure --dry-run
-sweep-and-secure 1.1.0  (TruffleHog + dotenvx)
+sweep-and-secure 1.2.0  (TruffleHog + dotenvx)
 Folder: /home/me/empty
   [ok] trufflehog  3.99.3     /usr/local/bin/trufflehog
   [ok] dotenvx     2.38.2     /usr/local/bin/dotenvx
@@ -148,7 +148,7 @@ To check a downloaded `sweep_and_secure.py` against the published checksums,
 from the folder it was downloaded into (the curl installer does this for you):
 
 ```
-curl -sSfL -O https://github.com/voxgig/sweep-and-secure/releases/download/v1.1.0/SHA256SUMS
+curl -sSfL -O https://github.com/voxgig/sweep-and-secure/releases/download/v1.2.0/SHA256SUMS
 grep ' sweep_and_secure.py$' SHA256SUMS | sha256sum -c -      # macOS: ... | shasum -a 256 -c -
 ```
 
@@ -375,7 +375,7 @@ with the current TruffleHog and dotenvx, and a packaging job that builds the
 wheel, runs the console script and exercises `install.sh`.
 
 To release: set `__version__` in `sweep_and_secure.py`, merge, then either push
-a matching tag (`git tag v1.1.0 && git push origin v1.1.0`) or run the release
+a matching tag (`git tag v1.2.0 && git push origin v1.2.0`) or run the release
 workflow from the Actions tab with the version, which creates the tag for you.
 The workflow (`.github/workflows/release.yml`) checks that the tag matches the
 version, runs the tests, builds the sdist and wheel, and publishes a GitHub
