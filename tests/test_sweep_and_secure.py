@@ -933,6 +933,33 @@ class UnitTests(unittest.TestCase):
         self.assertEqual(fixed, b'DOTENV_PUBLIC_KEY_PRODUCTION="02ab" # -fk .env.keys\nK=encrypted:x\n')
         self.assertEqual(sas.fix_keys_hint(b"no hint here\n", staged, os.sep), b"no hint here\n")
 
+    def test_cli_entry_point_returns_exit_codes(self):
+        real_main = sas.main
+        saved = sys.stderr
+        try:
+            sas.main = lambda argv=None: 0
+            self.assertEqual(sas.cli([]), 0)
+
+            def interrupted(argv=None):
+                raise KeyboardInterrupt()
+            sas.main = interrupted
+            sys.stderr = StringIO()
+            self.assertEqual(sas.cli([]), 130)
+            self.assertIn("Interrupted", sys.stderr.getvalue())
+        finally:
+            sas.main = real_main
+            sys.stderr = saved
+
+    @unittest.skipUnless(sys.version_info >= (3, 11), "tomllib")
+    def test_pyproject_console_script_points_at_a_real_function(self):
+        import tomllib
+        with io.open(os.path.join(REPO, "pyproject.toml"), "rb") as fh:
+            project = tomllib.load(fh)["project"]
+        module, function = project["scripts"]["sweep-and-secure"].split(":")
+        self.assertEqual(module, "sweep_and_secure")
+        self.assertTrue(callable(getattr(sas, function)))
+        self.assertEqual(project["dynamic"], ["version"])
+
     def test_mask_never_reveals_much(self):
         self.assertEqual(sas.mask(STRIPE_KEY), "sk_l...23")
         self.assertEqual(sas.mask("tenchars!!"), "te...!")

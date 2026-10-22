@@ -7,7 +7,7 @@ what it found, and -- once you say yes -- encrypts them with
 
 ```
 $ python sweep_and_secure.py
-sweep-and-secure 1.0.0  (TruffleHog + dotenvx)
+sweep-and-secure 1.1.0  (TruffleHog + dotenvx)
 Folder: /home/me/shop
   [ok] trufflehog  3.99.3     /usr/local/bin/trufflehog
   [ok] dotenvx     2.38.2     /usr/local/bin/dotenvx
@@ -49,6 +49,41 @@ Next steps
   ...
 ```
 
+## Installation
+
+The tool is one Python file with no dependencies of its own; take whichever
+route suits you. Each gives you a `sweep-and-secure` command.
+
+**With pipx (or uv)**, in an isolated environment:
+
+```
+pipx install git+https://github.com/voxgig/sweep-and-secure            # latest from the default branch
+pipx install git+https://github.com/voxgig/sweep-and-secure@v1.1.0     # a specific release
+pipx run --spec git+https://github.com/voxgig/sweep-and-secure sweep-and-secure --dry-run   # try it without installing
+uvx --from git+https://github.com/voxgig/sweep-and-secure sweep-and-secure --dry-run
+```
+
+**With curl, from a GitHub release** (macOS and Linux). The installer downloads
+`sweep_and_secure.py` from the latest release, checks its SHA-256 against the
+release's `SHA256SUMS`, and installs it as `sweep-and-secure`:
+
+```
+curl -sSfL https://github.com/voxgig/sweep-and-secure/releases/latest/download/install.sh | sh -s -- -b /usr/local/bin
+```
+
+`-b DIR` chooses the folder (default: `/usr/local/bin` when writable, otherwise
+`~/.local/bin`), `-v v1.1.0` a specific release. The installer is `install.sh`
+in this repository and is attached to every release, so you can read it first.
+
+**By hand**: download `sweep_and_secure.py` from the
+[latest release](https://github.com/voxgig/sweep-and-secure/releases/latest),
+check it against `SHA256SUMS`, make it executable and put it on your `PATH`, or
+simply run `python sweep_and_secure.py` from wherever it sits. On Windows use
+pipx or this route.
+
+`sweep-and-secure --version` confirms the install. Then install the two tools
+it drives:
+
 ## Requirements
 
 * Python 3.8 or newer. (The script still carries Python 2.7 compatibility code
@@ -73,13 +108,14 @@ cannot be executed from here); `--no-version-check` overrides that.
 
 ```
 cd your/project
-python sweep_and_secure.py            # scan, list, ask, encrypt
-python sweep_and_secure.py --dry-run  # scan and list only
-python sweep_and_secure.py --yes      # no questions (scripts, CI)
-python sweep_and_secure.py some/dir   # sweep a different folder
+sweep-and-secure            # scan, list, ask, encrypt
+sweep-and-secure --dry-run  # scan and list only
+sweep-and-secure --yes      # no questions (scripts, CI)
+sweep-and-secure some/dir   # sweep a different folder
 ```
 
-`chmod +x sweep_and_secure.py && ./sweep_and_secure.py` works too.
+Without installing, `python sweep_and_secure.py ...` (or
+`chmod +x sweep_and_secure.py && ./sweep_and_secure.py`) does the same.
 
 The run is interactive: it first lists every secret TruffleHog found (the
 detector type, the key or variable name it will use, a masked preview, where it
@@ -207,5 +243,13 @@ neither tool installed. The stand-in dotenvx follows the real tool's quoting,
 key-naming and key-lookup rules as measured against dotenvx 2.38. With
 `SWEEP_TEST_REAL_TOOLS=1` and the real tools on your `PATH` an extra tier runs
 the script against them. CI (`.github/workflows/test.yml`) runs the suite on
-Linux, macOS and Windows with Python 3.8 to 3.13, plus the real-tools tier on
-Linux with the current TruffleHog and dotenvx.
+Linux, macOS and Windows with Python 3.8 to 3.13, the real-tools tier on Linux
+with the current TruffleHog and dotenvx, and a packaging job that builds the
+wheel, runs the console script and exercises `install.sh`.
+
+To release: set `__version__` in `sweep_and_secure.py`, then push a matching tag
+(`git tag v1.1.0 && git push origin v1.1.0`). The release workflow
+(`.github/workflows/release.yml`) checks that the tag matches the version, runs
+the tests, builds the sdist and wheel, and publishes a GitHub release carrying
+the script, `install.sh`, both packages and `SHA256SUMS`, which is what the curl
+installer and `pipx install ...@vX.Y.Z` fetch.

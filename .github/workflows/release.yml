@@ -1,0 +1,46 @@
+name: release
+
+# Pushing a tag vX.Y.Z publishes a GitHub release with the script, install.sh, the
+# sdist and wheel, and SHA256SUMS - the assets that install.sh and pipx install from.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.13"
+      - name: Check that the tag matches __version__
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(python -c 'import sweep_and_secure; print(sweep_and_secure.__version__)')"
+          if [ "$tag" != "$version" ]; then
+            echo "tag v$tag does not match __version__ = $version in sweep_and_secure.py" >&2
+            exit 1
+          fi
+      - name: Tests
+        run: python -m unittest discover -s tests
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --quiet build
+          python -m build
+      - name: Assemble the release assets
+        run: |
+          mkdir release
+          cp sweep_and_secure.py install.sh dist/* release/
+          cd release && sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - name: Exercise install.sh against the assets
+        run: |
+          sh install.sh -u "file://$PWD/release" -b "$RUNNER_TEMP/bin"
+          "$RUNNER_TEMP/bin/sweep-and-secure" --version
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes release/*

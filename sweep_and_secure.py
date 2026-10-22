@@ -42,7 +42,7 @@ import tempfile
 import traceback
 from collections import OrderedDict
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # --------------------------------------------------------------------------
 # Python 2 / 3 compatibility
@@ -1840,8 +1840,9 @@ def print_next_steps(plan, chosen, keys_files, args, style):
 # --------------------------------------------------------------------------
 
 def parse_args(argv):
+    prog = os.path.basename(sys.argv[0]) if sys.argv and sys.argv[0] else "sweep-and-secure"
     parser = argparse.ArgumentParser(
-        prog="sweep_and_secure.py",
+        prog=prog,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=(
             "Scan a folder tree for API keys and secrets with TruffleHog, list what was found\n"
@@ -1885,7 +1886,7 @@ def parse_args(argv):
                         help="use a tool even if its --version could not be read")
     parser.add_argument("-v", "--verbose", action="store_true", help="show the commands run and tool output")
     parser.add_argument("--no-color", action="store_true", help="plain output")
-    parser.add_argument("--version", action="version", version="%(prog)s " + __version__)
+    parser.add_argument("--version", action="version", version="sweep-and-secure " + __version__)
     args = parser.parse_args(argv)
     if "NAME" not in args.placeholder:
         parser.error("--placeholder must contain NAME (it is replaced by the key name)")
@@ -2074,9 +2075,14 @@ def main(argv=None):
     return 1 if (failed or scan_incomplete) else 0
 
 
-if __name__ == "__main__":
+def cli(argv=None):
+    """Entry point of the `sweep-and-secure` command: main()'s exit code, 130 on Ctrl-C."""
     try:
-        sys.exit(main())
+        return main(argv)
     except KeyboardInterrupt:
         say(u"\nInterrupted.", sys.stderr)
-        sys.exit(130)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(cli())
