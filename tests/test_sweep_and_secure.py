@@ -695,7 +695,8 @@ class EndToEndTests(unittest.TestCase):
         self.before = self.tree.snapshot()
         _, listing, _ = run_script(self.tree.root, ["--dry-run", "--quarantine"])
         self.assertIn(u"build/old.tar.gz (tar.gz)", listing)
-        self.assertIn(u"caf\ufffd.txt", listing)
+        # the undecodable byte shows as U+FFFD, or as ? on a console that cannot show that
+        self.assertTrue(u"caf\ufffd.txt" in listing or u"caf?.txt" in listing, listing)
         self.assertIn("move to .secrets-quarantine/build/keys.zip", listing)
         self.assertIn("move to .secrets-quarantine/build/blob.txt.gz", listing)
         self.assertTrue(os.path.isfile(self.tree.path("build/keys.zip")))     # a dry run moves nothing

@@ -1351,9 +1351,15 @@ def walk_archive(opener, kind, name, prefix, depth, notes):
     name is the archive's own name (used in notes, and for a lone compressed file that does
     not record the name of its content); prefix is prepended to the paths inside. Each member
     opener() returns a fresh stream of that member's content. Nothing is written anywhere."""
+    # Every stream opened here is closed before the walk ends: an open handle on the archive
+    # would stop Windows from renaming it into quarantine later on.
+    open_streams = []
     try:
         if kind in ZIP_KINDS:
-            archive = zipfile.ZipFile(opener())
+            stream = opener()
+            open_streams.append(stream)
+            archive = zipfile.ZipFile(stream)
+            open_streams.append(archive)
             for info in archive.infolist():
                 member = safe_text(to_text(info.filename))
                 if member.endswith(u"/"):
@@ -1365,8 +1371,11 @@ def walk_archive(opener, kind, name, prefix, depth, notes):
                                             lambda info=info: archive.open(info), depth, notes):
                     yield entry
         elif kind in TAR_OR_COMPRESSED_KINDS:
+            stream = opener()
+            open_streams.append(stream)
             try:
-                tar = tarfile.open(fileobj=opener(), mode="r:*")
+                tar = tarfile.open(fileobj=stream, mode="r:*")
+                open_streams.append(tar)
             except tarfile.TarError:
                 tar = None
             if tar is not None:
@@ -1379,18 +1388,20 @@ def walk_archive(opener, kind, name, prefix, depth, notes):
             else:
                 # one compressed file (gzip, bzip2 or xz): named after the gzip header when it
                 # has one, else after the archive itself without the compression suffix
-                head = opener().read(512)
+                stream.seek(0)
+                head = stream.read(512)
                 stem = os.path.basename(name)
                 for ext in (u".gz", u".bz2", u".xz", u".bzip2", u".gzip"):
                     if stem.lower().endswith(ext):
                         stem = stem[:-len(ext)]
                         break
                 if head.startswith(b"\x1f\x8b"):
-                    member, decompress = gzip_member_name(head, stem), lambda: gzip.GzipFile(fileobj=opener())
+                    member = gzip_member_name(head, stem)
+                    decompress = lambda: Decompressed(opener(), lambda raw: gzip.GzipFile(fileobj=raw))
                 elif head.startswith(b"BZh"):
-                    member, decompress = stem, lambda: bz2.BZ2File(opener())
+                    member, decompress = stem, lambda: Decompressed(opener(), bz2.BZ2File)
                 elif head.startswith(b"\xfd7zXZ\x00") and lzma is not None:
-                    member, decompress = stem, lambda: lzma.LZMAFile(opener())
+                    member, decompress = stem, lambda: Decompressed(opener(), lzma.LZMAFile)
                 else:
                     notes.append(u"cannot read %s from here" % name)
                     return
@@ -1401,13 +1412,47 @@ def walk_archive(opener, kind, name, prefix, depth, notes):
     except (zipfile.BadZipfile, tarfile.TarError, IOError, OSError, EOFError, zlib.error,
             RuntimeError, ValueError, NotImplementedError) as exc:
         notes.append(u"could not read %s (%s)" % (name, to_text(str(exc)) or exc.__class__.__name__))
+    finally:
+        for handle in reversed(open_streams):
+            close_quietly(handle)
+
+
+def close_quietly(handle):
+    try:
+        handle.close()
+    except Exception:  # pragma: no cover - closing is best effort
+        pass
+
+
+class Decompressed(object):
+    """A decompressing reader (gzip, bzip2, xz) over a raw stream that closes both when
+    closed; the standard library readers leave a stream they were handed open."""
+
+    def __init__(self, raw, wrap):
+        self.raw = raw
+        try:
+            self.inner = wrap(raw)
+        except Exception:
+            close_quietly(raw)
+            raise
+
+    def read(self, size=-1):
+        return self.inner.read(size)
+
+    def close(self):
+        close_quietly(self.inner)
+        close_quietly(self.raw)
 
 
 def member_entries(display, size, opener, depth, notes):
     """One member: descend into it when it is an archive itself, else yield it."""
     if depth < INSPECT_MAX_DEPTH:
         try:
-            head = opener().read(512)
+            probe = opener()
+            try:
+                head = probe.read(512)
+            finally:
+                close_quietly(probe)
         except (IOError, OSError, EOFError, zlib.error, RuntimeError, ValueError, NotImplementedError) as exc:
             notes.append(u"could not read %s (%s)" % (display, to_text(str(exc)) or exc.__class__.__name__))
             return
@@ -1480,6 +1525,7 @@ def inspect_archive(archive):
             exhausted = True
             break
         found = []
+        stream = None
         try:
             stream = member_opener()
             data = b"" if (size is not None and size > INSPECT_FULL_READ_BYTES) else read_up_to(stream, INSPECT_FULL_READ_BYTES)
@@ -1499,6 +1545,9 @@ def inspect_archive(archive):
         except (IOError, OSError, EOFError, zlib.error, RuntimeError, ValueError, NotImplementedError) as exc:
             notes.append(u"could not read %s (%s)" % (display, to_text(str(exc)) or exc.__class__.__name__))
             continue
+        finally:
+            if stream is not None:
+                close_quietly(stream)
         if found:
             held[display] = found
     placed = set(id(f) for found in held.values() for f in found)
