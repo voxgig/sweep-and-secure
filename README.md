@@ -7,7 +7,7 @@ what it found, and -- once you say yes -- encrypts them with
 
 ```
 $ python sweep_and_secure.py
-sweep-and-secure 1.1.0  (TruffleHog + dotenvx)
+sweep-and-secure 1.2.0  (TruffleHog + dotenvx)
 Folder: /home/me/shop
   [ok] trufflehog  3.99.3     /usr/local/bin/trufflehog
   [ok] dotenvx     2.38.2     /usr/local/bin/dotenvx
@@ -58,7 +58,7 @@ route suits you. Each gives you a `sweep-and-secure` command.
 
 ```
 pipx install git+https://github.com/voxgig/sweep-and-secure            # latest from the default branch
-pipx install git+https://github.com/voxgig/sweep-and-secure@v1.1.0     # a specific release
+pipx install git+https://github.com/voxgig/sweep-and-secure@v1.2.0     # a specific release
 pipx run --spec git+https://github.com/voxgig/sweep-and-secure sweep-and-secure --dry-run   # try it without installing
 uvx --from git+https://github.com/voxgig/sweep-and-secure sweep-and-secure --dry-run
 ```
@@ -72,7 +72,7 @@ curl -sSfL https://github.com/voxgig/sweep-and-secure/releases/latest/download/i
 ```
 
 `-b DIR` chooses the folder (default: `/usr/local/bin` when writable, otherwise
-`~/.local/bin`), `-v v1.1.0` a specific release. The installer is `install.sh`
+`~/.local/bin`), `-v v1.2.0` a specific release. The installer is `install.sh`
 in this repository and is attached to every release, so you can read it first.
 
 **By hand**: download `sweep_and_secure.py` from the
@@ -81,8 +81,8 @@ check it against `SHA256SUMS`, make it executable and put it on your `PATH`, or
 simply run `python sweep_and_secure.py` from wherever it sits. On Windows use
 pipx or this route.
 
-`sweep-and-secure --version` confirms the install. Then install the two tools
-it drives:
+Then install the two tools it drives (next section) and run the checks under
+"Checking the install".
 
 ## Requirements
 
@@ -104,6 +104,54 @@ links. `--trufflehog PATH` / `--dotenvx PATH` (or the `TRUFFLEHOG_BIN` /
 A tool whose `--version` cannot be read is refused (it usually means the file
 cannot be executed from here); `--no-version-check` overrides that.
 
+## Checking the install
+
+Three commands check an install without changing anything, in increasing depth.
+
+```
+sweep-and-secure --version    # sweep-and-secure 1.2.0
+sweep-and-secure --help       # the option reference (see Options below)
+```
+
+These two run before TruffleHog and dotenvx are installed and exit at once with
+code 0, so they prove only that the script is on your `PATH` and that Python
+runs it. If you installed with pipx or uv and the command is not found, run
+`pipx ensurepath` (or `uv tool update-shell`) and open a new shell.
+
+The full check is a dry run. It finds the two tools, reports their versions and
+locations, scans the folder and lists what a real run would do, and changes
+nothing. In an empty folder it looks like this:
+
+```
+$ mkdir empty && cd empty && sweep-and-secure --dry-run
+sweep-and-secure 1.2.0  (TruffleHog + dotenvx)
+Folder: /home/me/empty
+  [ok] trufflehog  3.99.3     /usr/local/bin/trufflehog
+  [ok] dotenvx     2.38.2     /usr/local/bin/dotenvx
+Scanning with TruffleHog (this can take a while on big trees) ...
+  Scanned 0 file(s) in 0:02; TruffleHog reported 0 finding(s).
+
+TruffleHog found no plaintext secrets to encrypt.
+
+No dotenvx-encrypted keys found in env files yet.
+
+Nothing to encrypt.
+```
+
+Exit code 0 means everything is in place. If a tool is missing or too old the
+run stops before scanning, prints install links and exits 1; `--trufflehog PATH`
+and `--dotenvx PATH` (or the `TRUFFLEHOG_BIN` and `DOTENVX_BIN` environment
+variables) point it at a copy that is not on your `PATH`. A dry run in your real
+project is just as safe and shows the listing a real run would start with.
+
+To check a downloaded `sweep_and_secure.py` against the published checksums,
+from the folder it was downloaded into (the curl installer does this for you):
+
+```
+curl -sSfL -O https://github.com/voxgig/sweep-and-secure/releases/download/v1.2.0/SHA256SUMS
+grep ' sweep_and_secure.py$' SHA256SUMS | sha256sum -c -      # macOS: ... | shasum -a 256 -c -
+```
+
 ## Usage
 
 ```
@@ -117,6 +165,12 @@ sweep-and-secure some/dir   # sweep a different folder
 Without installing, `python sweep_and_secure.py ...` (or
 `chmod +x sweep_and_secure.py && ./sweep_and_secure.py`) does the same.
 
+While TruffleHog runs, a status line shows how many files it has scanned, how
+many findings it has reported so far and the time spent, redrawn in place on a
+terminal and printed as a heartbeat line every 15 seconds when the output is a
+pipe or a CI log, so a long scan is visibly alive rather than hung. It ends with
+`Scanned N file(s) in M:SS; TruffleHog reported K finding(s).`
+
 The run is interactive: it first lists every secret TruffleHog found (the
 detector type, the key or variable name it will use, a masked preview, where it
 is, and what will happen to it), then the keys that are already encrypted with
@@ -129,7 +183,8 @@ dotenvx, then asks. Answer `y` to encrypt everything listed, `n` to stop, or
 | --- | --- |
 | a dotenv file (`.env`, `.env.production`, `prod.env`, ...), as the value of `KEY=...` | `dotenvx encrypt -k KEY` encrypts that key in place: `KEY="encrypted:..."`. Every key whose value holds the secret is encrypted, not just the first |
 | anywhere else (source code, JSON, YAML, Markdown, certificates, ...) | the value is added to the project's `.env` (`--env-file` to change) and encrypted there; the plaintext in the file is replaced by `${KEY}` (`--placeholder` to change) |
-| a binary or archive file, a symlink, a secret TruffleHog had to decode first, a PDF, a generated lock file (`package-lock.json`, `poetry.lock`, ...), an example env file (`.env.example`, `.env.sample`, ...) | listed under "cannot fix automatically" for you to deal with by hand |
+| an archive TruffleHog looked inside (`.zip`, `.jar`, `.tar.gz`, ...) | listed under "cannot fix automatically", unless `--quarantine` is given: then the whole archive is moved out of the tree into the quarantine folder, keeping its relative path, and the folder's `MANIFEST.txt` records where it came from |
+| a binary file, a symlink, a secret TruffleHog had to decode first, a PDF, a generated lock file (`package-lock.json`, `poetry.lock`, ...), an example env file (`.env.example`, `.env.sample`, ...) | listed under "cannot fix automatically" for you to deal with by hand |
 | a value dotenvx cannot store exactly (it contains an apostrophe together with a backslash, or with both a backtick and a double quote) | listed under "cannot fix automatically"; moving it would corrupt it |
 
 Variable names come from the code around the secret (`AWS_SECRET_ACCESS_KEY = "..."`,
@@ -171,32 +226,104 @@ file in a sub-folder the "Next steps" give the command with `-fk`
 
 ### Options
 
-```
-path                    folder to sweep (default: current folder)
--n, --dry-run, --list   scan and list only; change nothing
--y, --yes               encrypt everything found without asking
---env-file PATH         dotenv file that receives secrets moved out of other files (default: .env)
---env-all               also encrypt every other plaintext key in dotenv files
---no-rewrite            store secrets encrypted but leave the source files untouched
---placeholder TEMPLATE  text that replaces a secret; NAME becomes the key (default: ${NAME})
---verify                let TruffleHog verify secrets against their services (network access)
---exclude REGEX         skip paths matching REGEX (repeatable)
---no-default-excludes   also scan .git, node_modules, virtualenvs, __pycache__ ...
---min-length N          ignore secrets shorter than N characters (default: 8)
---trufflehog PATH       trufflehog executable        --dotenvx PATH   dotenvx executable
---no-version-check      use a tool even if its --version could not be read
--v, --verbose           show the commands run and the tools' output
---no-color              plain output
-```
+`sweep-and-secure --help` prints the short form of this reference.
 
-`--exclude` patterns are regular expressions matched against the whole path; the
-built-in ones accept `/` and `\` as separators so that they work on Windows too,
-where TruffleHog sees backslashes.
+**Where to scan**
 
-Exit codes: `0` done or nothing to do, `1` a tool is missing, the scan failed
-or was cut short, an encryption or its verification failed, or the run was
-stopped by an unexpected error, `2` you said no (or stdin was not a terminal
-and `--yes` was not given), `130` interrupted.
+- `path`: the folder to sweep, default the current folder. Every sub-folder is
+  included. This folder is also where dotenvx keeps the private key file
+  (`.env.keys`), where the default `.env` lives, and where the script stages
+  files while it works.
+- `--exclude REGEX`: skip paths matching a regular expression; repeat the option
+  for several. Patterns are matched against the whole path as TruffleHog sees
+  it, so on Windows write `[/\\]` rather than `/` for a separator, for example
+  `--exclude '(^|[/\\])fixtures([/\\]|$)'`. These add to the built-in excludes.
+- `--no-default-excludes`: also scan `.git`, `.hg`, `.svn`, `node_modules`,
+  `__pycache__`, `.venv`, `venv` and `.tox`, which are skipped by default. The
+  dotenvx key files (`.env.keys*`), legacy `.env.vault` files and the script's
+  own staging files are never scanned or rewritten, whatever you pass.
+- `--min-length N`: ignore secrets shorter than N characters (default 8). They
+  are listed under "cannot fix automatically" rather than rewritten.
+- `--verify`: let TruffleHog check each credential against the service that
+  issued it. This sends the secret to that service over the network; live
+  credentials are marked `*` in the listing. Off by default.
+
+**What to do with what is found**
+
+- `-n`, `--dry-run`, `--list`: scan and report, change nothing. Exits 0 whatever
+  is found (1 only if the scan itself failed), so it suits install checks and
+  CI audits.
+- `-y`, `--yes`: encrypt everything listed without asking; use it in scripts
+  and CI. Without it the question is asked even when stdin is not a terminal
+  and the answer is read from there: a piped `y` is accepted, and no input at
+  all (end of file) counts as no, so the run lists the findings and exits 2.
+- `--env-file PATH`: the dotenv file that receives secrets moved out of other
+  files. Default `.env` in the swept folder; a relative PATH is taken from there.
+  The file is created with a comment header if it does not exist. Any
+  dotenv-style name works; dotenvx names the key variables after the file, so
+  `config/.env.production` gets `DOTENV_PRIVATE_KEY_PRODUCTION`. Names reserved
+  for dotenvx key files, vault files and the script's staging files
+  (`.env.keys*`, `.env.vault`, `.sweep-and-secure-*`) are refused, because they
+  are never scanned or rewritten. A secret found inside an existing env file is
+  always encrypted in that file, whatever `--env-file` says.
+- `--env-all`: also encrypt every other plaintext key in the env files
+  (`PORT=3000`, `APP_NAME=demo`, ...), not only the ones TruffleHog flagged. The
+  report's "Other plaintext keys" list shows exactly what this adds. Example
+  files such as `.env.example` are left out.
+- `--no-rewrite`: store the secrets encrypted but leave the source files as they
+  are. A later run without the flag recognises the stored values and only does
+  the rewriting; it does not store them twice.
+- `--quarantine`: move every archive that TruffleHog found a secret inside
+  (zip, jar, tar, gz, bz2, xz, 7z, rar, zstd ...) out of the tree into the
+  quarantine folder, `.secrets-quarantine` inside the swept folder by default,
+  keeping its relative path (`build/keys.zip` becomes
+  `.secrets-quarantine/build/keys.zip`, with a numeric suffix if that name is
+  taken). The folder's `MANIFEST.txt` gets a line per file with the time, the
+  original path and the detectors. The folder is added to `.gitignore` before
+  anything is moved and is never scanned afterwards. Archives appear as numbered
+  items ("move to ..."), so `s` lets you pick which to move. Other binary files
+  are not moved; they stay under "cannot fix automatically".
+- `--quarantine-dir DIR`: use DIR as the quarantine folder instead (relative to
+  the swept folder, or absolute, including a folder outside the tree); implies
+  `--quarantine`. A folder inside the tree is excluded from the scan for that
+  run. Reserved names and the swept folder itself are refused.
+- `--placeholder TEMPLATE`: the text that replaces a secret in a source file,
+  with `NAME` standing for the variable name. Default `${NAME}`;
+  `process.env.NAME`, `os.environ["NAME"]` or `<NAME>` are common alternatives.
+  This is plain text substitution: it removes the secret, and the code still
+  has to be changed to read the variable.
+
+**The tools**
+
+- `--trufflehog PATH`, `--dotenvx PATH`: use these executables instead of
+  searching. The search order is the option, the `TRUFFLEHOG_BIN` or
+  `DOTENVX_BIN` environment variable, the `PATH`, and for dotenvx a
+  project-local `node_modules/.bin/dotenvx`. Both tools are run with the swept
+  folder as their current directory.
+- `--no-version-check`: use a tool even when its `--version` output cannot be
+  read. That is normally refused because it usually means the file cannot be
+  executed from here (a POSIX shell script found on Windows, for instance), and
+  the failure would otherwise surface half way through a run.
+
+**Output**
+
+- `-v`, `--verbose`: print every command run (TruffleHog, `dotenvx encrypt`, and
+  the `dotenvx get` calls that verify each stored value) and the tools' output.
+  Secret values are never printed, only key names and masked previews.
+- `--no-color`: plain output. Colour is only used on a terminal, and the
+  `NO_COLOR` environment variable has the same effect.
+- `-h`, `--help`: the short reference. `--version`: print
+  `sweep-and-secure <version>`. Both exit at once, before the tools are looked
+  for, which is what makes them useful for checking an install.
+
+**Exit codes**
+
+| code | meaning |
+| --- | --- |
+| 0 | done, or nothing to do; also every dry run whose scan completed |
+| 1 | a tool is missing or unusable; the scan failed or was cut short; an encryption or its verification failed; or an unexpected error stopped the run, in which case the state of the tree is printed |
+| 2 | you answered no, or gave no answer: stdin was not a terminal, nothing was piped in and `--yes` was not given |
+| 130 | interrupted with Ctrl-C; what had already been changed is printed |
 
 ## After a run
 
@@ -248,7 +375,7 @@ with the current TruffleHog and dotenvx, and a packaging job that builds the
 wheel, runs the console script and exercises `install.sh`.
 
 To release: set `__version__` in `sweep_and_secure.py`, merge, then either push
-a matching tag (`git tag v1.1.0 && git push origin v1.1.0`) or run the release
+a matching tag (`git tag v1.2.0 && git push origin v1.2.0`) or run the release
 workflow from the Actions tab with the version, which creates the tag for you.
 The workflow (`.github/workflows/release.yml`) checks that the tag matches the
 version, runs the tests, builds the sdist and wheel, and publishes a GitHub

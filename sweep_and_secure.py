@@ -39,10 +39,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import traceback
-from collections import OrderedDict
+from collections import OrderedDict, deque
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # --------------------------------------------------------------------------
 # Python 2 / 3 compatibility
@@ -151,10 +153,29 @@ TOOLS = OrderedDict([
     }),
 ])
 
-# Paths TruffleHog should not bother with, and we should never rewrite.
-# Regular expressions, matched against the full (forward-slash) path.
-# TruffleHog matches them against the path as the OS spells it (backslashes on
-# Windows), so both separators are accepted.
+# Paths TruffleHog should not bother with, and we should never rewrite. Regular
+# expressions matched against the full path; TruffleHog sees the path as the OS
+# spells it (backslashes on Windows), so both separators are accepted.
+# Never scanned and never rewritten, whatever the options say:
+QUARANTINE_DEFAULT = ".secrets-quarantine"   # where --quarantine puts archives, unless told otherwise
+QUARANTINE_MANIFEST = "MANIFEST.txt"
+
+ALWAYS_EXCLUDES = [
+    r"(^|[/\\])\.env\.keys(\.[^/\\]*)?$",   # dotenvx private keys: .env.keys, .env.keys.bak ... (files, not folders)
+    r"(^|[/\\])\.env\.vault$",        # legacy dotenvx vault files
+    r"(^|[/\\])\.sweep-and-secure-",   # our own staging files, left by an interrupted run
+    r"(^|[/\\])\.secrets-quarantine([/\\]|$)",   # archives moved out of the way by --quarantine
+]
+
+# Archives TruffleHog looks inside: recognised by their first bytes, then by name.
+ARCHIVE_MAGIC = [
+    (b"PK\x03\x04", "zip"), (b"PK\x05\x06", "zip"), (b"\x1f\x8b", "gzip"), (b"BZh", "bzip2"),
+    (b"\xfd7zXZ\x00", "xz"), (b"7z\xbc\xaf\x27\x1c", "7z"), (b"Rar!\x1a\x07", "rar"),
+    (b"\x28\xb5\x2f\xfd", "zstd"),
+]
+ARCHIVE_EXTENSIONS = (".zip", ".jar", ".war", ".ear", ".apk", ".whl", ".egg", ".nupkg", ".tar", ".tgz",
+                      ".gz", ".bz2", ".tbz2", ".xz", ".txz", ".7z", ".rar", ".zst", ".cab")
+# Skipped unless --no-default-excludes: version control, vendored and generated trees.
 DEFAULT_EXCLUDES = [
     r"(^|[/\\])\.git([/\\]|$)",
     r"(^|[/\\])\.hg([/\\]|$)",
@@ -164,9 +185,6 @@ DEFAULT_EXCLUDES = [
     r"(^|[/\\])\.venv([/\\]|$)",
     r"(^|[/\\])venv([/\\]|$)",
     r"(^|[/\\])\.tox([/\\]|$)",
-    r"(^|[/\\])\.env\.keys",          # dotenvx private keys: never scan, never touch
-    r"(^|[/\\])\.env\.vault$",        # legacy dotenvx vault files
-    r"(^|[/\\])\.sweep-and-secure-",   # our own staging files, left by an interrupted run
 ]
 
 TEMP_PREFIX = ".sweep-and-secure-"
@@ -421,6 +439,25 @@ def is_example_env_file(name):
 
 def is_lockfile(name):
     return name.lower() in LOCKFILE_NAMES
+
+
+def archive_kind(path):
+    """'zip', 'gzip', 'tar' ... when the file is an archive TruffleHog looked inside, else None."""
+    try:
+        with io.open(path, "rb") as fh:
+            head = fh.read(512)
+    except (IOError, OSError):
+        return None
+    for magic, kind in ARCHIVE_MAGIC:
+        if head.startswith(magic):
+            return kind
+    if head[257:262] == b"ustar":
+        return "tar"
+    name = os.path.basename(path).lower()
+    for ext in ARCHIVE_EXTENSIONS:
+        if name.endswith(ext):
+            return ext.lstrip(".")
+    return None
 
 
 def find_closing_quote(body, quote):
@@ -712,8 +749,133 @@ class Finding(object):
         )
 
 
-def run_trufflehog(binary, root, exclude_patterns, args):
-    cmd = [binary, "filesystem", root, "--json", "--no-update"]
+class ScanProgress(object):
+    """A 'still working' line while TruffleHog runs: files scanned so far (its per-file
+    log lines at --log-level=3), findings so far (its JSON lines) and the time spent.
+    On a terminal the line is redrawn in place; elsewhere a heartbeat line is printed
+    every HEARTBEAT seconds, so that a CI log shows the scan is alive."""
+
+    HEARTBEAT = 15.0
+    REDRAW = 0.2
+
+    def __init__(self, stream=None, is_tty=None, heartbeat=None):
+        self.stream = stream if stream is not None else sys.stdout
+        if is_tty is None:
+            is_tty = bool(self.stream is not None and hasattr(self.stream, "isatty") and self.stream.isatty())
+        self.is_tty = is_tty
+        self.heartbeat = self.HEARTBEAT if heartbeat is None else heartbeat
+        self.files = 0
+        self.findings = 0
+        self.start = time.time()
+        self.last_draw = None
+        self.drawn = 0
+        self.lock = threading.Lock()
+
+    def saw_stderr(self, line):
+        if b'"scanning file"' in line:
+            with self.lock:
+                self.files += 1
+
+    def saw_stdout(self, line):
+        if line.lstrip().startswith(b"{"):
+            with self.lock:
+                self.findings += 1
+
+    def elapsed(self):
+        seconds = int(time.time() - self.start)
+        return u"%d:%02d" % (seconds // 60, seconds % 60)
+
+    def text(self):
+        return u"  scanning ... %d file(s), %d finding(s) so far, %s" % (self.files, self.findings, self.elapsed())
+
+    def tick(self):
+        """Called regularly by the waiting thread; draws when it is time to."""
+        if self.stream is None:
+            return
+        now = time.time()
+        interval = self.REDRAW if self.is_tty else self.heartbeat
+        if self.last_draw is None:
+            self.last_draw = self.start   # the first heartbeat waits a full interval
+        if now - self.last_draw < interval:
+            return
+        self.last_draw = now
+        text = self.text()
+        try:
+            if self.is_tty:
+                self.stream.write(u"\r" + text.ljust(self.drawn))
+                self.drawn = max(self.drawn, len(text))
+            else:
+                self.stream.write(text + u"\n")
+            self.stream.flush()
+        except (IOError, OSError, ValueError, UnicodeEncodeError):
+            pass
+
+    def finish(self):
+        if self.stream is not None and self.is_tty and self.drawn:
+            try:
+                self.stream.write(u"\r" + u" " * self.drawn + u"\r")
+                self.stream.flush()
+            except (IOError, OSError, ValueError):
+                pass
+
+
+def run_streaming(cmd, cwd, on_stdout, on_stderr, tick, keep_stderr=200):
+    """Run cmd, handing each stdout/stderr line to a callback as it arrives (so that a
+    long scan can show progress), and return (exit code, stdout lines, last stderr lines).
+    A KeyboardInterrupt kills the child before it propagates."""
+    env = dict(os.environ)
+    if PY2:  # pragma: no cover
+        cmd = [a.encode(FS_ENCODING) if isinstance(a, text_type) else a for a in cmd]
+        cwd = cwd.encode(FS_ENCODING) if isinstance(cwd, text_type) else cwd
+    proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out_lines, err_lines = [], deque(maxlen=keep_stderr)
+
+    def pump(pipe, store, callback):
+        try:
+            for line in iter(pipe.readline, b""):
+                store.append(line)
+                callback(line)
+        except (IOError, OSError, ValueError):
+            pass
+        finally:
+            try:
+                pipe.close()
+            except (IOError, OSError):
+                pass
+
+    readers = [threading.Thread(target=pump, args=(proc.stdout, out_lines, on_stdout)),
+               threading.Thread(target=pump, args=(proc.stderr, err_lines, on_stderr))]
+    for reader in readers:
+        reader.daemon = True
+        reader.start()
+    try:
+        proc.stdin.close()
+    except (IOError, OSError):
+        pass
+    try:
+        while proc.poll() is None:
+            time.sleep(0.1)
+            tick()
+        for reader in readers:
+            reader.join()
+    except BaseException:
+        try:
+            proc.kill()
+        except (OSError, IOError):
+            pass
+        try:
+            proc.wait()
+        except (OSError, IOError):
+            pass
+        raise
+    return proc.returncode, out_lines, list(err_lines)
+
+
+def run_trufflehog(binary, root, exclude_patterns, args, progress=None):
+    # --log-level=3 makes TruffleHog log every file it scans to stderr: that is the
+    # progress signal; results stay on stdout as JSON lines.
+    cmd = [binary, "filesystem", root, "--json", "--no-update", "--log-level=3"]
     if not args.verify:
         cmd.append("--no-verification")
     exclude_file = None
@@ -724,20 +886,24 @@ def run_trufflehog(binary, root, exclude_patterns, args):
         cmd.extend(["--exclude-paths", exclude_file])
     if args.verbose:
         say(u"  $ " + u" ".join(cmd))
+    if progress is None:
+        progress = ScanProgress(stream=None)
     try:
         try:
-            code, out, err = run_command(cmd, cwd=root)
+            code, out_lines, err_lines = run_streaming(cmd, root, progress.saw_stdout, progress.saw_stderr,
+                                                      progress.tick)
         except (OSError, IOError) as exc:
             raise ToolError(u"could not run %s: %s" % (binary, to_text(str(exc))))
     finally:
+        progress.finish()
         if exclude_file:
             try:
                 os.remove(exclude_file)
             except OSError:
                 pass
     findings = []
-    for line in out.splitlines():
-        line = line.strip()
+    for raw in out_lines:
+        line = to_text(raw).strip()
         if not line.startswith("{"):
             continue
         try:
@@ -747,9 +913,13 @@ def run_trufflehog(binary, root, exclude_patterns, args):
         finding = Finding.from_json(obj, root)
         if finding is not None:
             findings.append(finding)
+    err = u"\n".join(to_text(line).rstrip(u"\r\n") for line in err_lines
+                     if b'"scanning file"' not in line)
     if code != 0 and not findings:
         tail = u"\n".join(err.strip().splitlines()[-8:])
         raise ToolError(u"trufflehog exited with status %d:\n%s" % (code, tail))
+    say(u"  Scanned %d file(s) in %s; TruffleHog reported %d finding(s)."
+        % (progress.files, progress.elapsed(), len(findings)))
     if args.verbose and err.strip():
         say(style_dim_block(err))
     return findings, code
@@ -763,23 +933,25 @@ def style_dim_block(text):
 # What is already in the env files
 # --------------------------------------------------------------------------
 
-def inventory_env_files(root, exclude_res):
+def inventory_env_files(root, exclude_res, protect=()):
     """Return (encrypted, plaintext, stale) over all dotenv files: lists of
     (path, key, line) / (path, key, line, value), and the staging files or folders
-    an earlier interrupted run left behind."""
+    an earlier interrupted run left behind. Paths in protect (the store) are never
+    reported as stale, whatever they are called."""
+    protected = set(os.path.normpath(path) for path in protect)
     encrypted, plaintext, stale = [], [], []
     for dirpath, dirnames, filenames in os.walk(root):
         keep = []
         for name in dirnames:
             full = os.path.join(dirpath, name)
-            if name.startswith(TEMP_PREFIX) and not os.path.islink(full):
+            if name.startswith(TEMP_PREFIX) and not os.path.islink(full) and os.path.normpath(full) not in protected:
                 stale.append(full)
             elif not is_excluded(full, exclude_res, is_dir=True):
                 keep.append(name)
         dirnames[:] = sorted(keep)
         for name in sorted(filenames):
             path = os.path.join(dirpath, name)
-            if name.startswith(TEMP_PREFIX):
+            if name.startswith(TEMP_PREFIX) and os.path.normpath(path) not in protected:
                 stale.append(path)
                 continue
             if not is_env_file(name) or is_example_env_file(name):
@@ -833,7 +1005,7 @@ class Item(object):
         self.encoding = encoding
         self.extra = extra or {}
         self.context = None       # identifier guessed from the surrounding line
-        self.kind = None          # "env": encrypt KEY in place   "source": move + placeholder
+        self.kind = None          # "env": encrypt in place  "source": move + placeholder  "quarantine": move the file
         self.key = None           # env var name holding the value
         self.store = None         # env file that holds (or will hold) the value
         self.new_entry = False    # must we append KEY=value to self.store?
@@ -844,9 +1016,10 @@ class Item(object):
 
 
 class Plan(object):
-    def __init__(self, root, store):
+    def __init__(self, root, store, quarantine=None):
         self.root = root
         self.store = store
+        self.quarantine = quarantine   # folder archives with secrets are moved to, or None
         self.items = []
         self.skipped = []            # (path, detector, reason)
         self.encrypted = []          # (path, key, line) already encrypted
@@ -971,7 +1144,12 @@ def load_for_edit(path, cache):
             else:
                 data = read_bytes(path)
                 if b"\x00" in data and data[:2] not in UTF16_BOMS:
-                    result = (None, u"binary or archive file - delete it or rebuild it without the secret")
+                    kind = archive_kind(path)
+                    if kind:
+                        result = (None, u"%s archive with a secret inside - pass --quarantine to move it out of"
+                                        u" the tree, or rebuild it without the secret" % kind)
+                    else:
+                        result = (None, u"binary file - delete it or rebuild it without the secret")
                 else:
                     result = (data, u"")
         except (IOError, OSError) as exc:
@@ -980,10 +1158,11 @@ def load_for_edit(path, cache):
     return result
 
 
-def build_plan(findings, root, store, args, env_plaintext, exclude_res=(), decryptor=None):
-    plan = Plan(root, store)
+def build_plan(findings, root, store, args, env_plaintext, exclude_res=(), decryptor=None, quarantine=None):
+    plan = Plan(root, store, quarantine)
     cache = {}
     seen = {}
+    archives = OrderedDict()   # path -> quarantine item (one per archive, whatever it holds)
     ordered = sorted(findings, key=lambda f: (f.path, f.line, f.raw))
     for finding in ordered:
         if exclude_res and is_excluded(finding.path, exclude_res):
@@ -991,6 +1170,18 @@ def build_plan(findings, root, store, args, env_plaintext, exclude_res=(), decry
             continue
         data, reason = load_for_edit(finding.path, cache)
         if data is None:
+            kind = archive_kind(finding.path) if (quarantine and u"archive" in reason) else None
+            if kind:
+                item = archives.get(finding.path)
+                if item is None:
+                    item = Item(finding.path, 0, 0, finding.detector, finding.verified, finding.raw, b"",
+                                "utf-8", finding.extra)
+                    item.kind, item.key, item.note = "quarantine", u"-", kind
+                    archives[finding.path] = item
+                    plan.items.append(item)
+                elif finding.detector not in item.detector.split(u", "):
+                    item.detector += u", " + finding.detector
+                continue
             plan.skipped.append((finding.path, finding.detector, reason))
             continue
         located = False
@@ -1025,6 +1216,8 @@ def build_plan(findings, root, store, args, env_plaintext, exclude_res=(), decry
     text_cache = {}
     twins = []
     for item in plan.items:
+        if item.kind == "quarantine":
+            continue
         if not is_env_file(os.path.basename(item.path)):
             item.kind = "source"
             continue
@@ -1170,6 +1363,8 @@ def table(rows, headers, indent=u"  "):
 
 
 def action_text(item, plan, args):
+    if item.kind == "quarantine":
+        return u"move to %s" % plan.rel(quarantine_target(item, plan))
     store = plan.rel(item.store)
     if item.kind == "env":
         return u"encrypt in place"
@@ -1180,6 +1375,57 @@ def action_text(item, plan, args):
     if item.new_entry:
         return u"move to %s, replace with %s%s" % (store, placeholder, why)
     return u"replace with %s (value already in %s)" % (placeholder, store)
+
+
+def quarantine_target(item, plan):
+    """Where --quarantine puts this archive: the same relative path under the quarantine folder."""
+    try:
+        rel = os.path.relpath(item.path, plan.root)
+    except ValueError:
+        rel = os.path.basename(item.path)
+    if rel.startswith(".."):
+        rel = os.path.basename(item.path)
+    return os.path.join(plan.quarantine, rel)
+
+
+def move_to_quarantine(item, plan, journal=None):
+    """Move one archive out of the tree. Rename when possible; copy then delete across
+    file systems. Appends a line to the quarantine's MANIFEST.txt. Returns the new path."""
+    target = quarantine_target(item, plan)
+    folder = os.path.dirname(target)
+    if not os.path.isdir(folder):
+        os.makedirs(folder)
+    candidate, counter = target, 1
+    while os.path.exists(candidate):
+        candidate = u"%s.%d" % (target, counter)
+        counter += 1
+    try:
+        os.rename(item.path, candidate)
+    except OSError:
+        # another file system: copy into place under a temporary name, then remove the original
+        handle, tmp = tempfile.mkstemp(prefix=TEMP_PREFIX, dir=folder)
+        os.close(handle)
+        try:
+            shutil.copy2(item.path, tmp)
+            if os.path.getsize(tmp) != os.path.getsize(item.path):
+                raise IOError(u"copy of %s is incomplete" % item.path)
+            (getattr(os, "replace", None) or os.rename)(tmp, candidate)
+        except BaseException:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
+        os.remove(item.path)
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    line = u"%s  %s  <- %s  (%s)\n" % (stamp, slash_path(os.path.relpath(candidate, plan.quarantine)),
+                                        plan.rel(item.path), item.detector)
+    manifest = os.path.join(plan.quarantine, QUARANTINE_MANIFEST)
+    with io.open(manifest, "ab") as fh:
+        fh.write(line.encode("utf-8"))
+    if journal is not None:
+        journal.add("quarantine", item.path, candidate)
+    return candidate
 
 
 def print_report(plan, args, style, verified_any):
@@ -1193,7 +1439,7 @@ def print_report(plan, args, style, verified_any):
         for item in plan.items:
             where = plan.rel(item.path) + (u":%d" % item.line if item.line else u"")
             kind = item.detector + (u" *" if item.verified else u"")
-            rows.append((u"%d" % item.number, kind, item.key, mask(item.secret), where,
+            rows.append((u"%d" % item.number, kind, item.key or u"-", mask(item.secret), where,
                          action_text(item, plan, args)))
         for line in table(rows, (u"#", u"Type", u"Key / name", u"Secret", u"Where", u"Action")):
             say(line)
@@ -1649,6 +1895,17 @@ def execute(plan, chosen, dotenvx, args, style, decryptor=None, journal=None):
         if item.status in ("failed", "skipped") and item.kind == "source":
             badge = style.bad("[!!]") if item.status == "failed" else style.warn("[--]")
             say(u"  %s %s: %s: %s" % (badge, plan.rel(item.path), item.key, item.note))
+    for item in chosen:
+        if item.kind != "quarantine":
+            continue
+        try:
+            moved = move_to_quarantine(item, plan, journal)
+        except (IOError, OSError) as exc:
+            item.status, item.note = "failed", to_text(str(exc))
+            say(u"  %s %s: could not move to quarantine: %s" % (style.bad("[!!]"), plan.rel(item.path), item.note))
+            continue
+        item.status = "done"
+        say(u"  %s %s: moved to %s" % (style.ok("[ok]"), plan.rel(item.path), plan.rel(moved)))
     return [item for item in chosen if item.status == "failed"]
 
 
@@ -1720,45 +1977,50 @@ def git_ignores(git_root, path):
     return None
 
 
-def ensure_gitignore(git_root, keys_files):
-    """Make sure the private key file(s) are ignored by git. Returns (changed, message).
+def ensure_gitignore(git_root, paths, pattern=".env.keys*",
+                     why="dotenvx private decryption keys - never commit"):
+    """Make sure git ignores the given paths, adding `pattern` to the root .gitignore if
+    it does not. Returns (changed, message).
 
     Asks git itself (`git check-ignore`) so nested .gitignore files and negated
     rules are honoured; without git, falls back to looking for a matching line.
-    The files need not exist yet: this runs before dotenvx writes them.
+    The paths need not exist yet: this runs before dotenvx writes them.
     """
     ignore_path = os.path.join(git_root, ".gitignore")
     if os.path.islink(ignore_path):
         ignore_path = os.path.realpath(ignore_path)
     existing = read_bytes(ignore_path) if os.path.isfile(ignore_path) else b""
     names = []
-    for keys_file in keys_files:
+    for path in paths:
         try:
-            name = slash_path(os.path.relpath(keys_file, git_root))
+            name = slash_path(os.path.relpath(path, git_root))
         except ValueError:
-            name = slash_path(keys_file)
+            name = slash_path(path)
         if name not in names:
             names.append(name)
-    verdicts = [git_ignores(git_root, keys_file) for keys_file in keys_files]
+    verdicts = [git_ignores(git_root, path) for path in paths]
     if verdicts and all(verdict is True for verdict in verdicts):
         return False, u"git already ignores %s" % u", ".join(names)
     if any(verdict is None for verdict in verdicts):
-        patterns = set(line.strip() for line in to_text(existing).splitlines())
-        if patterns & set([".env.keys", ".env.keys*", ".env*", ".env.*", "*.keys", "/.env.keys", "**/.env.keys"]):
-            return False, u".gitignore already ignores .env.keys"
+        lines = set(line.strip() for line in to_text(existing).splitlines())
+        known = set([pattern])
+        if pattern == ".env.keys*":
+            known |= set([".env.keys", ".env*", ".env.*", "*.keys", "/.env.keys", "**/.env.keys"])
+        if lines & known:
+            return False, u".gitignore already ignores %s" % pattern
     newline = b"\r\n" if b"\r\n" in existing else b"\n"
     data = existing
     if data and not data.endswith(b"\n"):
         data += newline
     # Appended last, so it wins over any earlier negated rule in this file.
-    data += newline + b"# dotenvx private decryption keys - never commit (added by sweep_and_secure.py)" + newline
-    data += b".env.keys*" + newline
+    data += newline + to_bytes(u"# %s (added by sweep_and_secure.py)" % why) + newline
+    data += to_bytes(pattern) + newline
     write_bytes(ignore_path, data)
-    still_visible = [name for name, keys_file in zip(names, keys_files) if git_ignores(git_root, keys_file) is False]
+    still_visible = [name for name, path in zip(names, paths) if git_ignores(git_root, path) is False]
     if still_visible:
-        return True, (u"added .env.keys* to %s, but git STILL does not ignore %s - look for a negated"
-                      u" rule in a nested .gitignore" % (ignore_path, u", ".join(still_visible)))
-    return True, u"added .env.keys* to %s" % ignore_path
+        return True, (u"added %s to %s, but git STILL does not ignore %s - look for a negated"
+                      u" rule in a nested .gitignore" % (pattern, ignore_path, u", ".join(still_visible)))
+    return True, u"added %s to %s" % (pattern, ignore_path)
 
 
 def git_tracked(git_root, path):
@@ -1809,6 +2071,12 @@ def print_next_steps(plan, chosen, keys_files, args, style):
             say(u"       %s -- <your command>" % command)
         if needs_fk:
             say(u"     (dotenvx only looks for .env.keys next to the env file; -fk points it at the one it wrote)")
+    quarantined = [item for item in chosen if item.kind == "quarantine" and item.status == "done"]
+    if quarantined:
+        bullet(u"%d archive(s) holding secrets were moved to %s (see its %s for where each came from)."
+               % (len(quarantined), plan.rel(plan.quarantine), QUARANTINE_MANIFEST))
+        say(u"     Nothing reads them from there. Inspect them, rebuild them without the secrets, or delete")
+        say(u"     them; never commit that folder. If an archive was tracked by git, commit its removal.")
     if keys_files:
         bullet(u"The private decryption key lives in %s." % u", ".join(plan.rel(k) for k in keys_files))
         say(u"     NEVER commit it. Share it through a password manager or your CI's secret store")
@@ -1853,7 +2121,7 @@ def parse_args(argv):
             "                               plaintext replaced by a placeholder like ${KEY}"),
         epilog=(
             "exit codes: 0 done (or nothing to do), 1 missing tool / scan incomplete or failed / encryption failed,\n"
-            "            2 you said no (or no --yes while not interactive)\n"
+            "            2 you said no or gave no answer (stdin not a terminal, nothing piped, no --yes), 130 interrupted\n"
             "\n"
             "TruffleHog: https://trufflesecurity.com/trufflehog     dotenvx: https://dotenvx.com"),
     )
@@ -1869,6 +2137,12 @@ def parse_args(argv):
                              "not only the ones TruffleHog flagged")
     parser.add_argument("--no-rewrite", action="store_true",
                         help="store secrets encrypted but leave the source files untouched")
+    parser.add_argument("--quarantine", action="store_true",
+                        help="move archives (zip, tar, gz ...) that hold secrets out of the tree into the "
+                             "quarantine folder, keeping their relative paths")
+    parser.add_argument("--quarantine-dir", metavar="DIR", default=None,
+                        help="the quarantine folder (default: %s inside the swept folder); implies --quarantine"
+                             % QUARANTINE_DEFAULT)
     parser.add_argument("--placeholder", default="${NAME}", metavar="TEMPLATE",
                         help="text that replaces a secret in source files; NAME becomes the key "
                              "(default: ${NAME})")
@@ -1877,7 +2151,8 @@ def parse_args(argv):
     parser.add_argument("--exclude", action="append", default=[], metavar="REGEX",
                         help="skip paths matching this regular expression (repeatable)")
     parser.add_argument("--no-default-excludes", action="store_true",
-                        help="also scan .git, node_modules, virtualenvs and friends")
+                        help="also scan .git, node_modules, virtualenvs and friends "
+                             "(.env.keys and staging files stay excluded)")
     parser.add_argument("--min-length", type=int, default=8, metavar="N",
                         help="ignore secrets shorter than N characters (default: 8)")
     parser.add_argument("--trufflehog", metavar="PATH", help="trufflehog executable (default: search PATH)")
@@ -1895,21 +2170,34 @@ def parse_args(argv):
     return args
 
 
-def protect_keys_files_early(git_root, root, chosen, style):
-    """Before anything is encrypted: make sure git will ignore the private key files
-    dotenvx is about to write, so that a crash half way cannot leave them exposed."""
+def protect_keys_files_early(git_root, root, chosen, style, plan=None):
+    """Before anything is encrypted or moved: make sure git will ignore the private key
+    files dotenvx is about to write, and the quarantine folder archives are about to be
+    moved into, so that a crash half way cannot leave them exposed."""
     candidates = [os.path.join(root, ".env.keys")]
     for item in chosen:
         if item.store:
             candidate = os.path.join(os.path.dirname(item.store), ".env.keys")
             if candidate not in candidates:
                 candidates.append(candidate)
-    try:
-        changed, message = ensure_gitignore(git_root, candidates)
-    except (IOError, OSError) as exc:
-        say(u"  %s could not update .gitignore: %s" % (style.warn("[!!]"), to_text(str(exc))))
-        return
-    say(u"  %s %s" % (style.ok("[ok]") if changed else style.dim("[--]"), message))
+    jobs = [(candidates, ".env.keys*", "dotenvx private decryption keys - never commit")]
+    if plan is not None and plan.quarantine and any(item.kind == "quarantine" for item in chosen):
+        try:
+            rel = slash_path(os.path.relpath(plan.quarantine, git_root))
+        except ValueError:
+            rel = None
+        if rel and not rel.startswith(".."):
+            # ask git about a file inside the folder: a "dir/" pattern cannot match a folder that
+            # does not exist yet, but it does match the paths beneath it
+            inside = os.path.join(plan.quarantine, QUARANTINE_MANIFEST)
+            jobs.append(([inside], u"/%s/" % rel, "archives with secrets, moved by --quarantine - never commit"))
+    for paths, pattern, why in jobs:
+        try:
+            changed, message = ensure_gitignore(git_root, paths, pattern, why)
+        except (IOError, OSError) as exc:
+            say(u"  %s could not update .gitignore: %s" % (style.warn("[!!]"), to_text(str(exc))))
+            continue
+        say(u"  %s %s" % (style.ok("[ok]") if changed else style.dim("[--]"), message))
 
 
 def wrap_up(plan, chosen, journal, root, git_root, args, style, failed, error, scan_incomplete):
@@ -1950,6 +2238,8 @@ def wrap_up(plan, chosen, journal, root, git_root, args, style, failed, error, s
             say(u"  encrypted and saved:   %s" % plan.rel(path))
         for path in source_written:
             say(u"  placeholders written:  %s" % plan.rel(path))
+        for path in journal.paths("quarantine"):
+            say(u"  moved to quarantine:   %s" % plan.rel(path))
         pending = OrderedDict()
         for item in chosen:
             if item.kind == "source" and item.status == "planned" and item.store in env_written:
@@ -1961,7 +2251,9 @@ def wrap_up(plan, chosen, journal, root, git_root, args, style, failed, error, s
             say(u"  Run again to finish: stored values are recognised and reused, not duplicated.")
         return
 
-    stored = set((item.store, item.key) for item in chosen if item.status in ("done", "stored"))
+    stored = set((item.store, item.key) for item in chosen
+                 if item.status in ("done", "stored") and item.kind != "quarantine")
+    moved = [item for item in chosen if item.kind == "quarantine" and item.status == "done"]
     sources = [item for item in chosen if item.kind == "source"]
     removed = sum(item.replaced for item in sources if item.status == "done")
     removed_files = len(set(item.path for item in sources if item.status == "done"))
@@ -1969,6 +2261,8 @@ def wrap_up(plan, chosen, journal, root, git_root, args, style, failed, error, s
     parts = [u"%d secret(s) stored encrypted" % len(stored)]
     if sources and not args.no_rewrite:
         parts.append(u"%d plaintext occurrence(s) removed from %d file(s)" % (removed, removed_files))
+    if moved:
+        parts.append(u"%d archive(s) moved to %s" % (len(moved), plan.rel(plan.quarantine)))
     if failed:
         parts.append(u"%d failed" % len(failed))
     if skipped:
@@ -1998,12 +2292,36 @@ def main(argv=None):
     store = os.path.normpath(store)
     if os.path.islink(store):
         store = os.path.realpath(store)
+    reserved = [re.compile(pattern) for pattern in ALWAYS_EXCLUDES]
+    if os.path.basename(store).startswith(TEMP_PREFIX) or is_excluded(store, reserved):
+        say(style.bad(u"[!!] --env-file %s: that name is reserved. dotenvx key files (.env.keys*), vault files"
+                      u" (.env.vault) and this script's staging files (.sweep-and-secure-*) are never scanned or"
+                      u" rewritten, so secrets stored there would be lost; use a name like .env or config/secrets.env."
+                      % store), sys.stderr)
+        return 1
 
     say(style.bold(u"sweep-and-secure %s" % __version__) + style.dim(u"  (TruffleHog + dotenvx)"))
     say(u"Folder: %s" % root)
     tools = locate_tools(args, root, style)
 
-    exclude_patterns = [] if args.no_default_excludes else list(DEFAULT_EXCLUDES)
+    quarantine = None
+    if args.quarantine or args.quarantine_dir:
+        quarantine = fs_text(args.quarantine_dir or QUARANTINE_DEFAULT)
+        if not os.path.isabs(quarantine):
+            quarantine = os.path.join(root, quarantine)
+        quarantine = os.path.normpath(quarantine)
+        name = os.path.basename(quarantine)
+        reserved_name = name.startswith(TEMP_PREFIX) or (is_excluded(quarantine, reserved) and name != QUARANTINE_DEFAULT)
+        if reserved_name or quarantine == root:
+            say(style.bad(u"[!!] --quarantine-dir %s: that folder cannot be used (reserved name, or the swept folder"
+                          u" itself)." % quarantine), sys.stderr)
+            return 1
+    exclude_patterns = list(ALWAYS_EXCLUDES)
+    if quarantine and os.path.basename(quarantine) != QUARANTINE_DEFAULT:
+        # a custom quarantine folder inside the tree must not be scanned or rewritten either
+        exclude_patterns.append(u"^" + re.escape(quarantine).replace(re.escape(os.sep), u"[/\\\\]") + u"([/\\\\]|$)")
+    if not args.no_default_excludes:
+        exclude_patterns.extend(DEFAULT_EXCLUDES)
     exclude_patterns.extend(args.exclude)
     exclude_res = []
     for pattern in exclude_patterns:
@@ -2015,7 +2333,8 @@ def main(argv=None):
 
     say(u"Scanning with TruffleHog (this can take a while on big trees) ...")
     try:
-        findings, code = run_trufflehog(tools["trufflehog"]["path"], root, exclude_patterns, args)
+        findings, code = run_trufflehog(tools["trufflehog"]["path"], root, exclude_patterns, args,
+                                        ScanProgress(sys.stdout))
     except ToolError as exc:
         say(style.bad(u"[!!] %s" % to_text(str(exc))), sys.stderr)
         return 1
@@ -2025,7 +2344,7 @@ def main(argv=None):
                       u" probably INCOMPLETE. What it did report is handled below; the exit code will be 1."
                       % code))
 
-    encrypted, plaintext, stale = inventory_env_files(root, exclude_res)
+    encrypted, plaintext, stale = inventory_env_files(root, exclude_res, protect=(store,))
     if stale:
         names = u", ".join(slash_path(os.path.relpath(path, root)) for path in stale)
         if args.dry_run:
@@ -2034,7 +2353,7 @@ def main(argv=None):
             removed = remove_stale(stale)
             say(style.dim(u"Removed %d leftover staging file(s) from an interrupted run: %s" % (len(removed), names)))
     decryptor = make_decryptor(tools["dotenvx"]["path"], root, args)
-    plan = build_plan(findings, root, store, args, plaintext, exclude_res, decryptor)
+    plan = build_plan(findings, root, store, args, plaintext, exclude_res, decryptor, quarantine)
     plan.encrypted = encrypted
     plan.plain_env = plaintext
     print_report(plan, args, style, any(f.verified for f in findings))
@@ -2057,7 +2376,7 @@ def main(argv=None):
     journal = Journal()
     git_root = find_git_root(root)
     if git_root:
-        protect_keys_files_early(git_root, root, chosen, style)
+        protect_keys_files_early(git_root, root, chosen, style, plan)
     failed, error = [], None
     try:
         failed = execute(plan, chosen, tools["dotenvx"]["path"], args, style, decryptor, journal)

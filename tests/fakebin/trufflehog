@@ -19,6 +19,7 @@ import json
 import os
 import re
 import sys
+import zipfile
 
 DETECTORS = [
     ("Github", re.compile(r"\bghp_[A-Za-z0-9]{36}\b"),
@@ -48,13 +49,22 @@ def emit(path, text, offset, detector, raw, raw_v2, extra, decoder="PLAIN"):
     sys.stdout.write(json.dumps(obj) + "\n")
 
 
-def scan_file(path):
+def scan_file(path, log_level=0):
+    if log_level >= 3:  # like the real tool: one log line per file, on stderr
+        sys.stderr.write(json.dumps({"level": "info-3", "logger": "trufflehog", "msg": "scanning file",
+                                     "path": path}) + "\n")
     with io.open(path, "rb") as fh:
         data = fh.read()
     if data[:2] == b"\x1f\x8b":  # gzip archive: scan the content, report the archive
         try:
             data = gzip.GzipFile(fileobj=io.BytesIO(data)).read()
         except (IOError, OSError, EOFError):
+            return
+    elif data[:4] == b"PK\x03\x04":  # zip archive: scan every member, report the archive
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                data = b"\n".join(archive.read(name) for name in archive.namelist() if not name.endswith("/"))
+        except (IOError, OSError, zipfile.BadZipfile):
             return
     decoder = "PLAIN"
     if data[:2] in (b"\xff\xfe", b"\xfe\xff"):  # like TruffleHog's UTF16 decoder
@@ -87,6 +97,13 @@ def main(argv):
         sys.stderr.write("fake trufflehog: usage: trufflehog filesystem ROOT --json\n")
         return 2
     root = argv[1]
+    log_level = 0
+    for arg in argv:
+        if arg.startswith("--log-level="):
+            try:
+                log_level = int(arg.split("=", 1)[1])
+            except ValueError:
+                pass
     excludes = []
     if "--exclude-paths" in argv:
         with io.open(argv[argv.index("--exclude-paths") + 1], encoding="utf-8") as fh:
@@ -100,7 +117,7 @@ def main(argv):
         for name in sorted(filenames):
             path = os.path.join(dirpath, name)
             if not excluded(path) and not os.path.islink(path):
-                scan_file(path)
+                scan_file(path, log_level)
     if os.environ.get("FAKE_TRUFFLEHOG_PARTIAL"):  # results were printed, then it died
         sys.stderr.write("fake trufflehog: simulated failure after partial results\n")
         return 1
