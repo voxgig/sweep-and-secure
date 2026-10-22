@@ -151,10 +151,16 @@ TOOLS = OrderedDict([
     }),
 ])
 
-# Paths TruffleHog should not bother with, and we should never rewrite.
-# Regular expressions, matched against the full (forward-slash) path.
-# TruffleHog matches them against the path as the OS spells it (backslashes on
-# Windows), so both separators are accepted.
+# Paths TruffleHog should not bother with, and we should never rewrite. Regular
+# expressions matched against the full path; TruffleHog sees the path as the OS
+# spells it (backslashes on Windows), so both separators are accepted.
+# Never scanned and never rewritten, whatever the options say:
+ALWAYS_EXCLUDES = [
+    r"(^|[/\\])\.env\.keys",          # dotenvx private keys
+    r"(^|[/\\])\.env\.vault$",        # legacy dotenvx vault files
+    r"(^|[/\\])\.sweep-and-secure-",   # our own staging files, left by an interrupted run
+]
+# Skipped unless --no-default-excludes: version control, vendored and generated trees.
 DEFAULT_EXCLUDES = [
     r"(^|[/\\])\.git([/\\]|$)",
     r"(^|[/\\])\.hg([/\\]|$)",
@@ -164,9 +170,6 @@ DEFAULT_EXCLUDES = [
     r"(^|[/\\])\.venv([/\\]|$)",
     r"(^|[/\\])venv([/\\]|$)",
     r"(^|[/\\])\.tox([/\\]|$)",
-    r"(^|[/\\])\.env\.keys",          # dotenvx private keys: never scan, never touch
-    r"(^|[/\\])\.env\.vault$",        # legacy dotenvx vault files
-    r"(^|[/\\])\.sweep-and-secure-",   # our own staging files, left by an interrupted run
 ]
 
 TEMP_PREFIX = ".sweep-and-secure-"
@@ -1853,7 +1856,7 @@ def parse_args(argv):
             "                               plaintext replaced by a placeholder like ${KEY}"),
         epilog=(
             "exit codes: 0 done (or nothing to do), 1 missing tool / scan incomplete or failed / encryption failed,\n"
-            "            2 you said no (or no --yes while not interactive)\n"
+            "            2 you said no (or no --yes while not interactive), 130 interrupted\n"
             "\n"
             "TruffleHog: https://trufflesecurity.com/trufflehog     dotenvx: https://dotenvx.com"),
     )
@@ -1877,7 +1880,8 @@ def parse_args(argv):
     parser.add_argument("--exclude", action="append", default=[], metavar="REGEX",
                         help="skip paths matching this regular expression (repeatable)")
     parser.add_argument("--no-default-excludes", action="store_true",
-                        help="also scan .git, node_modules, virtualenvs and friends")
+                        help="also scan .git, node_modules, virtualenvs and friends "
+                             "(.env.keys and staging files stay excluded)")
     parser.add_argument("--min-length", type=int, default=8, metavar="N",
                         help="ignore secrets shorter than N characters (default: 8)")
     parser.add_argument("--trufflehog", metavar="PATH", help="trufflehog executable (default: search PATH)")
@@ -2003,7 +2007,9 @@ def main(argv=None):
     say(u"Folder: %s" % root)
     tools = locate_tools(args, root, style)
 
-    exclude_patterns = [] if args.no_default_excludes else list(DEFAULT_EXCLUDES)
+    exclude_patterns = list(ALWAYS_EXCLUDES)
+    if not args.no_default_excludes:
+        exclude_patterns.extend(DEFAULT_EXCLUDES)
     exclude_patterns.extend(args.exclude)
     exclude_res = []
     for pattern in exclude_patterns:

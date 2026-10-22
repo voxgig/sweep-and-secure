@@ -535,6 +535,13 @@ class EndToEndTests(unittest.TestCase):
         self.assertTrue(os.path.islink(self.tree.path(".env")))
         self.assertTrue(encrypted("AWS_ACCESS_KEY_ID", self.tree.read("shared/real.env")))
 
+    def test_no_default_excludes_still_protects_the_private_key_file(self):
+        self.tree.write(".env.keys", ("DOTENV_PRIVATE_KEY=%s\n" % GITHUB_TOKEN).encode("utf-8"))
+        code, out, err = run_script(self.tree.root, ["--dry-run", "--no-default-excludes"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("node_modules/pkg/.env", out)     # the vendor folder is scanned now
+        self.assertNotIn(".env.keys", out.split("Plaintext secrets found")[1])   # the key file never is
+
     def test_example_env_files_are_left_for_manual_attention(self):
         self.tree.write(".env.example", ("STRIPE_SECRET_KEY=%s\nPORT=1\n" % STRIPE_KEY).encode("utf-8"))
         code, out, err = run_script(self.tree.root, ["--dry-run", "--env-all"])
@@ -900,12 +907,18 @@ class UnitTests(unittest.TestCase):
         self.assertFalse(sas.is_lockfile("lock.py"))
 
     def test_is_excluded_accepts_either_separator(self):
-        rules = [re.compile(p) for p in sas.DEFAULT_EXCLUDES]
+        rules = [re.compile(p) for p in sas.ALWAYS_EXCLUDES + sas.DEFAULT_EXCLUDES]
         self.assertTrue(sas.is_excluded("/p/node_modules/x/.env", rules))
         self.assertTrue(sas.is_excluded("C:\\p\\node_modules\\x\\.env".replace("\\", os.sep), rules))
         self.assertTrue(sas.is_excluded("/p/.sweep-and-secure-abc", rules))
         self.assertTrue(sas.is_excluded("/p/.env.keys", rules))
         self.assertFalse(sas.is_excluded("/p/src/.env", rules))
+        # --no-default-excludes drops only the version-control and vendor folders
+        always = [re.compile(p) for p in sas.ALWAYS_EXCLUDES]
+        self.assertTrue(sas.is_excluded("/p/.env.keys", always))
+        self.assertTrue(sas.is_excluded("/p/config/.env.keys.bak", always))
+        self.assertTrue(sas.is_excluded("/p/.sweep-and-secure-x/.env", always))
+        self.assertFalse(sas.is_excluded("/p/node_modules/x/.env", always))
 
     def test_build_plan_ignores_findings_in_excluded_paths(self):
         folder = tempfile.mkdtemp(prefix="sweep-unit-")
