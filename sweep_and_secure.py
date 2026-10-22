@@ -30,6 +30,8 @@ where to get them.
 from __future__ import absolute_import, division, print_function
 
 import argparse
+import bz2
+import gzip
 import hashlib
 import io
 import json
@@ -39,13 +41,21 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
 import traceback
+import zipfile
+import zlib
 from collections import OrderedDict, deque
 
-__version__ = "1.3.0"
+try:
+    import lzma
+except ImportError:  # pragma: no cover - Python 2 without the backport
+    lzma = None
+
+__version__ = "1.3.1"
 
 # --------------------------------------------------------------------------
 # Python 2 / 3 compatibility
@@ -176,6 +186,13 @@ ARCHIVE_MAGIC = [
 ]
 ARCHIVE_EXTENSIONS = (".zip", ".jar", ".war", ".ear", ".apk", ".whl", ".egg", ".nupkg", ".tar", ".tgz",
                       ".gz", ".bz2", ".tbz2", ".xz", ".txz", ".7z", ".rar", ".zst", ".cab")
+ZIP_KINDS = ("zip", "jar", "war", "ear", "apk", "whl", "egg", "nupkg")
+TAR_OR_COMPRESSED_KINDS = ("tar", "tgz", "gzip", "gz", "bzip2", "bz2", "tbz2", "xz", "txz", "tar.gz", "tar.bz2", "tar.xz")
+# Looking inside archives (which files hold the secrets TruffleHog reported):
+INSPECT_MAX_DEPTH = 3                        # archives inside archives inside archives
+INSPECT_BUDGET_BYTES = 512 * 1024 * 1024     # uncompressed content read per archive, at most
+INSPECT_FULL_READ_BYTES = 64 * 1024 * 1024   # members up to this size are searched in memory
+INSPECT_CHUNK = 4 * 1024 * 1024              # bigger members are searched in chunks of this size
 # Skipped unless --no-default-excludes: version control, vendored and generated trees.
 DEFAULT_EXCLUDES = [
     r"(^|[/\\])\.git([/\\]|$)",
@@ -1137,6 +1154,7 @@ class Plan(object):
         self.quarantine = quarantine   # folder archives with secrets are moved to, or None
         self.quarantine_flagged = True # False when it is only offered because the run is interactive
         self.items = []
+        self.archives = OrderedDict()  # path -> Archive: archives TruffleHog found secrets inside
         self.skipped = []            # (path, detector, reason)
         self.encrypted = []          # (path, key, line) already encrypted
         self.plain_env = []          # (path, key, line, value) unflagged plaintext env keys
@@ -1274,11 +1292,283 @@ def load_for_edit(path, cache):
     return result
 
 
+class Archive(object):
+    """An archive TruffleHog found secrets inside, and what we could see in it."""
+
+    def __init__(self, path, kind):
+        self.path = path
+        self.kind = kind
+        self.findings = []    # every TruffleHog result reported for this archive
+        self.item = None      # the quarantine Item when this run may move it, else None
+        self.inside = []      # (path inside the archive, [findings that file holds]) in archive order
+        self.unplaced = []    # findings no file inside holds verbatim
+        self.note = u""       # why the view inside is incomplete, when it is
+
+
+def gzip_member_name(head, fallback):
+    """The original file name recorded in a gzip header (FNAME), else fallback."""
+    if len(head) < 10 or not head.startswith(b"\x1f\x8b"):
+        return fallback
+    flags = ord(head[3:4])
+    pos = 10
+    if flags & 0x04:  # FEXTRA
+        if len(head) < pos + 2:
+            return fallback
+        pos += 2 + (ord(head[pos:pos + 1]) | (ord(head[pos + 1:pos + 2]) << 8))
+    if flags & 0x08:  # FNAME
+        end = head.find(b"\x00", pos)
+        if end > pos:
+            return head[pos:end].decode("latin-1")
+    return fallback
+
+
+def archive_kind_of_bytes(head, name):
+    """archive_kind() for data already in hand: magic bytes first, then the name."""
+    for magic, kind in ARCHIVE_MAGIC:
+        if head.startswith(magic):
+            return kind
+    if head[257:262] == b"ustar":
+        return "tar"
+    lowered = name.lower()
+    for ext in ARCHIVE_EXTENSIONS:
+        if lowered.endswith(ext):
+            return ext.lstrip(".")
+    return None
+
+
+def safe_text(text):
+    """text with any undecodable bytes (tarfile keeps them as surrogates) replaced, so that it
+    can be printed and encoded without surprises."""
+    try:
+        return text.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+    except (UnicodeError, LookupError):  # pragma: no cover - Python 2 has no surrogateescape
+        return text.encode("ascii", "replace").decode("ascii")
+
+
+def walk_archive(opener, kind, name, prefix, depth, notes):
+    """Yield (path inside, size or None, opener) for every regular file in the archive that
+    opener() streams, descending into archives found inside it up to INSPECT_MAX_DEPTH deep.
+    name is the archive's own name (used in notes, and for a lone compressed file that does
+    not record the name of its content); prefix is prepended to the paths inside. Each member
+    opener() returns a fresh stream of that member's content. Nothing is written anywhere."""
+    # Every stream opened here is closed before the walk ends: an open handle on the archive
+    # would stop Windows from renaming it into quarantine later on.
+    open_streams = []
+    try:
+        if kind in ZIP_KINDS:
+            stream = opener()
+            open_streams.append(stream)
+            archive = zipfile.ZipFile(stream)
+            open_streams.append(archive)
+            for info in archive.infolist():
+                member = safe_text(to_text(info.filename))
+                if member.endswith(u"/"):
+                    continue
+                if info.flag_bits & 0x1:
+                    notes.append(u"%s%s is password-protected" % (prefix, member))
+                    continue
+                for entry in member_entries(prefix + member, info.file_size,
+                                            lambda info=info: archive.open(info), depth, notes):
+                    yield entry
+        elif kind in TAR_OR_COMPRESSED_KINDS:
+            stream = opener()
+            open_streams.append(stream)
+            try:
+                tar = tarfile.open(fileobj=stream, mode="r:*")
+                open_streams.append(tar)
+            except tarfile.TarError:
+                tar = None
+            if tar is not None:
+                for member in tar:
+                    if not member.isfile():
+                        continue
+                    for entry in member_entries(prefix + safe_text(to_text(member.name)), member.size,
+                                                lambda member=member: tar.extractfile(member), depth, notes):
+                        yield entry
+            else:
+                # one compressed file (gzip, bzip2 or xz): named after the gzip header when it
+                # has one, else after the archive itself without the compression suffix
+                stream.seek(0)
+                head = stream.read(512)
+                stem = os.path.basename(name)
+                for ext in (u".gz", u".bz2", u".xz", u".bzip2", u".gzip"):
+                    if stem.lower().endswith(ext):
+                        stem = stem[:-len(ext)]
+                        break
+                if head.startswith(b"\x1f\x8b"):
+                    member = gzip_member_name(head, stem)
+                    decompress = lambda: Decompressed(opener(), lambda raw: gzip.GzipFile(fileobj=raw))
+                elif head.startswith(b"BZh"):
+                    member, decompress = stem, lambda: Decompressed(opener(), bz2.BZ2File)
+                elif head.startswith(b"\xfd7zXZ\x00") and lzma is not None:
+                    member, decompress = stem, lambda: Decompressed(opener(), lzma.LZMAFile)
+                else:
+                    notes.append(u"cannot read %s from here" % name)
+                    return
+                for entry in member_entries(prefix + safe_text(member), None, decompress, depth, notes):
+                    yield entry
+        else:
+            notes.append(u"cannot look inside a %s archive from here" % kind)
+    except (zipfile.BadZipfile, tarfile.TarError, IOError, OSError, EOFError, zlib.error,
+            RuntimeError, ValueError, NotImplementedError) as exc:
+        notes.append(u"could not read %s (%s)" % (name, to_text(str(exc)) or exc.__class__.__name__))
+    finally:
+        for handle in reversed(open_streams):
+            close_quietly(handle)
+
+
+def close_quietly(handle):
+    try:
+        handle.close()
+    except Exception:  # pragma: no cover - closing is best effort
+        pass
+
+
+class Decompressed(object):
+    """A decompressing reader (gzip, bzip2, xz) over a raw stream that closes both when
+    closed; the standard library readers leave a stream they were handed open."""
+
+    def __init__(self, raw, wrap):
+        self.raw = raw
+        try:
+            self.inner = wrap(raw)
+        except Exception:
+            close_quietly(raw)
+            raise
+
+    def read(self, size=-1):
+        return self.inner.read(size)
+
+    def close(self):
+        close_quietly(self.inner)
+        close_quietly(self.raw)
+
+
+def member_entries(display, size, opener, depth, notes):
+    """One member: descend into it when it is an archive itself, else yield it."""
+    if depth < INSPECT_MAX_DEPTH:
+        try:
+            probe = opener()
+            try:
+                head = probe.read(512)
+            finally:
+                close_quietly(probe)
+        except (IOError, OSError, EOFError, zlib.error, RuntimeError, ValueError, NotImplementedError) as exc:
+            notes.append(u"could not read %s (%s)" % (display, to_text(str(exc)) or exc.__class__.__name__))
+            return
+        inner = archive_kind_of_bytes(head, display)
+        if inner:
+            for entry in walk_archive(opener, inner, display, display + u"!", depth + 1, notes):
+                yield entry
+            return
+    yield (display, size, opener)
+
+
+def read_up_to(stream, limit):
+    """Up to limit + 1 bytes from stream: one byte more than limit tells the caller there is more."""
+    chunks, total = [], 0
+    while total <= limit:
+        chunk = stream.read(min(INSPECT_CHUNK, limit + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks)
+
+
+def search_stream(stream, needles, overlap, budget, head=b""):
+    """Which needles (plain bytes) occur in head + the rest of stream, read chunk by chunk
+    while budget lasts: (hits, budget left, exhausted). head is content already read and
+    charged; a needle straddling the head and the first chunk is still found."""
+    hits = set(needle for needle in needles if needle in head)
+    tail = head[-overlap:] if overlap else b""
+    while budget > 0:
+        chunk = stream.read(INSPECT_CHUNK)
+        if not chunk:
+            return hits, budget, False
+        budget -= len(chunk)
+        window = tail + chunk
+        for needle in needles:
+            if needle not in hits and needle in window:
+                hits.add(needle)
+        tail = window[-overlap:] if overlap else b""
+    return hits, budget, True
+
+
+def inspect_archive(archive):
+    """Fill in archive.inside, .unplaced and .note: which files inside hold the secrets
+    TruffleHog reported. zip, tar (any compression), gzip, bzip2 and xz are opened with the
+    standard library, archives nested in archives too; at most INSPECT_BUDGET_BYTES of
+    content is read, every byte decompressed counted once. Members up to
+    INSPECT_FULL_READ_BYTES are searched like files (same decoders), bigger ones chunk by
+    chunk for the plain text. Nothing is written."""
+    notes = []
+    if archive.kind in ("gzip", "bzip2", "xz"):
+        # the magic bytes say "compressed"; is it a compressed tar? (shown as tar.gz etc.)
+        try:
+            tarfile.open(archive.path, "r:*").close()
+            archive.kind = u"tar." + {"gzip": u"gz", "bzip2": u"bz2", "xz": u"xz"}[archive.kind]
+            if archive.item is not None:
+                archive.item.note = archive.kind
+        except (tarfile.TarError, IOError, OSError, EOFError, zlib.error, ValueError):
+            pass
+    wanted = [(finding, [c for c in candidate_secrets(finding) if c]) for finding in archive.findings]
+    needles = sorted(set(to_bytes(c) for _, cs in wanted for c in cs), key=len, reverse=True)
+    overlap = len(needles[0]) - 1 if needles else 0
+    budget = INSPECT_BUDGET_BYTES
+    held = OrderedDict()
+    exhausted = False
+    opener = lambda: io.open(archive.path, "rb")
+    name = os.path.basename(archive.path)
+    for display, size, member_opener in walk_archive(opener, archive.kind, name, u"", 0, notes):
+        if budget <= 0:
+            exhausted = True
+            break
+        found = []
+        stream = None
+        try:
+            stream = member_opener()
+            data = b"" if (size is not None and size > INSPECT_FULL_READ_BYTES) else read_up_to(stream, INSPECT_FULL_READ_BYTES)
+            budget -= len(data)
+            if data and len(data) <= INSPECT_FULL_READ_BYTES:
+                for finding, candidates in wanted:
+                    if any(locate(data, c, finding.decoder) for c in candidates):
+                        found.append(finding)
+            else:
+                # too big to hold: the part already read is searched for the plain text and the
+                # rest follows from the same stream, so nothing is decompressed or charged twice
+                hits, budget, ran_out = search_stream(stream, needles, overlap, budget, data)
+                exhausted = exhausted or ran_out
+                for finding, candidates in wanted:
+                    if any(to_bytes(c) in hits for c in candidates):
+                        found.append(finding)
+        except (IOError, OSError, EOFError, zlib.error, RuntimeError, ValueError, NotImplementedError) as exc:
+            notes.append(u"could not read %s (%s)" % (display, to_text(str(exc)) or exc.__class__.__name__))
+            continue
+        finally:
+            if stream is not None:
+                close_quietly(stream)
+        if found:
+            held[display] = found
+    placed = set(id(f) for found in held.values() for f in found)
+    archive.inside = list(held.items())
+    archive.unplaced = [f for f in archive.findings if id(f) not in placed]
+    if exhausted:
+        notes.append(u"stopped looking after %d MB of content; the rest was not checked"
+                     % (INSPECT_BUDGET_BYTES // (1024 * 1024)))
+    if archive.unplaced and (archive.inside or notes):
+        decoders = sorted(set(f.decoder for f in archive.unplaced))
+        notes.append(u"%d secret(s) not found verbatim in any file inside (TruffleHog decoder: %s)"
+                     % (len(archive.unplaced), u", ".join(decoders)))
+    if len(notes) > 3:
+        notes = notes[:3] + [u"and %d more problem(s)" % (len(notes) - 3)]
+    archive.note = u"; ".join(notes)
+
+
 def build_plan(findings, root, store, args, env_plaintext, exclude_res=(), decryptor=None, quarantine=None):
     plan = Plan(root, store, quarantine)
     cache = {}
     seen = {}
-    archives = OrderedDict()   # path -> quarantine item (one per archive, whatever it holds)
     ordered = sorted(findings, key=lambda f: (f.path, f.line, f.raw))
     for finding in ordered:
         if exclude_res and is_excluded(finding.path, exclude_res):
@@ -1286,17 +1576,25 @@ def build_plan(findings, root, store, args, env_plaintext, exclude_res=(), decry
             continue
         data, reason = load_for_edit(finding.path, cache)
         if data is None:
-            kind = archive_kind(finding.path) if (quarantine and u"archive" in reason) else None
+            kind = archive_kind(finding.path) if u"archive" in reason else None
             if kind:
-                item = archives.get(finding.path)
-                if item is None:
-                    item = Item(finding.path, 0, 0, finding.detector, finding.verified, finding.raw, b"",
-                                "utf-8", finding.extra)
-                    item.kind, item.key, item.note = "quarantine", u"-", kind
-                    archives[finding.path] = item
-                    plan.items.append(item)
-                elif finding.detector not in item.detector.split(u", "):
-                    item.detector += u", " + finding.detector
+                # One Archive per file, whatever it holds; it is a quarantine item when this
+                # run may move archives, else it counts as needing manual attention.
+                archive = plan.archives.get(finding.path)
+                if archive is None:
+                    archive = Archive(finding.path, kind)
+                    plan.archives[finding.path] = archive
+                    if quarantine:
+                        item = Item(finding.path, 0, 0, finding.detector, finding.verified, finding.raw, b"",
+                                    "utf-8", finding.extra)
+                        item.kind, item.key, item.note = "quarantine", u"-", kind
+                        archive.item = item
+                        plan.items.append(item)
+                    else:
+                        plan.skipped.append((finding.path, finding.detector, reason))
+                archive.findings.append(finding)
+                if archive.item is not None and finding.detector not in archive.item.detector.split(u", "):
+                    archive.item.detector += u", " + finding.detector
                 continue
             plan.skipped.append((finding.path, finding.detector, reason))
             continue
@@ -1326,6 +1624,9 @@ def build_plan(findings, root, store, args, env_plaintext, exclude_res=(), decry
                 reason = (u"secret text not found verbatim in the file (TruffleHog decoder: %s)"
                           % finding.decoder)
             plan.skipped.append((finding.path, finding.detector, reason))
+
+    for archive in plan.archives.values():
+        inspect_archive(archive)   # which files inside hold the secrets: shown in the listing
 
     # Secrets found inside env files: which KEY=... entries hold the secret? Every one of
     # them must be encrypted, so each becomes an item of its own.
@@ -1506,7 +1807,9 @@ def quarantine_target(item, plan):
 
 def move_to_quarantine(item, plan, journal=None):
     """Move one archive out of the tree. Rename when possible; copy then delete across
-    file systems. Appends a line to the quarantine's MANIFEST.txt. Returns the new path."""
+    file systems. The move is journaled first, then a line goes into the quarantine's
+    MANIFEST.txt. Returns (new path, warning): the warning is set when the file moved but
+    the manifest could not be written."""
     target = quarantine_target(item, plan)
     folder = os.path.dirname(target)
     if not os.path.isdir(folder):
@@ -1533,26 +1836,87 @@ def move_to_quarantine(item, plan, journal=None):
                 pass
             raise
         os.remove(item.path)
-    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    line = u"%s  %s  <- %s  (%s)\n" % (stamp, slash_path(os.path.relpath(candidate, plan.quarantine)),
-                                        plan.rel(item.path), item.detector)
-    manifest = os.path.join(plan.quarantine, QUARANTINE_MANIFEST)
-    with io.open(manifest, "ab") as fh:
-        fh.write(line.encode("utf-8"))
     if journal is not None:
-        journal.add("quarantine", item.path, candidate)
-    return candidate
+        journal.add("quarantine", item.path, candidate)   # before anything else can fail: the file has moved
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    archive = plan.archives.get(item.path)
+    inside = u""
+    if archive is not None and archive.inside:
+        inside = u"  inside: " + u", ".join(safe_text(member) for member, _ in archive.inside)
+    line = u"%s  %s  <- %s  (%s)%s\n" % (stamp, slash_path(os.path.relpath(candidate, plan.quarantine)),
+                                          plan.rel(item.path), item.detector, inside)
+    manifest = os.path.join(plan.quarantine, QUARANTINE_MANIFEST)
+    try:
+        with io.open(manifest, "ab") as fh:
+            fh.write(line.encode("utf-8", "replace"))
+    except (IOError, OSError, UnicodeError) as exc:
+        return candidate, u"moved, but %s could not be updated: %s" % (QUARANTINE_MANIFEST, to_text(str(exc)))
+    return candidate, u""
+
+
+def secrets_text(findings):
+    """'Stripe sk_l...23, AWS AKIA...M2' for a list of findings: each distinct secret counted
+    once, and '(x2)' when two different secrets happen to mask to the same text."""
+    shown = OrderedDict()
+    seen = set()
+    for finding in findings:
+        if (finding.detector, finding.raw) in seen:
+            continue
+        seen.add((finding.detector, finding.raw))
+        text = u"%s%s %s" % (finding.detector, u" *" if finding.verified else u"", mask(finding.raw))
+        shown[text] = shown.get(text, 0) + 1
+    return u", ".join(text if count == 1 else u"%s (x%d)" % (text, count) for text, count in shown.items())
+
+
+def print_archives(plan, args, style):
+    """The archives TruffleHog found secrets inside, which files inside hold them, and
+    what this run would do with each: moved whole to quarantine, or left in place."""
+    say(u"")
+    if plan.quarantine:
+        tail = (u"  (a chosen archive is moved whole to %s; nothing inside it is rewritten)"
+                % plan.rel(plan.quarantine))
+    else:
+        tail = u"  (not rewritten; with --yes, pass --quarantine to move them out of the tree)"
+    say(style.bold(u"Archives holding secrets: %d" % len(plan.archives)) + style.dim(tail))
+    rows = []
+    for archive in plan.archives.values():
+        number = u"%d" % archive.item.number if archive.item is not None else u"-"
+        name = u"%s (%s)" % (plan.rel(archive.path), archive.kind)
+        if archive.item is not None:
+            action = action_text(archive.item, plan, args)
+        else:
+            action = u"stays in place (pass --quarantine to move it)"
+        lines = [(member, secrets_text(found)) for member, found in archive.inside]
+        if archive.unplaced:
+            where = u"(not seen inside)" if lines or archive.note else u"(could not look inside)"
+            lines.append((where, secrets_text(archive.unplaced)))
+        for index, (member, secrets) in enumerate(lines):
+            first = index == 0
+            rows.append((number if first else u"", name if first else u"", member, secrets,
+                         action if first else u""))
+    for line in table(rows, (u"#", u"Archive", u"File inside", u"Secrets", u"Action")):
+        say(line)
+    for archive in plan.archives.values():
+        if archive.note:
+            say(style.dim(u"  %s: %s" % (plan.rel(archive.path), archive.note)))
+    if plan.quarantine and not plan.quarantine_flagged:
+        say(style.dim(u"  Offered because this run asks first: y moves them too, s lets you leave them in place."
+                      u" A --yes run moves archives only with --quarantine."))
 
 
 def print_report(plan, args, style, verified_any):
     say(u"")
-    if not plan.items:
-        say(style.ok(u"TruffleHog found no plaintext secrets to encrypt."))
+    secrets = [item for item in plan.items if item.kind != "quarantine"]
+    if not secrets:
+        if plan.archives:
+            say(style.ok(u"No plaintext secrets to encrypt in text files; the archives below hold some."))
+        else:
+            say(style.ok(u"TruffleHog found no plaintext secrets to encrypt."))
     else:
-        files = len(set(item.path for item in plan.items))
-        say(style.bold(u"Plaintext secrets found: %d in %d file(s)" % (len(plan.items), files)))
+        files = len(set(item.path for item in secrets))
+        say(style.bold(u"Plaintext secrets found: %d in %d file(s)" % (len(secrets), files)))
         rows = []
-        for item in plan.items:
+        for item in secrets:
             where = plan.rel(item.path) + (u":%d" % item.line if item.line else u"")
             kind = item.detector + (u" *" if item.verified else u"")
             rows.append((u"%d" % item.number, kind, item.key or u"-", mask(item.secret), where,
@@ -1561,13 +1925,13 @@ def print_report(plan, args, style, verified_any):
             say(line)
         if verified_any:
             say(style.dim(u"  * = TruffleHog verified this credential is live"))
-        if any(item.kind == "quarantine" for item in plan.items) and not plan.quarantine_flagged:
-            say(style.dim(u"  Archives holding secrets are offered for moving to %s; answer s to leave them in"
-                          u" place. A --yes run moves them only with --quarantine." % plan.rel(plan.quarantine)))
-    if plan.skipped:
+    if plan.archives:
+        print_archives(plan, args, style)
+    skipped = [entry for entry in plan.skipped if entry[0] not in plan.archives]   # archives: shown above
+    if skipped:
         say(u"")
-        say(style.warn(u"Found but cannot fix automatically: %d" % len(plan.skipped)))
-        for path, detector, reason in plan.skipped:
+        say(style.warn(u"Found but cannot fix automatically: %d" % len(skipped)))
+        for path, detector, reason in skipped:
             say(u"  %-18s %s" % (detector, plan.rel(path)))
             say(u"  %-18s %s" % (u"", style.dim(reason)))
     if plan.ignored:
@@ -2026,13 +2390,15 @@ def execute(plan, chosen, dotenvx, args, style, decryptor=None, journal=None):
         if item.kind != "quarantine":
             continue
         try:
-            moved = move_to_quarantine(item, plan, journal)
+            moved, warning = move_to_quarantine(item, plan, journal)
         except (IOError, OSError) as exc:
             item.status, item.note = "failed", to_text(str(exc))
             say(u"  %s %s: could not move to quarantine: %s" % (style.bad("[!!]"), plan.rel(item.path), item.note))
             continue
         item.status = "done"
         say(u"  %s %s: moved to %s" % (style.ok("[ok]"), plan.rel(item.path), plan.rel(moved)))
+        if warning:
+            say(u"  %s %s: %s" % (style.warn("[--]"), plan.rel(moved), warning))
     return [item for item in chosen if item.status == "failed"]
 
 
