@@ -143,12 +143,12 @@ and `--dotenvx PATH` (or the `TRUFFLEHOG_BIN` and `DOTENVX_BIN` environment
 variables) point it at a copy that is not on your `PATH`. A dry run in your real
 project is just as safe and shows the listing a real run would start with.
 
-To check a downloaded release file against the published checksums (the curl
-installer does this for you):
+To check a downloaded `sweep_and_secure.py` against the published checksums,
+from the folder it was downloaded into (the curl installer does this for you):
 
 ```
 curl -sSfL -O https://github.com/voxgig/sweep-and-secure/releases/download/v1.1.0/SHA256SUMS
-sha256sum -c --ignore-missing SHA256SUMS      # macOS: shasum -a 256 -c --ignore-missing SHA256SUMS
+grep ' sweep_and_secure.py$' SHA256SUMS | sha256sum -c -      # macOS: ... | shasum -a 256 -c -
 ```
 
 ## Usage
@@ -245,16 +245,19 @@ file in a sub-folder the "Next steps" give the command with `-fk`
 - `-n`, `--dry-run`, `--list`: scan and report, change nothing. Exits 0 whatever
   is found (1 only if the scan itself failed), so it suits install checks and
   CI audits.
-- `-y`, `--yes`: encrypt everything listed without asking. Required when the
-  script is not run from a terminal, such as a script or CI; without it a
-  non-interactive run lists the findings and exits 2.
+- `-y`, `--yes`: encrypt everything listed without asking; use it in scripts
+  and CI. Without it the question is asked even when stdin is not a terminal
+  and the answer is read from there: a piped `y` is accepted, and no input at
+  all (end of file) counts as no, so the run lists the findings and exits 2.
 - `--env-file PATH`: the dotenv file that receives secrets moved out of other
   files. Default `.env` in the swept folder; a relative PATH is taken from there.
   The file is created with a comment header if it does not exist. Any
   dotenv-style name works; dotenvx names the key variables after the file, so
-  `config/.env.production` gets `DOTENV_PRIVATE_KEY_PRODUCTION`. A secret found
-  inside an existing env file is always encrypted in that file, whatever
-  `--env-file` says.
+  `config/.env.production` gets `DOTENV_PRIVATE_KEY_PRODUCTION`. Names reserved
+  for dotenvx key files, vault files and the script's staging files
+  (`.env.keys*`, `.env.vault`, `.sweep-and-secure-*`) are refused, because they
+  are never scanned or rewritten. A secret found inside an existing env file is
+  always encrypted in that file, whatever `--env-file` says.
 - `--env-all`: also encrypt every other plaintext key in the env files
   (`PORT=3000`, `APP_NAME=demo`, ...), not only the ones TruffleHog flagged. The
   report's "Other plaintext keys" list shows exactly what this adds. Example
@@ -297,7 +300,7 @@ file in a sub-folder the "Next steps" give the command with `-fk`
 | --- | --- |
 | 0 | done, or nothing to do; also every dry run whose scan completed |
 | 1 | a tool is missing or unusable; the scan failed or was cut short; an encryption or its verification failed; or an unexpected error stopped the run, in which case the state of the tree is printed |
-| 2 | you answered no, or stdin was not a terminal and `--yes` was not given |
+| 2 | you answered no, or gave no answer: stdin was not a terminal, nothing was piped in and `--yes` was not given |
 | 130 | interrupted with Ctrl-C; what had already been changed is printed |
 
 ## After a run

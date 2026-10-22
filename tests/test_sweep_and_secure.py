@@ -535,6 +535,19 @@ class EndToEndTests(unittest.TestCase):
         self.assertTrue(os.path.islink(self.tree.path(".env")))
         self.assertTrue(encrypted("AWS_ACCESS_KEY_ID", self.tree.read("shared/real.env")))
 
+    def test_reserved_env_file_names_are_refused(self):
+        for name in (".sweep-and-secure-secrets.env", "config/.env.keys", ".env.vault"):
+            code, out, err = run_script(self.tree.root, ["--yes", "--env-file", name])
+            self.assertEqual(code, 1, name + "\n" + out + err)
+            self.assertIn("that name is reserved", err)
+        self.assertUnchanged()
+
+    def test_a_folder_merely_named_like_the_key_file_is_still_scanned(self):
+        self.tree.write("backup/.env.keys-project/src/a.py", ("t = '%s'\n" % GITHUB_TOKEN).encode("utf-8"))
+        code, out, err = run_script(self.tree.root, ["--dry-run"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("backup/.env.keys-project/src/a.py", out)
+
     def test_no_default_excludes_still_protects_the_private_key_file(self):
         self.tree.write(".env.keys", ("DOTENV_PRIVATE_KEY=%s\n" % GITHUB_TOKEN).encode("utf-8"))
         code, out, err = run_script(self.tree.root, ["--dry-run", "--no-default-excludes"])
@@ -917,8 +930,12 @@ class UnitTests(unittest.TestCase):
         always = [re.compile(p) for p in sas.ALWAYS_EXCLUDES]
         self.assertTrue(sas.is_excluded("/p/.env.keys", always))
         self.assertTrue(sas.is_excluded("/p/config/.env.keys.bak", always))
+        self.assertTrue(sas.is_excluded("/p/sub/.env.keys.production", always))
         self.assertTrue(sas.is_excluded("/p/.sweep-and-secure-x/.env", always))
         self.assertFalse(sas.is_excluded("/p/node_modules/x/.env", always))
+        # the key-file rule names files, not every descendant of a similarly named folder
+        self.assertFalse(sas.is_excluded("/backup/.env.keys-project/src/a.py", always))
+        self.assertFalse(sas.is_excluded("/p/.env.keysmith", always))
 
     def test_build_plan_ignores_findings_in_excluded_paths(self):
         folder = tempfile.mkdtemp(prefix="sweep-unit-")
@@ -934,6 +951,19 @@ class UnitTests(unittest.TestCase):
             self.assertEqual((plan.ignored, plan.items, plan.skipped), (1, [], []))
             plan = sas.build_plan([finding], folder, os.path.join(folder, ".env"), args, [], [])
             self.assertEqual(len(plan.items), 1)
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_inventory_never_reports_the_store_as_stale(self):
+        folder = tempfile.mkdtemp(prefix="sweep-unit-")
+        try:
+            odd = os.path.join(folder, ".sweep-and-secure-store.env")
+            other = os.path.join(folder, ".sweep-and-secure-leftover")
+            for path in (odd, other):
+                with io.open(path, "wb") as fh:
+                    fh.write(b"K=v\n")
+            _, _, stale = sas.inventory_env_files(folder, [], protect=(odd,))
+            self.assertEqual(stale, [other])
         finally:
             shutil.rmtree(folder, ignore_errors=True)
 

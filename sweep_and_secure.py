@@ -156,7 +156,7 @@ TOOLS = OrderedDict([
 # spells it (backslashes on Windows), so both separators are accepted.
 # Never scanned and never rewritten, whatever the options say:
 ALWAYS_EXCLUDES = [
-    r"(^|[/\\])\.env\.keys",          # dotenvx private keys
+    r"(^|[/\\])\.env\.keys(\.[^/\\]*)?$",   # dotenvx private keys: .env.keys, .env.keys.bak ... (files, not folders)
     r"(^|[/\\])\.env\.vault$",        # legacy dotenvx vault files
     r"(^|[/\\])\.sweep-and-secure-",   # our own staging files, left by an interrupted run
 ]
@@ -766,23 +766,25 @@ def style_dim_block(text):
 # What is already in the env files
 # --------------------------------------------------------------------------
 
-def inventory_env_files(root, exclude_res):
+def inventory_env_files(root, exclude_res, protect=()):
     """Return (encrypted, plaintext, stale) over all dotenv files: lists of
     (path, key, line) / (path, key, line, value), and the staging files or folders
-    an earlier interrupted run left behind."""
+    an earlier interrupted run left behind. Paths in protect (the store) are never
+    reported as stale, whatever they are called."""
+    protected = set(os.path.normpath(path) for path in protect)
     encrypted, plaintext, stale = [], [], []
     for dirpath, dirnames, filenames in os.walk(root):
         keep = []
         for name in dirnames:
             full = os.path.join(dirpath, name)
-            if name.startswith(TEMP_PREFIX) and not os.path.islink(full):
+            if name.startswith(TEMP_PREFIX) and not os.path.islink(full) and os.path.normpath(full) not in protected:
                 stale.append(full)
             elif not is_excluded(full, exclude_res, is_dir=True):
                 keep.append(name)
         dirnames[:] = sorted(keep)
         for name in sorted(filenames):
             path = os.path.join(dirpath, name)
-            if name.startswith(TEMP_PREFIX):
+            if name.startswith(TEMP_PREFIX) and os.path.normpath(path) not in protected:
                 stale.append(path)
                 continue
             if not is_env_file(name) or is_example_env_file(name):
@@ -1856,7 +1858,7 @@ def parse_args(argv):
             "                               plaintext replaced by a placeholder like ${KEY}"),
         epilog=(
             "exit codes: 0 done (or nothing to do), 1 missing tool / scan incomplete or failed / encryption failed,\n"
-            "            2 you said no (or no --yes while not interactive), 130 interrupted\n"
+            "            2 you said no or gave no answer (stdin not a terminal, nothing piped, no --yes), 130 interrupted\n"
             "\n"
             "TruffleHog: https://trufflesecurity.com/trufflehog     dotenvx: https://dotenvx.com"),
     )
@@ -2002,6 +2004,13 @@ def main(argv=None):
     store = os.path.normpath(store)
     if os.path.islink(store):
         store = os.path.realpath(store)
+    reserved = [re.compile(pattern) for pattern in ALWAYS_EXCLUDES]
+    if os.path.basename(store).startswith(TEMP_PREFIX) or is_excluded(store, reserved):
+        say(style.bad(u"[!!] --env-file %s: that name is reserved. dotenvx key files (.env.keys*), vault files"
+                      u" (.env.vault) and this script's staging files (.sweep-and-secure-*) are never scanned or"
+                      u" rewritten, so secrets stored there would be lost; use a name like .env or config/secrets.env."
+                      % store), sys.stderr)
+        return 1
 
     say(style.bold(u"sweep-and-secure %s" % __version__) + style.dim(u"  (TruffleHog + dotenvx)"))
     say(u"Folder: %s" % root)
@@ -2031,7 +2040,7 @@ def main(argv=None):
                       u" probably INCOMPLETE. What it did report is handled below; the exit code will be 1."
                       % code))
 
-    encrypted, plaintext, stale = inventory_env_files(root, exclude_res)
+    encrypted, plaintext, stale = inventory_env_files(root, exclude_res, protect=(store,))
     if stale:
         names = u", ".join(slash_path(os.path.relpath(path, root)) for path in stale)
         if args.dry_run:
