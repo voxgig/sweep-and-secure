@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""A stand-in for TruffleHog used by the test-suite (not a real scanner).
+
+It understands just enough of the real command line:
+
+    trufflehog --version
+    trufflehog filesystem ROOT --json [--no-update] [--no-verification] [--exclude-paths FILE]
+
+and prints TruffleHog-shaped JSON lines for a handful of secret patterns.
+Set FAKE_TRUFFLEHOG_FAIL=1 to make it exit with status 1.
+"""
+from __future__ import print_function
+
+import gzip
+import io
+import json
+import os
+import re
+import sys
+
+DETECTORS = [
+    ("Github", re.compile(r"\bghp_[A-Za-z0-9]{36}\b"),
+     {"rotation_guide": "https://howtorotate.com/docs/tutorials/github/"}),
+    ("Stripe", re.compile(r"\bsk_live_[A-Za-z0-9]{24,}\b"),
+     {"rotation_guide": "https://howtorotate.com/docs/tutorials/stripe/"}),
+    ("SlackWebhook", re.compile(r"https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]{24}"), {}),
+    ("PrivateKey", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"), {}),
+    # Like the real detector, report the URL without the database path.
+    ("Postgres", re.compile(r"postgres://[^\s\"'<>:@]+:[^\s\"'<>@]+@[^\s\"'<>/]+"), {}),
+]
+AWS_ID = re.compile(r"\bAKIA[0-9A-Z]{16}\b")
+AWS_SECRET = re.compile(r"(?<![A-Za-z0-9/+=])[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])")
+
+
+def emit(path, text, offset, detector, raw, raw_v2, extra):
+    obj = {
+        "SourceMetadata": {"Data": {"Filesystem": {"file": path, "line": text.count("\n", 0, offset) + 1}}},
+        "SourceID": 1, "SourceType": 15, "SourceName": "trufflehog - filesystem",
+        "DetectorType": 0, "DetectorName": detector, "DecoderName": "PLAIN",
+        "Verified": False, "Raw": raw, "RawV2": raw_v2, "Redacted": raw[:6] + "...",
+        "ExtraData": extra or None,
+    }
+    sys.stdout.write(json.dumps(obj) + "\n")
+
+
+def scan_file(path):
+    with io.open(path, "rb") as fh:
+        data = fh.read()
+    if data[:2] == b"\x1f\x8b":  # gzip archive: scan the content, report the archive
+        try:
+            data = gzip.GzipFile(fileobj=io.BytesIO(data)).read()
+        except (IOError, OSError, EOFError):
+            return
+    text = data.decode("utf-8", "replace")
+    for detector, pattern, extra in DETECTORS:
+        for match in pattern.finditer(text):
+            emit(path, text, match.start(), detector, match.group(0), "", extra)
+    ids = list(AWS_ID.finditer(text))
+    if ids:
+        secrets = [m.group(0) for m in AWS_SECRET.finditer(text) if not m.group(0).startswith("AKIA")]
+        for match in ids:
+            raw_v2 = match.group(0) + ":" + secrets[0] if secrets else ""
+            emit(path, text, match.start(), "AWS", match.group(0), raw_v2, {})
+
+
+def main(argv):
+    if "--version" in argv:
+        print("trufflehog 3.99.0")
+        return 0
+    if os.environ.get("FAKE_TRUFFLEHOG_FAIL"):
+        sys.stderr.write("fake trufflehog: simulated failure\n")
+        return 1
+    if len(argv) < 2 or argv[0] != "filesystem":
+        sys.stderr.write("fake trufflehog: usage: trufflehog filesystem ROOT --json\n")
+        return 2
+    root = argv[1]
+    excludes = []
+    if "--exclude-paths" in argv:
+        with io.open(argv[argv.index("--exclude-paths") + 1], encoding="utf-8") as fh:
+            excludes = [re.compile(line.strip()) for line in fh if line.strip()]
+
+    def excluded(path):
+        return any(rx.search(path) for rx in excludes)
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if not excluded(os.path.join(dirpath, d) + "/"))
+        for name in sorted(filenames):
+            path = os.path.join(dirpath, name)
+            if not excluded(path) and not os.path.islink(path):
+                scan_file(path)
+    sys.stderr.write('{"level":"info-0","msg":"finished scanning (fake)"}\n')
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
