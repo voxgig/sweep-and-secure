@@ -12,7 +12,9 @@ also run the tier that exercises the real tools (RealToolsTests).
 """
 from __future__ import absolute_import, print_function
 
+import bz2
 import gzip
+import lzma
 import hashlib
 import io
 import os
@@ -684,19 +686,30 @@ class EndToEndTests(unittest.TestCase):
         self.assertNoLeftovers()
 
     def test_quarantine_moves_archives_holding_secrets_out_of_the_tree(self):
+        # a tar.gz whose member name is not UTF-8: still listed, moved and recorded in the manifest
+        with tarfile.open(self.tree.path("build/old.tar.gz"), "w:gz", encoding="latin-1", format=tarfile.USTAR_FORMAT) as tf:
+            data = ("key %s\n" % STRIPE_KEY).encode("utf-8")
+            info = tarfile.TarInfo(u"caf\u00e9.txt")
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+        self.before = self.tree.snapshot()
         _, listing, _ = run_script(self.tree.root, ["--dry-run", "--quarantine"])
+        self.assertIn(u"build/old.tar.gz (tar.gz)", listing)
+        self.assertIn(u"caf\ufffd.txt", listing)
         self.assertIn("move to .secrets-quarantine/build/keys.zip", listing)
         self.assertIn("move to .secrets-quarantine/build/blob.txt.gz", listing)
         self.assertTrue(os.path.isfile(self.tree.path("build/keys.zip")))     # a dry run moves nothing
         code, out, err = run_script(self.tree.root, ["--yes", "--quarantine"])
         self.assertEqual(code, 0, out + err)
-        for rel in ("build/keys.zip", "build/blob.txt.gz"):
+        for rel in ("build/keys.zip", "build/blob.txt.gz", "build/old.tar.gz"):
             self.assertFalse(os.path.exists(self.tree.path(rel)), rel)
             self.assertEqual(self.tree.read_bytes(".secrets-quarantine/" + rel), self.before[rel.replace("/", os.sep)])
         manifest = self.tree.read(".secrets-quarantine/MANIFEST.txt")
         self.assertIn("build/keys.zip  <- build/keys.zip  (Stripe)  inside: config/prod.env", manifest)
         self.assertIn("build/blob.txt.gz  <- build/blob.txt.gz  (Github)  inside: blob.txt", manifest)
-        self.assertIn("2 archive(s) moved to .secrets-quarantine", out)
+        self.assertIn(u"build/old.tar.gz  <- build/old.tar.gz  (Stripe)  inside: caf\ufffd.txt", manifest)
+        self.assertTrue(os.path.isfile(self.tree.path(".secrets-quarantine/build/old.tar.gz")))
+        self.assertIn("3 archive(s) moved to .secrets-quarantine", out)
         self.assertIn("/.secrets-quarantine/", self.tree.read(".gitignore"))
         self.assertIn("moved to .secrets-quarantine (see its MANIFEST.txt", out)
         # the quarantine folder is never scanned, with or without the flag
@@ -1175,6 +1188,53 @@ class UnitTests(unittest.TestCase):
         finally:
             shutil.rmtree(folder, ignore_errors=True)
 
+    def test_inspect_archive_names_lone_compressed_files_after_the_archive(self):
+        folder = tempfile.mkdtemp(prefix="sweep-inside-")
+        try:
+            body = ("insert %s\n" % STRIPE_KEY).encode("utf-8")
+            nameless = os.path.join(folder, "dump.sql.gz")       # gzip -n: no file name in the header
+            with io.open(nameless, "wb") as fh:
+                with gzip.GzipFile(filename="", fileobj=fh, mode="wb") as gz:
+                    gz.write(body)
+            with bz2.BZ2File(os.path.join(folder, "notes.bz2"), "wb") as fh:
+                fh.write(body)
+            with lzma.LZMAFile(os.path.join(folder, "report.txt.xz"), "wb") as fh:
+                fh.write(body)
+            for name, kind, member in (("dump.sql.gz", "gzip", "dump.sql"), ("notes.bz2", "bzip2", "notes"),
+                                       ("report.txt.xz", "xz", "report.txt")):
+                archive = sas.Archive(os.path.join(folder, name), kind)
+                archive.findings = [self.finding(archive.path, "Stripe", STRIPE_KEY)]
+                sas.inspect_archive(archive)
+                self.assertEqual([m for m, _ in archive.inside], [member], name)
+                self.assertEqual(archive.note, "", name)
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_inspect_archive_copes_with_undecodable_member_names(self):
+        folder = tempfile.mkdtemp(prefix="sweep-inside-")
+        try:
+            path = os.path.join(folder, "old.tar")
+            with tarfile.open(path, "w", encoding="latin-1", format=tarfile.USTAR_FORMAT) as tf:   # a name that is not UTF-8
+                data = ("key %s\n" % STRIPE_KEY).encode("utf-8")
+                info = tarfile.TarInfo(u"caf\u00e9.txt")
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+            archive = sas.Archive(path, "tar")
+            archive.findings = [self.finding(path, "Stripe", STRIPE_KEY)]
+            sas.inspect_archive(archive)
+            self.assertEqual([m for m, _ in archive.inside], [u"caf\ufffd.txt"])
+            u"".join(m for m, _ in archive.inside).encode("utf-8")   # printable and encodable
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_secrets_text_counts_distinct_secrets_that_mask_alike(self):
+        twin = STRIPE_KEY[:10] + "ABCD" + STRIPE_KEY[14:]   # same first four and last two characters
+        self.assertNotEqual(twin, STRIPE_KEY)
+        findings = [self.finding("a.zip", "Stripe", STRIPE_KEY), self.finding("a.zip", "Stripe", twin),
+                    self.finding("a.zip", "Stripe", STRIPE_KEY),   # the same secret again: counted once
+                    self.finding("a.zip", "AWS", AWS_ID, "%s:%s" % (AWS_ID, AWS_SECRET))]
+        self.assertEqual(sas.secrets_text(findings), "Stripe %s (x2), AWS %s" % (sas.mask(STRIPE_KEY), sas.mask(AWS_ID)))
+
     def test_inspect_archive_searches_big_members_in_chunks_within_a_budget(self):
         folder = tempfile.mkdtemp(prefix="sweep-inside-")
         saved = sas.INSPECT_FULL_READ_BYTES, sas.INSPECT_CHUNK, sas.INSPECT_BUDGET_BYTES
@@ -1195,6 +1255,20 @@ class UnitTests(unittest.TestCase):
             archive.findings = [self.finding(path, "Stripe", STRIPE_KEY)]
             sas.inspect_archive(archive)
             self.assertIn("stopped looking after 0 MB of content; the rest was not checked", archive.note)
+            # a member of unknown size (a gzip stream inside the zip) that turns out too big to hold:
+            # the part already read is kept, so a secret straddling that boundary is still found
+            sas.INSPECT_BUDGET_BYTES = saved[2]
+            inner = io.BytesIO()
+            with gzip.GzipFile(filename="big.log", fileobj=inner, mode="wb") as gz:
+                gz.write(b"x" * 990 + STRIPE_KEY.encode("utf-8") + b"\n" + b"y" * 4000)
+            path = os.path.join(folder, "wrapped.zip")
+            with zipfile.ZipFile(path, "w") as z:
+                z.writestr("logs/big.log.gz", inner.getvalue())
+            archive = sas.Archive(path, "zip")
+            archive.findings = [self.finding(path, "Stripe", STRIPE_KEY)]
+            sas.inspect_archive(archive)
+            self.assertEqual([m for m, _ in archive.inside], ["logs/big.log.gz!big.log"])
+            self.assertEqual(archive.note, "")
         finally:
             sas.INSPECT_FULL_READ_BYTES, sas.INSPECT_CHUNK, sas.INSPECT_BUDGET_BYTES = saved
             shutil.rmtree(folder, ignore_errors=True)

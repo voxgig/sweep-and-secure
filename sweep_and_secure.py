@@ -1336,23 +1336,32 @@ def archive_kind_of_bytes(head, name):
     return None
 
 
-def walk_archive(opener, kind, prefix, depth, notes):
+def safe_text(text):
+    """text with any undecodable bytes (tarfile keeps them as surrogates) replaced, so that it
+    can be printed and encoded without surprises."""
+    try:
+        return text.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+    except (UnicodeError, LookupError):  # pragma: no cover - Python 2 has no surrogateescape
+        return text.encode("ascii", "replace").decode("ascii")
+
+
+def walk_archive(opener, kind, name, prefix, depth, notes):
     """Yield (path inside, size or None, opener) for every regular file in the archive that
     opener() streams, descending into archives found inside it up to INSPECT_MAX_DEPTH deep.
-    Each member opener() returns a fresh stream of that member's content. Problems are
-    appended to notes; nothing is written anywhere."""
-    label = prefix.rstrip(u"!") or u"the archive"
+    name is the archive's own name (used in notes, and for a lone compressed file that does
+    not record the name of its content); prefix is prepended to the paths inside. Each member
+    opener() returns a fresh stream of that member's content. Nothing is written anywhere."""
     try:
         if kind in ZIP_KINDS:
             archive = zipfile.ZipFile(opener())
             for info in archive.infolist():
-                name = to_text(info.filename)
-                if name.endswith(u"/"):
+                member = safe_text(to_text(info.filename))
+                if member.endswith(u"/"):
                     continue
                 if info.flag_bits & 0x1:
-                    notes.append(u"%s%s is password-protected" % (prefix, name))
+                    notes.append(u"%s%s is password-protected" % (prefix, member))
                     continue
-                for entry in member_entries(prefix + name, info.file_size,
+                for entry in member_entries(prefix + member, info.file_size,
                                             lambda info=info: archive.open(info), depth, notes):
                     yield entry
         elif kind in TAR_OR_COMPRESSED_KINDS:
@@ -1364,32 +1373,34 @@ def walk_archive(opener, kind, prefix, depth, notes):
                 for member in tar:
                     if not member.isfile():
                         continue
-                    for entry in member_entries(prefix + to_text(member.name), member.size,
+                    for entry in member_entries(prefix + safe_text(to_text(member.name)), member.size,
                                                 lambda member=member: tar.extractfile(member), depth, notes):
                         yield entry
             else:
-                # one compressed file: gzip, bzip2 or xz
+                # one compressed file (gzip, bzip2 or xz): named after the gzip header when it
+                # has one, else after the archive itself without the compression suffix
                 head = opener().read(512)
-                stem = os.path.basename(label)
-                for ext in (u".gz", u".bz2", u".xz", u".bzip2"):
+                stem = os.path.basename(name)
+                for ext in (u".gz", u".bz2", u".xz", u".bzip2", u".gzip"):
                     if stem.lower().endswith(ext):
                         stem = stem[:-len(ext)]
+                        break
                 if head.startswith(b"\x1f\x8b"):
-                    name, decompress = gzip_member_name(head, stem), lambda: gzip.GzipFile(fileobj=opener())
+                    member, decompress = gzip_member_name(head, stem), lambda: gzip.GzipFile(fileobj=opener())
                 elif head.startswith(b"BZh"):
-                    name, decompress = stem, lambda: bz2.BZ2File(opener())
+                    member, decompress = stem, lambda: bz2.BZ2File(opener())
                 elif head.startswith(b"\xfd7zXZ\x00") and lzma is not None:
-                    name, decompress = stem, lambda: lzma.LZMAFile(opener())
+                    member, decompress = stem, lambda: lzma.LZMAFile(opener())
                 else:
-                    notes.append(u"cannot read %s from here" % label)
+                    notes.append(u"cannot read %s from here" % name)
                     return
-                for entry in member_entries(prefix + name, None, decompress, depth, notes):
+                for entry in member_entries(prefix + safe_text(member), None, decompress, depth, notes):
                     yield entry
         else:
             notes.append(u"cannot look inside a %s archive from here" % kind)
     except (zipfile.BadZipfile, tarfile.TarError, IOError, OSError, EOFError, zlib.error,
             RuntimeError, ValueError, NotImplementedError) as exc:
-        notes.append(u"could not read %s (%s)" % (label, to_text(str(exc)) or exc.__class__.__name__))
+        notes.append(u"could not read %s (%s)" % (name, to_text(str(exc)) or exc.__class__.__name__))
 
 
 def member_entries(display, size, opener, depth, notes):
@@ -1402,13 +1413,14 @@ def member_entries(display, size, opener, depth, notes):
             return
         inner = archive_kind_of_bytes(head, display)
         if inner:
-            for entry in walk_archive(opener, inner, display + u"!", depth + 1, notes):
+            for entry in walk_archive(opener, inner, display, display + u"!", depth + 1, notes):
                 yield entry
             return
     yield (display, size, opener)
 
 
 def read_up_to(stream, limit):
+    """Up to limit + 1 bytes from stream: one byte more than limit tells the caller there is more."""
     chunks, total = [], 0
     while total <= limit:
         chunk = stream.read(min(INSPECT_CHUNK, limit + 1 - total))
@@ -1419,12 +1431,32 @@ def read_up_to(stream, limit):
     return b"".join(chunks)
 
 
+def search_stream(stream, needles, overlap, budget, head=b""):
+    """Which needles (plain bytes) occur in head + the rest of stream, read chunk by chunk
+    while budget lasts: (hits, budget left, exhausted). head is content already read and
+    charged; a needle straddling the head and the first chunk is still found."""
+    hits = set(needle for needle in needles if needle in head)
+    tail = head[-overlap:] if overlap else b""
+    while budget > 0:
+        chunk = stream.read(INSPECT_CHUNK)
+        if not chunk:
+            return hits, budget, False
+        budget -= len(chunk)
+        window = tail + chunk
+        for needle in needles:
+            if needle not in hits and needle in window:
+                hits.add(needle)
+        tail = window[-overlap:] if overlap else b""
+    return hits, budget, True
+
+
 def inspect_archive(archive):
     """Fill in archive.inside, .unplaced and .note: which files inside hold the secrets
     TruffleHog reported. zip, tar (any compression), gzip, bzip2 and xz are opened with the
     standard library, archives nested in archives too; at most INSPECT_BUDGET_BYTES of
-    content is read. Members up to INSPECT_FULL_READ_BYTES are searched like files (same
-    decoders), bigger ones chunk by chunk for the plain text. Nothing is written."""
+    content is read, every byte decompressed counted once. Members up to
+    INSPECT_FULL_READ_BYTES are searched like files (same decoders), bigger ones chunk by
+    chunk for the plain text. Nothing is written."""
     notes = []
     if archive.kind in ("gzip", "bzip2", "xz"):
         # the magic bytes say "compressed"; is it a compressed tar? (shown as tar.gz etc.)
@@ -1442,40 +1474,25 @@ def inspect_archive(archive):
     held = OrderedDict()
     exhausted = False
     opener = lambda: io.open(archive.path, "rb")
-    for display, size, member_opener in walk_archive(opener, archive.kind, u"", 0, notes):
+    name = os.path.basename(archive.path)
+    for display, size, member_opener in walk_archive(opener, archive.kind, name, u"", 0, notes):
         if budget <= 0:
             exhausted = True
             break
         found = []
         try:
             stream = member_opener()
-            if size is not None and size > INSPECT_FULL_READ_BYTES:
-                data = None
-            else:
-                data = read_up_to(stream, INSPECT_FULL_READ_BYTES)
-                if len(data) > INSPECT_FULL_READ_BYTES:
-                    stream = member_opener()   # too big after all: search it in chunks instead
-                    data = None
-            if data is not None:
-                budget -= len(data)
+            data = b"" if (size is not None and size > INSPECT_FULL_READ_BYTES) else read_up_to(stream, INSPECT_FULL_READ_BYTES)
+            budget -= len(data)
+            if data and len(data) <= INSPECT_FULL_READ_BYTES:
                 for finding, candidates in wanted:
                     if any(locate(data, c, finding.decoder) for c in candidates):
                         found.append(finding)
             else:
-                hits = set()
-                tail = b""
-                while budget > 0:
-                    chunk = stream.read(INSPECT_CHUNK)
-                    if not chunk:
-                        break
-                    budget -= len(chunk)
-                    window = tail + chunk
-                    for needle in needles:
-                        if needle not in hits and needle in window:
-                            hits.add(needle)
-                    tail = window[-overlap:] if overlap else b""
-                else:
-                    exhausted = True
+                # too big to hold: the part already read is searched for the plain text and the
+                # rest follows from the same stream, so nothing is decompressed or charged twice
+                hits, budget, ran_out = search_stream(stream, needles, overlap, budget, data)
+                exhausted = exhausted or ran_out
                 for finding, candidates in wanted:
                     if any(to_bytes(c) in hits for c in candidates):
                         found.append(finding)
@@ -1741,7 +1758,9 @@ def quarantine_target(item, plan):
 
 def move_to_quarantine(item, plan, journal=None):
     """Move one archive out of the tree. Rename when possible; copy then delete across
-    file systems. Appends a line to the quarantine's MANIFEST.txt. Returns the new path."""
+    file systems. The move is journaled first, then a line goes into the quarantine's
+    MANIFEST.txt. Returns (new path, warning): the warning is set when the file moved but
+    the manifest could not be written."""
     target = quarantine_target(item, plan)
     folder = os.path.dirname(target)
     if not os.path.isdir(folder):
@@ -1768,29 +1787,36 @@ def move_to_quarantine(item, plan, journal=None):
                 pass
             raise
         os.remove(item.path)
+    if journal is not None:
+        journal.add("quarantine", item.path, candidate)   # before anything else can fail: the file has moved
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     archive = plan.archives.get(item.path)
     inside = u""
     if archive is not None and archive.inside:
-        inside = u"  inside: " + u", ".join(member for member, _ in archive.inside)
+        inside = u"  inside: " + u", ".join(safe_text(member) for member, _ in archive.inside)
     line = u"%s  %s  <- %s  (%s)%s\n" % (stamp, slash_path(os.path.relpath(candidate, plan.quarantine)),
                                           plan.rel(item.path), item.detector, inside)
     manifest = os.path.join(plan.quarantine, QUARANTINE_MANIFEST)
-    with io.open(manifest, "ab") as fh:
-        fh.write(line.encode("utf-8"))
-    if journal is not None:
-        journal.add("quarantine", item.path, candidate)
-    return candidate
+    try:
+        with io.open(manifest, "ab") as fh:
+            fh.write(line.encode("utf-8", "replace"))
+    except (IOError, OSError, UnicodeError) as exc:
+        return candidate, u"moved, but %s could not be updated: %s" % (QUARANTINE_MANIFEST, to_text(str(exc)))
+    return candidate, u""
 
 
 def secrets_text(findings):
-    """'Stripe sk_l...23, AWS AKIA...M2' for a list of findings, each secret once."""
-    parts = []
+    """'Stripe sk_l...23, AWS AKIA...M2' for a list of findings: each distinct secret counted
+    once, and '(x2)' when two different secrets happen to mask to the same text."""
+    shown = OrderedDict()
+    seen = set()
     for finding in findings:
+        if (finding.detector, finding.raw) in seen:
+            continue
+        seen.add((finding.detector, finding.raw))
         text = u"%s%s %s" % (finding.detector, u" *" if finding.verified else u"", mask(finding.raw))
-        if text not in parts:
-            parts.append(text)
-    return u", ".join(parts)
+        shown[text] = shown.get(text, 0) + 1
+    return u", ".join(text if count == 1 else u"%s (x%d)" % (text, count) for text, count in shown.items())
 
 
 def print_archives(plan, args, style):
@@ -2315,13 +2341,15 @@ def execute(plan, chosen, dotenvx, args, style, decryptor=None, journal=None):
         if item.kind != "quarantine":
             continue
         try:
-            moved = move_to_quarantine(item, plan, journal)
+            moved, warning = move_to_quarantine(item, plan, journal)
         except (IOError, OSError) as exc:
             item.status, item.note = "failed", to_text(str(exc))
             say(u"  %s %s: could not move to quarantine: %s" % (style.bad("[!!]"), plan.rel(item.path), item.note))
             continue
         item.status = "done"
         say(u"  %s %s: moved to %s" % (style.ok("[ok]"), plan.rel(item.path), plan.rel(moved)))
+        if warning:
+            say(u"  %s %s: %s" % (style.warn("[--]"), plan.rel(moved), warning))
     return [item for item in chosen if item.status == "failed"]
 
 
