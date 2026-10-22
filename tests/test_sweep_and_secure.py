@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import tarfile
 import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -324,19 +325,29 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("Already encrypted with dotenvx", out)
         self.assertIn("DB_PASSWORD", out)
         self.assertIn("config/.env.production", out)
-        # an interactive run offers to quarantine the archives, and a dry run previews that
+        # archives get their own section: which files inside hold which secrets, and the action.
+        # An interactive run offers to quarantine them, and a dry run previews that.
+        self.assertIn("Plaintext secrets found: 11 in 8 file(s)", out)   # archives are not counted here
+        self.assertIn("Archives holding secrets: 2", out)
+        self.assertIn("File inside", out)
+        self.assertIn("build/keys.zip (zip)", out)
+        self.assertIn("config/prod.env", out)        # the member that holds the Stripe key
+        self.assertIn("Stripe sk_l", out)
+        self.assertIn("build/blob.txt.gz (gzip)", out)
+        self.assertIn("blob.txt ", out)              # gzip: the original file name from the header
+        self.assertIn("Github ghp_", out)
         self.assertIn("move to .secrets-quarantine/build/blob.txt.gz", out)
         self.assertIn("move to .secrets-quarantine/build/keys.zip", out)
-        self.assertIn("Archives holding secrets are offered for moving to .secrets-quarantine", out)
-        self.assertIn("Plaintext secrets found: 13 in 10 file(s)", out)
+        self.assertIn("Offered because this run asks first", out)
         # a --yes run leaves them alone unless --quarantine is given, and the preview says so
         code, out, err = run_script(self.tree.root, ["--dry-run", "--yes"])
         self.assertEqual(code, 0, out + err)
         self.assertIn("Plaintext secrets found: 11 in 8 file(s)", out)
-        self.assertIn("gzip archive with a secret inside", out)
-        self.assertIn("zip archive with a secret inside", out)
-        self.assertIn("pass --quarantine", out)
-        self.assertNotIn("offered for moving", out)
+        self.assertIn("Archives holding secrets: 2", out)
+        self.assertIn("config/prod.env", out)
+        self.assertIn("stays in place (pass --quarantine to move it)", out)
+        self.assertNotIn("move to .secrets-quarantine", out)
+        self.assertNotIn("Offered because", out)
         self.assertTrue(re.search(r"Scanned \d+ file\(s\) in \d+:\d\d; TruffleHog reported \d+ finding\(s\)", out), out)
         self.assertNotIn("node_modules/pkg/.env", out)   # excluded by default
         self.assertIn("Other plaintext keys", out)       # PORT, APP_NAME, LOG_LEVEL
@@ -683,8 +694,8 @@ class EndToEndTests(unittest.TestCase):
             self.assertFalse(os.path.exists(self.tree.path(rel)), rel)
             self.assertEqual(self.tree.read_bytes(".secrets-quarantine/" + rel), self.before[rel.replace("/", os.sep)])
         manifest = self.tree.read(".secrets-quarantine/MANIFEST.txt")
-        self.assertIn("build/keys.zip  <- build/keys.zip  (Stripe)", manifest)
-        self.assertIn("build/blob.txt.gz  <- build/blob.txt.gz  (Github)", manifest)
+        self.assertIn("build/keys.zip  <- build/keys.zip  (Stripe)  inside: config/prod.env", manifest)
+        self.assertIn("build/blob.txt.gz  <- build/blob.txt.gz  (Github)  inside: blob.txt", manifest)
         self.assertIn("2 archive(s) moved to .secrets-quarantine", out)
         self.assertIn("/.secrets-quarantine/", self.tree.read(".gitignore"))
         self.assertIn("moved to .secrets-quarantine (see its MANIFEST.txt", out)
@@ -1107,6 +1118,87 @@ class UnitTests(unittest.TestCase):
         finally:
             shutil.rmtree(folder, ignore_errors=True)
 
+    def finding(self, path, detector, raw, raw_v2="", decoder="PLAIN"):
+        return sas.Finding(path, 0, detector, raw, raw_v2, False, decoder, {})
+
+    def test_inspect_archive_names_the_files_inside_that_hold_the_secrets(self):
+        folder = tempfile.mkdtemp(prefix="sweep-inside-")
+        try:
+            inner = io.BytesIO()
+            with zipfile.ZipFile(inner, "w") as z:
+                z.writestr("deep/creds.txt", "aws %s %s\n" % (AWS_ID, AWS_SECRET))
+            tgz = io.BytesIO()
+            with tarfile.open(fileobj=tgz, mode="w:gz") as tf:
+                data = ("hook: %s\n" % SLACK).encode("utf-8")
+                info = tarfile.TarInfo("docs/hooks.yml")
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+            outer = os.path.join(folder, "bundle.zip")
+            with zipfile.ZipFile(outer, "w") as z:
+                z.writestr("conf/prod.env", "STRIPE_SECRET_KEY=%s\n" % STRIPE_KEY)
+                z.writestr("readme.txt", "nothing here\n")
+                z.writestr("nested/keys.zip", inner.getvalue())
+                z.writestr("nested/docs.tar.gz", tgz.getvalue())
+                z.writestr("misc/notes.txt", "the stripe key again: %s\n" % STRIPE_KEY)
+            archive = sas.Archive(outer, "zip")
+            archive.findings = [self.finding(outer, "Stripe", STRIPE_KEY),
+                                self.finding(outer, "AWS", AWS_ID, "%s:%s" % (AWS_ID, AWS_SECRET)),
+                                self.finding(outer, "SlackWebhook", SLACK),
+                                self.finding(outer, "Github", GITHUB_TOKEN)]   # not in there at all
+            sas.inspect_archive(archive)
+            inside = [(member, [f.detector for f in found]) for member, found in archive.inside]
+            self.assertEqual(inside, [("conf/prod.env", ["Stripe"]),
+                                      ("nested/keys.zip!deep/creds.txt", ["AWS"]),
+                                      ("nested/docs.tar.gz!docs/hooks.yml", ["SlackWebhook"]),
+                                      ("misc/notes.txt", ["Stripe"])])
+            self.assertEqual([f.detector for f in archive.unplaced], ["Github"])
+            self.assertIn("1 secret(s) not found verbatim in any file inside (TruffleHog decoder: PLAIN)", archive.note)
+            # a single gzip file: the member is named after the gzip header, falling back to the file name
+            gz = os.path.join(folder, "dump.sql.gz")
+            with gzip.open(gz, "wb") as fh:
+                fh.write(("insert %s\n" % STRIPE_KEY).encode("utf-8"))
+            archive = sas.Archive(gz, "gzip")
+            archive.findings = [self.finding(gz, "Stripe", STRIPE_KEY)]
+            sas.inspect_archive(archive)
+            self.assertEqual([m for m, _ in archive.inside], ["dump.sql"])
+            self.assertEqual(archive.note, "")
+            # formats the standard library cannot open are said so, and the secrets still listed
+            seven = os.path.join(folder, "old.7z")
+            with io.open(seven, "wb") as fh:
+                fh.write(b"7z\xbc\xaf\x27\x1c" + b"\x00" * 40)
+            archive = sas.Archive(seven, "7z")
+            archive.findings = [self.finding(seven, "Stripe", STRIPE_KEY)]
+            sas.inspect_archive(archive)
+            self.assertEqual(archive.inside, [])
+            self.assertEqual(len(archive.unplaced), 1)
+            self.assertIn("cannot look inside a 7z archive from here", archive.note)
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_inspect_archive_searches_big_members_in_chunks_within_a_budget(self):
+        folder = tempfile.mkdtemp(prefix="sweep-inside-")
+        saved = sas.INSPECT_FULL_READ_BYTES, sas.INSPECT_CHUNK, sas.INSPECT_BUDGET_BYTES
+        try:
+            path = os.path.join(folder, "big.zip")
+            padding = b"x" * 1020
+            with zipfile.ZipFile(path, "w") as z:
+                z.writestr("logs/huge.log", padding + STRIPE_KEY.encode("utf-8") + b"\n" + b"y" * 3000)
+                z.writestr("logs/other.log", b"z" * 5000)
+            archive = sas.Archive(path, "zip")
+            archive.findings = [self.finding(path, "Stripe", STRIPE_KEY)]
+            sas.INSPECT_FULL_READ_BYTES, sas.INSPECT_CHUNK = 1000, 1024   # the key straddles a chunk boundary
+            sas.inspect_archive(archive)
+            self.assertEqual([m for m, _ in archive.inside], ["logs/huge.log"])
+            self.assertEqual(archive.note, "")
+            sas.INSPECT_BUDGET_BYTES = 2000   # not enough to read everything: say so, keep what was seen
+            archive = sas.Archive(path, "zip")
+            archive.findings = [self.finding(path, "Stripe", STRIPE_KEY)]
+            sas.inspect_archive(archive)
+            self.assertIn("stopped looking after 0 MB of content; the rest was not checked", archive.note)
+        finally:
+            sas.INSPECT_FULL_READ_BYTES, sas.INSPECT_CHUNK, sas.INSPECT_BUDGET_BYTES = saved
+            shutil.rmtree(folder, ignore_errors=True)
+
     def test_scan_progress_counts_and_draws(self):
         out = StringIO()
         progress = sas.ScanProgress(stream=out, is_tty=False, heartbeat=0)
@@ -1234,6 +1326,26 @@ class RealToolsTests(unittest.TestCase):
         self.assertTrue(os.path.isfile(self.tree.path(".env.keys")))
         self.assertIn(".env.keys*", self.tree.read(".gitignore"))
         self.assertEqual(self.tree.leftovers(), [])
+
+    def test_dry_run_shows_what_is_inside_the_archives(self):
+        # a tar.gz member too: the real TruffleHog looks inside it, and the listing names the file
+        self.tree.write("build/site.tar.gz", b"")
+        with tarfile.open(self.tree.path("build/site.tar.gz"), "w:gz") as tf:
+            data = ("hook: %s\n" % SLACK).encode("utf-8")
+            info = tarfile.TarInfo("etc/hooks.yml")
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+        code, out, err = run_script(self.tree.root, ["--dry-run"], path=self.path)
+        self.assertEqual(code, 0, out + err)
+        # the toy GitHub token in blob.txt.gz is not something the real TruffleHog flags
+        self.assertTrue(re.search(r"Archives holding secrets: [23]", out), out)
+        self.assertIn("build/site.tar.gz (tar.gz)", out)
+        self.assertIn("etc/hooks.yml", out)
+        self.assertIn("SlackWebhook http", out)
+        self.assertIn("build/keys.zip (zip)", out)
+        self.assertIn("config/prod.env", out)
+        self.assertIn("Stripe sk_l", out)
+        self.assertIn("move to .secrets-quarantine/build/keys.zip", out)
 
     def test_check_setup_passes_with_the_real_tools(self):
         code, out, err = run_script(self.tree.root, ["--check-setup"], path=self.path)
