@@ -1,10 +1,19 @@
 name: release
 
-# Pushing a tag vX.Y.Z publishes a GitHub release with the script, install.sh, the
-# sdist and wheel, and SHA256SUMS - the assets that install.sh and pipx install from.
+# Publishes a GitHub release carrying the script, install.sh, the sdist and wheel,
+# and SHA256SUMS - the assets that install.sh and pipx install from. Two ways in:
+#   - push a tag vX.Y.Z (the tag must match __version__ in sweep_and_secure.py);
+#   - run this workflow from the Actions tab with the version: the tag is created
+#     on the chosen branch's head and the release published, in one go.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, e.g. 1.1.0; must equal __version__ in sweep_and_secure.py. The tag vX.Y.Z is created on this branch's head."
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -12,19 +21,38 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    env:
+      REQUESTED_VERSION: ${{ inputs.version }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.13"
-      - name: Check that the tag matches __version__
+      - name: Work out the tag and check it matches __version__
+        id: tag
         run: |
-          tag="${GITHUB_REF_NAME#v}"
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            tag="v${REQUESTED_VERSION#v}"
+            target="$GITHUB_SHA"          # the tag does not exist yet: create it on this commit
+          else
+            tag="$GITHUB_REF_NAME"
+            target=""                     # the pushed tag already names the commit
+          fi
+          case "$tag" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "'$tag' is not a vX.Y.Z version" >&2; exit 1 ;;
+          esac
           version="$(python -c 'import sweep_and_secure; print(sweep_and_secure.__version__)')"
-          if [ "$tag" != "$version" ]; then
-            echo "tag v$tag does not match __version__ = $version in sweep_and_secure.py" >&2
+          if [ "${tag#v}" != "$version" ]; then
+            echo "$tag does not match __version__ = $version in sweep_and_secure.py" >&2
             exit 1
           fi
+          if [ -n "$target" ] && git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "tag $tag already exists; push a new version or delete the tag first" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "target=$target" >> "$GITHUB_OUTPUT"
       - name: Tests
         run: python -m unittest discover -s tests
       - name: Build sdist and wheel
@@ -40,7 +68,12 @@ jobs:
         run: |
           sh install.sh -u "file://$PWD/release" -b "$RUNNER_TEMP/bin"
           "$RUNNER_TEMP/bin/sweep-and-secure" --version
-      - name: Create the GitHub release
+      - name: Create the GitHub release (and the tag, when run by hand)
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes release/*
+          TAG: ${{ steps.tag.outputs.tag }}
+          TARGET: ${{ steps.tag.outputs.target }}
+        run: |
+          set -- "$TAG" --title "$TAG" --generate-notes
+          [ -n "$TARGET" ] && set -- "$@" --target "$TARGET"
+          gh release create "$@" release/*

@@ -247,9 +247,10 @@ Linux, macOS and Windows with Python 3.8 to 3.13, the real-tools tier on Linux
 with the current TruffleHog and dotenvx, and a packaging job that builds the
 wheel, runs the console script and exercises `install.sh`.
 
-To release: set `__version__` in `sweep_and_secure.py`, then push a matching tag
-(`git tag v1.1.0 && git push origin v1.1.0`). The release workflow
-(`.github/workflows/release.yml`) checks that the tag matches the version, runs
-the tests, builds the sdist and wheel, and publishes a GitHub release carrying
-the script, `install.sh`, both packages and `SHA256SUMS`, which is what the curl
-installer and `pipx install ...@vX.Y.Z` fetch.
+To release: set `__version__` in `sweep_and_secure.py`, merge, then either push
+a matching tag (`git tag v1.1.0 && git push origin v1.1.0`) or run the release
+workflow from the Actions tab with the version, which creates the tag for you.
+The workflow (`.github/workflows/release.yml`) checks that the tag matches the
+version, runs the tests, builds the sdist and wheel, and publishes a GitHub
+release carrying the script, `install.sh`, both packages and `SHA256SUMS`, which
+is what the curl installer and `pipx install ...@vX.Y.Z` fetch.
