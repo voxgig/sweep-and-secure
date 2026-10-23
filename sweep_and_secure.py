@@ -59,7 +59,7 @@ try:
 except ImportError:  # pragma: no cover - Python 2 without the backport
     lzma = None
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 # --------------------------------------------------------------------------
 # Python 2 / 3 compatibility
@@ -275,6 +275,26 @@ INTEGRITY_HASH_RE = re.compile(br"(?:\bsha1-[A-Za-z0-9+/]{27}=?|\bsha256-[A-Za-z
                                br"|\bh1:[A-Za-z0-9+/]{43}=?"
                                br"|\bsha1:[0-9a-fA-F]{40}|\bsha256:[0-9a-fA-F]{64}"
                                br"|\bsha384:[0-9a-fA-F]{96}|\bsha512:[0-9a-fA-F]{128})(?![A-Za-z0-9+/=])")
+# The other long random strings a generated lock file is made of: bare checksums and commit ids, hex of
+# a digest's length (a commit id, the sha1 URL fragment in yarn.lock, Cargo.lock's checksum, yarn berry's
+# 10c0/...) or base64 of one (packages.lock.json's contentHash). TruffleHog's keyword detectors take
+# them for tokens when a package is called cloudflare, sentry, datadog ... One is set aside only where
+# it is seen to be public: a URL's fragment or path (LOCK_URL_CONTEXT_RE), a checksum, revision or
+# reference field, a mix.lock entry (LOCK_FIELD_CONTEXT_RE), or an entry of a checksum section such as
+# Podfile.lock's SPEC CHECKSUMS (LOCK_SECTION_RE on the header line); and never where it looks like a
+# credential: a URL's user information (user:secret@host), after an equals sign (?token=secret) or after
+# a telling word (LOCK_CREDENTIAL_RE). Anything else in a lock file stays a finding.
+LOCK_DIGEST_RE = re.compile(br"(?<![0-9A-Za-z+=])(?:[0-9a-fA-F]{128}|[0-9a-fA-F]{96}|[0-9a-fA-F]{64}|[0-9a-fA-F]{40}"
+                            br"|[0-9a-fA-F]{32}|[A-Za-z0-9+/]{86}==|[A-Za-z0-9+/]{64}|[A-Za-z0-9+/]{43}=|[A-Za-z0-9+/]{27}=)"
+                            br"(?![0-9A-Za-z+/=])")
+LOCK_CREDENTIAL_RE = re.compile(br"(?i)(?:token|passw(?:or)?d|pwd|secret|auth|api[_-]?key|access[_-]?key|private|credential)"
+                                br"[^0-9A-Za-z]{0,8}$")
+LOCK_URL_CONTEXT_RE = re.compile(br"://[^\s\"'<>]*(?:[#/]|[\"']\s*:\s*[\"'])$")   # ...tgz#<digest>, .../tar.gz/<digest>, "<url>": "<digest>"
+LOCK_FIELD_CONTEXT_RE = re.compile(br"(?i)(?:integrity|checksum|hash|sha(?:1|256|384|512)?|md5|digest|reference|revision|\b[pr]?rev"
+                                   br"|commit|resolved|resolution|version|shasum|head|signature|fingerprint)s?[\"']?\s*[:=]\s*[\"']?"
+                                   br"(?:[0-9a-z]{1,8}[/:])?\s*$"
+                                   br"|\{:(?:hex|git),")   # mix.lock: {:hex, :name, "1.0.0", "<checksum>", ...}
+LOCK_SECTION_RE = re.compile(br"(?i)integrity|checksum|hash|digest|revision|commit|resolution|sha(?:1|256|384|512)?\b")
 
 ALWAYS_EXCLUDES = [
     r"(^|[/\\])\.env\.keys(\.[^/\\]*)?$",   # dotenvx private keys: .env.keys, .env.keys.bak ... (files, not folders)
@@ -335,6 +355,8 @@ LOCKFILE_NAMES = set("""
     package-lock.json npm-shrinkwrap.json yarn.lock pnpm-lock.yaml bun.lock bun.lockb
     poetry.lock pipfile.lock uv.lock pdm.lock cargo.lock composer.lock gemfile.lock
     mix.lock pubspec.lock packages.lock.json flake.lock .terraform.lock.hcl
+    go.sum podfile.lock package.resolved cartfile.resolved deno.lock gopkg.lock paket.lock
+    renv.lock shrinkwrap.yaml conan.lock gradle.lockfile
     """.split())
 
 # U+FEFF: a UTF-8 byte order mark, which dotenvx (JavaScript's \s) skips like whitespace;
@@ -928,6 +950,10 @@ def locate_tools(args, root, style, keep_going=False):
         say(u"  %s %-11s %-10s %s" % (style.ok("[ok]"), name,
                                       ".".join(str(v) for v in version) if version else "?",
                                       style.dim(path)))
+        if name == "trufflehog" and version and version < TRUFFLEHOG_SKIPS_COMPILED:
+            say(style.dim(u"       an old release, used as it is; %s and later skip compiled files themselves and later"
+                          u" releases keep tightening their detectors, so upgrade when you can"
+                          % u".".join(str(v) for v in TRUFFLEHOG_SKIPS_COMPILED)))
     if keep_going:
         return found, problems
     if problems:
@@ -1701,6 +1727,59 @@ def inside_integrity_hash(finding, data):
     return found
 
 
+def section_header(data, line_start, indent):
+    """The nearest line above the one at line_start that is indented less than indent: the header
+    of the YAML-like section the line belongs to (Podfile.lock's SPEC CHECKSUMS:, a hashes = [ block).
+    b"" when there is none within 400 lines, or the line is not indented."""
+    pos = line_start
+    for _ in range(400):
+        if pos <= 0 or indent <= 0:
+            return b""
+        prev_start = data.rfind(b"\n", 0, pos - 1) + 1
+        prev = data[prev_start:pos - 1].rstrip(b"\r")
+        stripped = prev.lstrip()
+        if stripped and len(prev) - len(stripped) < indent:
+            return prev
+        pos = prev_start
+    return b""
+
+
+def lockfile_identifier(finding, data):
+    """In a generated lock file: True when every occurrence of the reported text is a bare checksum
+    or commit id (LOCK_DIGEST_RE) in a place seen to be public (a URL's fragment or path, a checksum,
+    revision or reference field, a mix.lock entry, an entry of a checksum section) and in none that
+    looks like a credential (a URL's user information, after an equals sign or after a telling word).
+    Anything else, and text that is not found at all, is False: it stays a finding."""
+    if not data:
+        return False
+    found = False
+    for candidate in candidate_secrets(finding):
+        needle = to_bytes(candidate)
+        start = data.find(needle)
+        while start >= 0:
+            found = True
+            line_start = data.rfind(b"\n", 0, start) + 1
+            line_end = data.find(b"\n", start)
+            line = data[line_start:line_end if line_end >= 0 else len(data)]
+            offset = start - line_start
+            span = None
+            for match in LOCK_DIGEST_RE.finditer(line):
+                if match.start() <= offset and match.end() >= offset + len(needle):
+                    span = match
+                    break
+            if span is None:
+                return False
+            before, after = line[:span.start()], line[span.end():]
+            if after.lstrip()[:1] == b"@" or before.rstrip()[-1:] == b"=" or LOCK_CREDENTIAL_RE.search(before):
+                return False   # a credential, whatever its shape
+            if not (LOCK_URL_CONTEXT_RE.search(before) or LOCK_FIELD_CONTEXT_RE.search(before)):
+                header = section_header(data, line_start, len(line) - len(line.lstrip()))
+                if not LOCK_SECTION_RE.search(header):
+                    return False   # a digest nobody vouches for: it is listed
+            start = data.find(needle, start + 1)
+    return found
+
+
 def gzip_member_name(head, fallback):
     """The original file name recorded in a gzip header (FNAME), else fallback."""
     if len(head) < 10 or not head.startswith(b"\x1f\x8b"):
@@ -1989,9 +2068,14 @@ def build_plan(findings, root, store, args, env_plaintext, exclude_res=(), decry
             continue
         data, reason = load_for_edit(finding.path, cache)
         if data is None:
-            if not reason.endswith(u" archive") and inside_integrity_hash(finding, file_bytes(finding.path, raw_cache)):
-                set_aside_hash(plan, finding)   # a package checksum that looks like a key (lock files, mostly)
-                continue
+            if not reason.endswith(u" archive"):
+                raw = file_bytes(finding.path, raw_cache)
+                if inside_integrity_hash(finding, raw):
+                    set_aside_hash(plan, finding, u"inside a package integrity hash")
+                    continue
+                if reason == u"generated lock file" and lockfile_identifier(finding, raw):
+                    set_aside_hash(plan, finding, u"a checksum or commit id in a lock file")
+                    continue
             entry = plan.unfixable.get(finding.path)
             if entry is None:
                 kind = archive_kind(finding.path) if reason.endswith(u" archive") else None
@@ -2001,7 +2085,7 @@ def build_plan(findings, root, store, args, env_plaintext, exclude_res=(), decry
             entry.findings.append(finding)
             continue
         if inside_integrity_hash(finding, data):
-            set_aside_hash(plan, finding)
+            set_aside_hash(plan, finding, u"inside a package integrity hash")
             continue
         located = False
         too_short = False
@@ -2122,12 +2206,12 @@ def build_plan(findings, root, store, args, env_plaintext, exclude_res=(), decry
     return plan
 
 
-def set_aside_hash(plan, finding):
-    """Count a finding that sits inside a package integrity hash, and name it in the run log
-    so that a set-aside can always be checked afterwards (the value itself is never logged)."""
+def set_aside_hash(plan, finding, what):
+    """Count a finding that is a public identifier (inside a package integrity hash, or a checksum
+    or commit id in a lock file), and name it in the run log so that a set-aside can always be
+    checked afterwards (the value itself is never logged)."""
     plan.hashes += 1
-    log_only(u"set aside, inside a package integrity hash: %s line %s (%s)"
-             % (plan.rel(finding.path), finding.line, finding.detector))
+    log_only(u"set aside, %s: %s line %s (%s)" % (what, plan.rel(finding.path), finding.line, finding.detector))
 
 
 UNKNOWN = object()   # an encrypted store value we could not decrypt here
@@ -2334,9 +2418,10 @@ def move_to_quarantine(item, plan, journal=None):
     return candidate, u""
 
 
-def secrets_text(findings):
+def secrets_text(findings, lines=False):
     """'Stripe sk_l...23, AWS AKIA...M2' for a list of findings: each distinct secret counted
-    once, and '(x2)' when two different secrets happen to mask to the same text."""
+    once, and '(x2)' when two different secrets happen to mask to the same text. With lines,
+    the line TruffleHog reported each one on, so that a match can be looked at by hand."""
     shown = OrderedDict()
     seen = set()
     for finding in findings:
@@ -2344,6 +2429,8 @@ def secrets_text(findings):
             continue
         seen.add((finding.detector, finding.raw))
         text = u"%s%s %s" % (finding.detector, u" *" if finding.verified else u"", mask(finding.raw))
+        if lines and finding.line:
+            text += u" (line %d)" % finding.line
         shown[text] = shown.get(text, 0) + 1
     return u", ".join(text if count == 1 else u"%s (x%d)" % (text, count) for text, count in shown.items())
 
@@ -2378,8 +2465,10 @@ def print_unfixable(plan, args, style):
             if entry.unplaced:
                 where = u"%s: (not seen inside)" % entry.kind if lines or entry.note else u"%s: (could not look inside)" % entry.kind
                 lines.append((where, secrets_text(entry.unplaced)))
-        else:
-            lines = [(entry.why, secrets_text(entry.findings))]
+        else:   # line numbers for files that are text (a lock file, an example env file, a source file)
+            textual = not entry.why.startswith((u"PDF", u"binary file", u"larger than", u"cannot be read",
+                                                u"symbolic link", u"file is gone"))
+            lines = [(entry.why, secrets_text(entry.findings, lines=textual))]
         for index, (why, secrets) in enumerate(lines):
             first = index == 0
             rows.append((number if first else u"", name if first else u"", why, secrets, action if first else u""))
@@ -2474,9 +2563,9 @@ def print_report(plan, args, style, verified_any):
                       % (len(skipped), summary)))
     if plan.hashes:
         say(u"")
-        say(style.dim(u"Set aside %d finding(s) that sit inside package integrity hashes (sha512-..., h1:..., sha256:...):"
-                      u" those are public checksums that happen to match a detector's pattern, not secrets.%s"
-                      % (plan.hashes, u" Each is named in the run log." if RUN_LOG is not None else u"")))
+        say(style.dim(u"Set aside %d finding(s) that are package integrity hashes (sha512-..., h1:..., sha256:...) or"
+                      u" checksums and commit ids in lock files: public identifiers that happen to match a detector's"
+                      u" pattern, not secrets.%s" % (plan.hashes, u" Each is named in the run log." if RUN_LOG is not None else u"")))
     if plan.ignored:
         say(u"")
         say(style.dim(u"Ignored %d finding(s) inside excluded folders (.git, node_modules, ...)." % plan.ignored))
