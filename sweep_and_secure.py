@@ -2831,7 +2831,7 @@ def plan_setup_upgrades(plan, env_paths, dotenvx, args):
     """What this run can tighten in a folder dotenvx already manages: a private key sitting in a
     .env.keys file that the OS secret store could hold instead (one entry per key pair), and files
     the quarantine holds as they are. Sets and returns plan.upgrades."""
-    upgrades = {"keys": [], "quarantine": [], "records": []}
+    upgrades = {"keys": [], "quarantine": []}
     candidates = []
     extra = [plan.store, quarantine_env_path(plan) if plan.quarantine else None]
     for path in list(env_paths) + extra:
@@ -2851,7 +2851,7 @@ def plan_setup_upgrades(plan, env_paths, dotenvx, args):
         if plan.quarantine_crypto is None and not plan.quarantine_plain_reason:
             prepare_quarantine_crypto(plan, dotenvx, args)
         if plan.quarantine_crypto:
-            upgrades["quarantine"], upgrades["records"] = plain, records
+            upgrades["quarantine"] = plain
     plan.upgrades = upgrades
     return upgrades
 
@@ -2938,10 +2938,11 @@ def move_key_to_store(plan, env_path, keys_file, dotenvx, args, style, journal):
     return True
 
 
-def encrypt_quarantined_record(plan, record, records, journal):
+def encrypt_quarantined_record(plan, record, journal):
     """Encrypt one file the quarantine holds as it is, in place: <name> becomes <name>.enc, the record
-    says how (key, cipher, derivation, digest, size, mode), and MANIFEST.txt gets a line. Returns the
-    new stored name."""
+    says how (key, cipher, derivation, digest, size, mode), and MANIFEST.txt gets a line. The index is
+    read again before it is written: the files moved earlier in this run have records in it that the
+    planning stage never saw. Returns (new stored name, problems)."""
     stored_rel = record["quarantined"]
     source = os.path.join(plan.quarantine, stored_rel.replace(u"/", os.sep))
     target, counter = source + ENCRYPTED_SUFFIX, 1
@@ -2955,12 +2956,19 @@ def encrypt_quarantined_record(plan, record, records, journal):
     extras, warnings = encrypt_into_quarantine(plan, source, target, journal)
     new_rel = slash_path(os.path.relpath(target, plan.quarantine))
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    record["quarantined"] = new_rel
-    record.update(extras)
+    changes = OrderedDict([("quarantined", new_rel)])
+    changes.update(extras)
     if mode and not record.get("mode"):
-        record["mode"] = mode
-    record["encrypted_at"] = stamp
+        changes["mode"] = mode
+    changes["encrypted_at"] = stamp
+    record.update(changes)
     problems = list(warnings)
+    records = quarantine_records(plan)
+    current = [r for r in records if isinstance(r, dict) and r.get("quarantined") == stored_rel and not r.get("restored_at")]
+    if current:
+        current[-1].update(changes)
+    else:
+        records.append(record)
     try:
         write_bytes(os.path.join(plan.quarantine, QUARANTINE_INDEX),
                     (json.dumps(records, indent=2, ensure_ascii=False) + u"\n").encode("utf-8", "replace"))
@@ -2983,7 +2991,7 @@ def apply_setup_upgrades(plan, upgrades, dotenvx, args, style, journal):
     for record in upgrades["quarantine"]:
         old = record.get("quarantined")
         try:
-            new_rel, problems = encrypt_quarantined_record(plan, record, upgrades["records"], journal)
+            new_rel, problems = encrypt_quarantined_record(plan, record, journal)
         except (IOError, OSError, ToolError) as exc:
             say(u"  %s %s/%s: left as it is: %s" % (style.bad("[!!]"), plan.rel(plan.quarantine), old, to_text(str(exc))))
             plan.quarantine_upgrade_failed.append(old)
@@ -2994,21 +3002,45 @@ def apply_setup_upgrades(plan, upgrades, dotenvx, args, style, journal):
             say(u"  %s %s: %s" % (style.warn("[--]"), new_rel, problem))
 
 
-def print_custody_status(plan, env_paths, style):
-    """For a run with nothing to change: where the private key of each env file dotenvx manages is."""
+def key_at_hand(env_path, dotenvx, plan, args):
+    """Can dotenvx decrypt a value of env_path here, wherever its key is? None when the file has no
+    encrypted value to try."""
+    try:
+        entries = parse_env_entries(read_text(env_path))
+    except (IOError, OSError):
+        return False
+    key = next((k for k, v, _ in entries if v.startswith(ENCRYPTED_PREFIX)), None)
+    if key is None:
+        return None
+    value, _reason = decrypt_env_value(dotenvx, env_path, key, plan.root, args)
+    return value is not None
+
+
+def print_custody_status(plan, env_paths, dotenvx, args, style):
+    """For a run with nothing to change: where the private key of each env file dotenvx manages is,
+    proven by decrypting a value (a keys file may hold a key of the right name that belongs to another
+    file, and a key may be on another machine altogether)."""
     store = native_store_name()
     managed = [path for path in env_paths if store_public_key(path)[1]]
     if not managed:
         return
     say(u"")
     for env_path in managed:
+        rel = plan.rel(env_path)
         held = keys_file_holding(env_path, discover_keys_files([env_path], plan.root))
-        if held:
-            say(u"  %s %s: encrypted with dotenvx; its private key is in %s" % (style.ok("[ok]"), plan.rel(env_path), plan.rel(held[0])))
-        else:
+        if held and key_file_serves(env_path, held[0], dotenvx, plan, args):
+            say(u"  %s %s: encrypted with dotenvx; its private key is in %s" % (style.ok("[ok]"), rel, plan.rel(held[0])))
+            continue
+        at_hand = key_at_hand(env_path, dotenvx, plan, args)
+        if at_hand:
             say(u"  %s %s: encrypted with dotenvx; its private key is kept by dotenvx, not in a key file here (%s)"
-                % (style.ok("[ok]"), plan.rel(env_path),
-                   u"the %s, a password manager, or another machine" % store if store else u"a password manager or another machine"))
+                % (style.ok("[ok]"), rel, u"the %s or a password manager" % store if store else u"a password manager"))
+        elif at_hand is None:
+            say(u"  %s %s: carries a dotenvx public key but no encrypted value yet" % (style.ok("[ok]"), rel))
+        else:
+            say(u"  %s %s: encrypted with dotenvx, but its private key is not available on this machine%s"
+                % (style.warn("[--]"), rel,
+                   u" (%s holds a key of the same name that does not decrypt it)" % plan.rel(held[0]) if held else u""))
     say(style.dim(u"  dotenvx is the tool in use here (dotenvx run, get, set):  https://dotenvx.com/docs"))
 
 
@@ -4564,7 +4596,7 @@ def main(argv=None):
         say(u"")
         say(u"Nothing to encrypt.")
         if managed_env:
-            print_custody_status(plan, managed_env, style)
+            print_custody_status(plan, managed_env, tools["dotenvx"]["path"], args, style)
         else:
             print_dotenvx_pointer(style)
         return 1 if scan_incomplete else 0

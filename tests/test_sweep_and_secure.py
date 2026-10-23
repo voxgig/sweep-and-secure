@@ -1554,8 +1554,8 @@ class EndToEndTests(unittest.TestCase):
             self.assertIn("Nothing to encrypt.", out)
             self.assertNotIn("Setup to tighten", out)
             self.assertIn("[ok] .env: encrypted with dotenvx; its private key is kept by dotenvx, not in a key file here", out)
-            self.assertIn("[ok] config/.env.production: encrypted with dotenvx; its private key is kept by dotenvx, not in a key"
-                          " file here", out)
+            self.assertIn("[--] config/.env.production: encrypted with dotenvx, but its private key is not available on this"
+                          " machine", out)
             self.assertIn("https://dotenvx.com/docs", out)
             # --restore still works with the key in the store
             code, out, err = run_script(self.tree.root, ["--restore", "build/keys.zip"], extra_env=env)
@@ -1564,6 +1564,26 @@ class EndToEndTests(unittest.TestCase):
             self.assertNoLeftovers()
         finally:
             shutil.rmtree(store_dir, ignore_errors=True)
+
+    def test_tightening_keeps_the_records_of_files_moved_in_the_same_run(self):
+        original = self.before[os.path.join("build", "keys.zip")]
+        code, out, err = run_script(self.tree.root, ["--yes", "--quarantine", "--openssl", os.path.join(self.tree.root, "none")])
+        self.assertEqual(code, 0, out + err)
+        self.tree.write("build/more.zip", original)        # a new file to quarantine, and two old ones to encrypt
+        code, out, err = run_script(self.tree.root, ["--yes", "--quarantine"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("build/more.zip: moved to .secrets-quarantine/build/more.zip.enc (encrypted)", out)
+        self.assertIn("[ok] .secrets-quarantine/build/keys.zip: encrypted in place as build/keys.zip.enc", out)
+        index = json.loads(self.tree.read(".secrets-quarantine/index.json"))
+        self.assertEqual(sorted(r["quarantined"] for r in index),
+                         ["build/blob.txt.gz.enc", "build/keys.zip.enc", "build/more.zip.enc"])
+        self.assertTrue(all(r["encrypted"] for r in index), index)
+        for rel in ("build/more.zip", "build/keys.zip", "build/blob.txt.gz"):
+            self.assertEqual(quarantined_bytes(self.tree, rel), self.before.get(rel.replace("/", os.sep), original), rel)
+        code, out, err = run_script(self.tree.root, ["--restore", "build/more.zip"])
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self.tree.read_bytes("build/more.zip"), original)
+        self.assertNoLeftovers()
 
     def test_tightening_respects_no_native_ci_and_an_unreachable_store(self):
         store = sas.native_store_name() or "Linux Secret Service"
@@ -1579,6 +1599,9 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual(code, 0, out + err)
             self.assertNotIn("Setup to tighten", out)
             self.assertIn("[ok] .env: encrypted with dotenvx; its private key is in .env.keys", out)
+            # a key of the same name is in .env.keys, but it is .env's, not this file's: never claimed for it
+            self.assertIn("[--] config/.env.production: encrypted with dotenvx, but its private key is not available on this"
+                          " machine (.env.keys holds a key of the same name that does not decrypt it)", out)
             self.assertTrue(os.path.isfile(self.tree.path(".env.keys")))
             # on CI (the CI variable set) keys stay in files, as dotenvx itself keeps them there
             code, out, err = run_script(self.tree.root, ["--yes", "--quarantine"],
