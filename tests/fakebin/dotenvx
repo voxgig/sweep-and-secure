@@ -83,6 +83,15 @@ def out(text):
     sys.stdout.flush()
 
 
+def err(text):
+    """dotenvx (Node) writes UTF-8 to a piped stderr whatever the console code page; so does the
+    stand-in, or a Windows Python would turn its glyphs into backslash escapes."""
+    sys.stderr.flush()
+    data = (text + u"\n").encode("utf-8")
+    getattr(sys.stderr, "buffer", sys.stderr).write(data)
+    sys.stderr.flush()
+
+
 def closing_quote(body, quote):
     i = 0
     while i < len(body):
@@ -242,17 +251,17 @@ def native(argv):
     with io.open(path, "rb") as fh:
         suffix, key_id = header(fh.read().decode("utf-8"))
     if suffix is None:
-        sys.stderr.write("☠ [MISSING_PUBLIC_KEY] no DOTENV_PUBLIC_KEY in %s\n" % path)
+        err("☠ [MISSING_PUBLIC_KEY] no DOTENV_PUBLIC_KEY in %s" % path)
         return 1
     name = "DOTENV_PRIVATE_KEY" + suffix
     pub = "02fake" + key_id
     if action == "up":
         if not store_path():
-            sys.stderr.write("☠ failed to save private key to %s\n" % STORE_NAME)
+            err("☠ failed to save private key to %s" % STORE_NAME)
             return 1
         private = private_key(path, suffix, [keys_file])
         if not private:
-            sys.stderr.write("☠ [MISSING_PRIVATE_KEY] %s not found\n" % name)
+            err("☠ [MISSING_PRIVATE_KEY] %s not found" % name)
             return 1
         store = store_load()
         store[pub] = private
@@ -271,7 +280,7 @@ def native(argv):
         store = store_load()
         private = store.get(pub)
         if not private:
-            sys.stderr.write("☠ [NOT_FOUND] private key not found in %s\n" % STORE_NAME)
+            err("☠ [NOT_FOUND] private key not found in %s" % STORE_NAME)
             return 1
         existing = ""
         if os.path.isfile(keys_file):

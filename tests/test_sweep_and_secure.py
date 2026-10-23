@@ -1406,7 +1406,7 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("is moved whole to .secrets-quarantine AS IT IS: openssl was not found at --openssl %s" % missing, out)
         code, out, err = run_script(self.tree.root, ["--yes", "--quarantine", "--openssl", missing])
         self.assertEqual(code, 0, out + err)
-        self.assertIn("build/keys.zip: moved to .secrets-quarantine/build/keys.zip\n", out)
+        self.assertRegex(out, r"(?m)build/keys\.zip: moved to \.secrets-quarantine/build/keys\.zip\s*$")
         self.assertNotIn("(encrypted)", out)
         self.assertIn("[--] 2 file(s) were moved to .secrets-quarantine AS THEY ARE, secrets inside: openssl was not found", out)
         self.assertIn("were moved to .secrets-quarantine AS THEY ARE (openssl was not found at --openssl", out)
