@@ -2476,7 +2476,7 @@ def execute(plan, chosen, dotenvx, args, style, decryptor=None, journal=None):
             say(u"  %s %s: encrypted %d key(s): %s" % (style.ok("[ok]"), plan.rel(env_path), len(keys),
                                                       u", ".join(keys)))
             for warning in warnings:
-                say(u"  %s %s: %s" % (style.warn("[!!]"), plan.rel(env_path), warning))
+                say(u"  %s %s: %s" % (style.warn("[--]"), plan.rel(env_path), warning))
         else:
             failed_stores.add(env_path)
             say(u"  %s %s: %s" % (style.bad("[!!]"), plan.rel(env_path), note))
@@ -2820,7 +2820,7 @@ def protect_keys_files_early(git_root, root, chosen, style, plan=None):
         try:
             changed, message = ensure_gitignore(git_root, paths, pattern, why)
         except (IOError, OSError) as exc:
-            say(u"  %s could not update .gitignore: %s" % (style.warn("[!!]"), to_text(str(exc))))
+            say(u"  %s could not update .gitignore: %s" % (style.warn("[--]"), to_text(str(exc))))
             continue
         say(u"  %s %s" % (style.ok("[ok]") if changed else style.dim("[--]"), message))
 
@@ -2847,7 +2847,7 @@ def wrap_up(plan, chosen, journal, root, git_root, args, style, failed, error, s
                 if changed or u"STILL" in message:
                     say(u"  %s %s" % (style.warn("[!!]") if u"STILL" in message else style.ok("[ok]"), message))
             except (IOError, OSError) as exc:
-                say(u"  %s could not update .gitignore: %s" % (style.warn("[!!]"), to_text(str(exc))))
+                say(u"  %s could not update .gitignore: %s" % (style.warn("[--]"), to_text(str(exc))))
         else:
             say(u"  %s not a git repository: keep .env.keys out of any backups or shares you make."
                 % style.warn("[--]"))

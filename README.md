@@ -7,8 +7,9 @@ found and what it intends to do, and, once you say yes, encrypts the secrets
 with [dotenvx](https://dotenvx.com), replaces the plaintext in your files with
 placeholders, and moves archives that hold secrets out of the tree. It is one
 Python file with no dependencies of its own, runs on Linux, macOS and Windows,
-and is built so that a crash, a power cut or a Ctrl-C can never leave the tree
-half-changed.
+and is built so that no file is ever left half-written: each file is changed
+completely or not at all, an interrupted run says what it did, and running
+again finishes the job.
 
 - [What it does](#what-it-does)
 - [Install](#install)
@@ -96,7 +97,7 @@ numeric suffix, and the listing says why.
   with the private key from `.env.keys` or from the environment and hands them
   to the program as ordinary environment variables.
 
-### Built never to leave the tree broken
+### Built never to leave a file half-written
 
 Nothing is written to an env file until the result has been checked. The env
 file is copied, under its own name, into a staging folder inside the swept
@@ -111,13 +112,19 @@ it there. Source files are rewritten atomically as well, and only after their
 value has been stored. Archives are moved with a rename, or copied and verified
 before the original is removed when the quarantine folder is on another disk.
 
-Before anything is encrypted the script asks `git check-ignore` whether
-`.env.keys` is ignored and appends `.env.keys*` (and the quarantine folder) to
-your `.gitignore` if not, so that an interrupted run cannot leave the key
-exposed; afterwards it checks again and warns loudly if the key file is tracked
-by git. Every change is journaled. If a run is interrupted or hits an unexpected
-error it prints exactly what was changed and what still holds plaintext, and
-running again finishes the job: stored values are recognised, not stored twice.
+The run as a whole is not one transaction: it changes the env files first,
+then the source files one by one, then moves the archives, so a Ctrl-C or a
+power cut between two files leaves the earlier ones changed and the later ones
+untouched, never a file in between. Before anything is encrypted the script asks
+`git check-ignore` whether `.env.keys` is ignored and appends `.env.keys*` (and
+the quarantine folder) to your `.gitignore` if not, so that an interrupted run
+cannot leave the key exposed; afterwards it checks again and warns loudly if the
+key file is tracked by git. Every change is recorded as it is made: a run that
+is interrupted or hits an unexpected error prints exactly what was changed and
+what still holds plaintext, and after a power cut the next listing shows what is
+still in plaintext. Running again finishes the job: stored values are recognised,
+not stored twice, and leftover staging files from the interrupted run are
+removed (they may hold a plaintext copy of an env file, so they never stay).
 
 ### What it does not do
 
@@ -178,6 +185,8 @@ you can read it first. By hand: download `sweep_and_secure.py` from the
 [latest release](https://github.com/voxgig/sweep-and-secure/releases/latest),
 check it against `SHA256SUMS`, make it executable and put it on your `PATH`, or
 run `python sweep_and_secure.py` from wherever it sits.
+
+<a name="requirements"></a>
 
 ### 2. Install TruffleHog and dotenvx
 
@@ -389,9 +398,11 @@ Next steps
 
 The `.gitignore` lines are written before anything is encrypted, so even an
 interrupted run cannot leave `.env.keys` exposed. Everything under "Encrypting"
-happens through the staging-and-verify path described above; a line that
-started with `[!!]` instead of `[ok]` would mean that file was left untouched
-and the reason printed.
+happens through the staging-and-verify path described above. `[ok]` means the
+change was made; `[--]` is a warning about a change that was made (for example
+a value that could not be checked because the private key for that file is not
+on this machine, or a byte order mark that was removed); `[!!]` is a failure:
+that file was left untouched, and the reason follows.
 
 ### What the files look like afterwards
 
@@ -504,7 +515,11 @@ Done: 2 secret(s) stored encrypted; 2 plaintext occurrence(s) removed from 1 fil
 ### Saying no
 
 `n`, or no answer at all, changes nothing and exits with code 2, so a script
-that forgot `--yes` fails visibly instead of silently doing nothing:
+that forgot `--yes` fails visibly instead of silently doing nothing. (The one
+thing a declined run still does is remove leftover staging files that an
+earlier interrupted run left behind, which it reports; they may hold a
+plaintext copy of an env file. Names starting with `.sweep-and-secure-` are
+reserved for that staging.)
 
 ```
 Encrypt 6 secret(s) and move 2 archive(s) to quarantine now? [y/N/s]  (s = choose which): n
