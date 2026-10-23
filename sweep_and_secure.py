@@ -2556,10 +2556,17 @@ def discover_keys_files(env_paths, root):
             match = None
         if match:
             candidates.append(os.path.normpath(os.path.join(folder, match.group(1))))
-    found = []
+    # One entry per file, whatever path leads to it: the -fk hint dotenvx writes may spell the
+    # folder through a symlink (/private/var for /var on macOS), unlike the paths we build.
+    found, seen = [], set()
     for candidate in candidates:
-        if os.path.isfile(candidate) and candidate not in found:
-            found.append(candidate)
+        if not os.path.isfile(candidate):
+            continue
+        identity = os.path.realpath(candidate)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        found.append(candidate)
     return found
 
 
@@ -2686,7 +2693,8 @@ def print_next_steps(plan, chosen, keys_files, args, style):
             rel = plan.rel(env_path)
             command = u"dotenvx run" if rel == ".env" else u"dotenvx run -f %s" % rel
             keys_file = keys_file_for(env_path, keys_files)
-            if keys_file and os.path.dirname(keys_file) != os.path.dirname(env_path):
+            if keys_file and (os.path.realpath(os.path.dirname(keys_file))
+                              != os.path.realpath(os.path.dirname(env_path))):
                 command += u" -fk %s" % plan.rel(keys_file)
                 needs_fk = True
             say(u"       %s -- <your command>" % command)

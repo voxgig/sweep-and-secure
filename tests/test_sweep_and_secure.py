@@ -476,7 +476,8 @@ class EndToEndTests(unittest.TestCase):
                       " 2 need manual attention", out)
         self.assertIn("Next steps", out)
         self.assertIn("dotenvx run -- <your command>", out)
-        self.assertNotIn("-fk", out)                     # .env and .env.keys share a folder
+        self.assertNotIn(" -fk ", out)                   # .env and .env.keys share a folder
+        self.assertEqual(out.count("private key file:"), 1)   # one keys file, however its path is spelled
         self.assertIn("howtorotate.com/docs/tutorials/stripe/", out)
         self.assertNoLeftovers()
 
