@@ -5,11 +5,13 @@ folder, and lock them away. One command scans the tree with
 [TruffleHog](https://trufflesecurity.com/trufflehog), shows you everything it
 found and what it intends to do, and, once you say yes, encrypts the secrets
 with [dotenvx](https://dotenvx.com), replaces the plaintext in your files with
-placeholders, and moves archives that hold secrets out of the tree. It is one
-Python file with no dependencies of its own, runs on Linux, macOS and Windows,
-and is built so that no file is ever left half-written: each file is changed
-completely or not at all, an interrupted run says what it did, and running
-again finishes the job.
+placeholders, and moves the files it cannot fix in place (archives, binaries,
+PDFs, lock files, example env files) out of the tree into a quarantine folder
+that remembers where each came from. It is one Python file with no dependencies
+of its own, runs on Linux, macOS and Windows, keeps a log of every run, and is
+built so that no file is ever left half-written: each file is changed completely
+or not at all, an interrupted run says what it did, and running again finishes
+the job.
 
 - [What it does](#what-it-does)
 - [Install](#install)
@@ -53,7 +55,10 @@ between:
    place (`KEY="encrypted:..."`). A secret found anywhere else is added to the
    project's `.env`, encrypted there, and the plaintext in the source file is
    replaced by a placeholder such as `${KEY}`. The same secret in several files
-   gets one name. Archives you chose are moved whole into a quarantine folder.
+   gets one name. A file whose secrets cannot be fixed in place (an archive, a
+   binary, a PDF, a lock file, an example env file) is moved whole into a
+   quarantine folder when you choose it, and the folder's manifest and index
+   record where it came from.
 5. **It tells you what is left to do.** Change the code to read the variables,
    run your program through `dotenvx run`, keep the private key out of git,
    rotate the exposed credentials (with links to the rotation guides), and check
@@ -65,9 +70,10 @@ between:
 | --- | --- |
 | a dotenv file (`.env`, `.env.production`, `prod.env`, ...), as the value of `KEY=...` | `dotenvx encrypt -k KEY` encrypts that key in place: `KEY="encrypted:..."`. Every key whose value holds the secret is encrypted, not just the first |
 | anywhere else (source code, JSON, YAML, Markdown, certificates, ...) | the value is added to the project's `.env` (`--env-file` to change) and encrypted there; the plaintext in the file is replaced by `${KEY}` (`--placeholder` to change) |
-| an archive TruffleHog looked inside (`.zip`, `.jar`, `.tar.gz`, ...) | listed in its own "Archives holding secrets" section, with the files inside that hold each secret (zip, tar with any compression, gzip, bzip2 and xz are opened, nested ones too). The whole archive is moved out of the tree into the quarantine folder (`.secrets-quarantine` in the swept folder, `--quarantine-dir` to change), keeping its relative path; the folder's `MANIFEST.txt` records where it came from and which files inside held secrets. An interactive run offers this as a numbered item, so `s` can leave an archive in place; a `--yes` run moves archives only when `--quarantine` is given |
-| a binary file, a symlink, a secret TruffleHog had to decode first, a PDF, a generated lock file (`package-lock.json`, `poetry.lock`, ...), an example env file (`.env.example`, `.env.sample`, ...) | listed under "cannot fix automatically" for you to deal with by hand |
-| a value dotenvx cannot store exactly (it contains an apostrophe together with a backslash, or with both a backtick and a double quote) | listed under "cannot fix automatically"; moving it would corrupt it |
+| a file that cannot be fixed in place: an archive TruffleHog looked inside (`.zip`, `.jar`, `.tar.gz`, ...), a binary, a PDF, a generated lock file (`package-lock.json`, `poetry.lock`, ...), an example env file (`.env.example`, `.env.sample`, ...), a file too large or unreadable, or a text file whose only secrets are encoded, shorter than `--min-length` or impossible for dotenvx to store exactly | listed in the "Files holding secrets that cannot be fixed in place" section with the reason, and for archives the files inside that hold each secret (zip, tar with any compression, gzip, bzip2 and xz are opened, nested ones too). The whole file is moved out of the tree into the quarantine folder (`.secrets-quarantine` in the swept folder, `--quarantine-dir` to change), keeping its relative path; the folder's `MANIFEST.txt` and `index.json` record where it came from, why, and which files inside held secrets. An interactive run offers this as a numbered item, so `s` can leave a file in place; a `--yes` run moves files only when `--quarantine` is given |
+| a text file some of whose secrets are fixed in place and one of which cannot be (encoded, too short, unstorable) | the fixable ones are handled; the file is listed with the other one for you to handle by hand, and is never moved, because moving it would undo the fixes |
+| a symbolic link | listed; fix the file it points to |
+| a match that sits inside a package integrity hash (`sha512-...` in `package-lock.json` or `yarn.lock`, `h1:...` in `go.sum`, `sha256:...` in a Python lock file) | set aside and counted, not treated as a secret: those are public checksums that happen to match a detector's pattern, a known weakness of several TruffleHog detectors |
 
 Variable names come from the code around the secret (`AWS_SECRET_ACCESS_KEY =
 "..."`, `"apiKey": "..."`, `password: ...`), made specific with the detector name
@@ -90,12 +96,40 @@ numeric suffix, and the listing says why.
 - Source files hold `${KEY}` where the secrets were. The code still has to be
   changed to read the variable (`os.environ["KEY"]`, `process.env.KEY`, ...);
   the placeholder removes the secret and marks the spot.
-- `.secrets-quarantine/` holds the archives that were moved, under their
-  original relative paths, with a `MANIFEST.txt`. It is git-ignored and never
-  scanned.
+- `.secrets-quarantine/` holds the files that were moved, under their original
+  relative paths (a numeric suffix such as `keys.zip.1` when that name is already
+  taken there). Its `MANIFEST.txt` has one line per file and its `index.json`
+  one record per file: the stored name, the original path (relative and
+  absolute), when it was moved, why, the detectors, and for archives the files
+  inside that held secrets. The folder is git-ignored and never scanned. To
+  put a file back, move it to its original path by hand once it no longer
+  holds the secret.
+- A log of the run is in the user's log folder (see below).
 - Your program runs as `dotenvx run -- <command>`: dotenvx decrypts the values
   with the private key from `.env.keys` or from the environment and hands them
   to the program as ordinary environment variables.
+
+### It says what it is before it starts
+
+Every run opens with a notice that this is a security tool that changes files
+on purpose, that the changes are deliberate and cannot be undone by the tool,
+and that you should commit or back up first; the last sentence names the mode
+(a dry run changes nothing, an interactive run changes nothing before you
+confirm, `--yes` will not ask). The setup check carries no notice because it
+changes nothing.
+
+### Every run is logged
+
+Each run writes a plain-text log to one common folder per user, so that any run
+on the machine can be looked at afterwards: what was printed (without colour),
+the prompts and your answers, the TruffleHog and dotenvx commands with their
+diagnostics, and the exit code. Secret values never appear in it: the run prints
+masked previews only, and the output of `dotenvx get` is never logged. The folder
+is `~/.local/state/sweep-and-secure/logs` on Linux (`$XDG_STATE_HOME` when set),
+`~/Library/Logs/sweep-and-secure` on macOS and
+`%LOCALAPPDATA%\sweep-and-secure\logs` on Windows; `SWEEP_AND_SECURE_LOG_DIR` or
+`--log-dir DIR` choose another, `--no-log` writes none. The newest 100 logs are
+kept. Each run prints `Log: <path>` as its second line.
 
 ### Built never to leave a file half-written
 
@@ -109,8 +143,9 @@ real file in one atomic rename. If anything fails the real file has not been
 touched and the source files are left alone. Plaintext never lands on the real
 env file's path, not even for a moment, so a crash or a power cut cannot leave
 it there. Source files are rewritten atomically as well, and only after their
-value has been stored. Archives are moved with a rename, or copied and verified
-before the original is removed when the quarantine folder is on another disk.
+value has been stored. Files are moved to quarantine with a rename, or copied
+and verified before the original is removed when the quarantine folder is on
+another disk; the move is recorded in the folder's manifest and index.
 
 The run as a whole is not one transaction: it changes the env files first,
 then the source files one by one, then moves the archives, so a Ctrl-C or a
@@ -138,7 +173,7 @@ removed (they may hold a plaintext copy of an env file, so they never stay).
   `DB_PASSWORD=hunter2` in a `.env` file is listed under "other plaintext keys"
   and encrypted only with `--env-all`.
 - It does not edit binaries, PDFs or lock files, and it does not edit inside
-  archives; archives are moved whole.
+  archives; such files are moved whole to quarantine, or left for you.
 
 ## Install
 
@@ -175,7 +210,7 @@ Without installing anything, straight from the repository:
 uvx --from git+https://github.com/voxgig/sweep-and-secure sweep-and-secure --dry-run
 ```
 
-To pin a release, append `@v1.3.2` to the git URL, or pass `-v v1.3.2` to the
+To pin a release, append `@v1.4.0` to the git URL, or pass `-v v1.4.0` to the
 installer. To upgrade, run the same command again (`pipx upgrade
 sweep-and-secure` or `uv tool upgrade sweep-and-secure` for those routes). The
 installer takes `-b DIR` for another folder (without `-b` it uses
@@ -261,12 +296,13 @@ everything.
 
 ```
 $ sweep-and-secure --check-setup
-sweep-and-secure 1.3.2  (TruffleHog + dotenvx)
+sweep-and-secure 1.4.0  (TruffleHog + dotenvx)
+Log: /home/me/.local/state/sweep-and-secure/logs/2026-10-23T10-33-32Z-shop-48213.log
 Python 3.13.16 (/usr/bin/python3) on Linux-6.8.0-x86_64-with-glibc2.39
   [ok] trufflehog  3.99.3     /usr/local/bin/trufflehog
   [ok] dotenvx     2.38.2     /usr/local/bin/dotenvx
   [ok] git         2.43.0     /usr/bin/git  (optional: keeps .env.keys out of commits)
-  Scanned 1 file(s) in 0:03; TruffleHog reported 0 finding(s).
+  Scanned 1 file(s) in 0:02; TruffleHog reported 0 finding(s).
   [ok] trufflehog  ran in a scratch folder: exit status 0, 1 file(s) scanned, no findings
   [ok] dotenvx     ran in a scratch folder: encrypted a value, decrypted it back, wrote .env.keys
 
@@ -287,6 +323,7 @@ is a Stripe key, `AKIA...M2` an AWS access key id):
 ```
 shop/
   .env                     PORT and APP_NAME, plus a Stripe secret key in plaintext
+  .env.example             a copy of .env that was meant as a template, key included
   config/.env.production   LOG_LEVEL in plaintext; DB_PASSWORD already encrypted with dotenvx
   config/app.json          a Slack webhook URL
   docs/notes.md            the same webhook URL again
@@ -304,27 +341,32 @@ audit.
 ```
 $ cd shop
 $ sweep-and-secure --dry-run
-sweep-and-secure 1.3.2  (TruffleHog + dotenvx)
+sweep-and-secure 1.4.0  (TruffleHog + dotenvx)
+Log: /home/me/.local/state/sweep-and-secure/logs/2026-10-23T10-33-38Z-shop-48213.log
 Folder: /home/me/shop
+  Note: this is a security tool that changes files on purpose: it encrypts env files, rewrites
+  source files and moves files to quarantine. The changes are deliberate and it cannot undo them;
+  commit or back up first. This is a dry run: nothing is changed.
   [ok] trufflehog  3.99.3     /usr/local/bin/trufflehog
   [ok] dotenvx     2.38.2     /usr/local/bin/dotenvx
 Scanning with TruffleHog (this can take a while on big trees) ...
-  Scanned 10 file(s) in 0:03; TruffleHog reported 7 finding(s).
+  Scanned 11 file(s) in 0:02; TruffleHog reported 8 finding(s).
 
 Plaintext secrets found: 6 in 4 file(s)
   #  Type          Key / name             Secret     Where              Action
   1  Stripe        STRIPE_SECRET_KEY      sk_l...23  .env:2             encrypt in place
-  4  SlackWebhook  SLACK_WEBHOOK          http...wX  config/app.json:5  move to .env, replace with ${SLACK_WEBHOOK}
-  5  SlackWebhook  SLACK_WEBHOOK          http...wX  docs/notes.md:4    replace with ${SLACK_WEBHOOK} (value already in .env)
-  6  AWS           AWS_ACCESS_KEY_ID      AKIA...M2  src/settings.py:2  move to .env, replace with ${AWS_ACCESS_KEY_ID}
-  7  AWS           AWS_SECRET_ACCESS_KEY  1tUm...IU  src/settings.py:3  move to .env, replace with ${AWS_SECRET_ACCESS_KEY}
-  8  Postgres      DATABASE_URL           post...pp  src/settings.py:4  move to .env, replace with ${DATABASE_URL}
+  5  SlackWebhook  SLACK_WEBHOOK          http...wX  config/app.json:5  move to .env, replace with ${SLACK_WEBHOOK}
+  6  SlackWebhook  SLACK_WEBHOOK          http...wX  docs/notes.md:4    replace with ${SLACK_WEBHOOK} (value already in .env)
+  7  AWS           AWS_ACCESS_KEY_ID      AKIA...M2  src/settings.py:2  move to .env, replace with ${AWS_ACCESS_KEY_ID}
+  8  AWS           AWS_SECRET_ACCESS_KEY  1tUm...IU  src/settings.py:3  move to .env, replace with ${AWS_SECRET_ACCESS_KEY}
+  9  Postgres      DATABASE_URL           post...pp  src/settings.py:4  move to .env, replace with ${DATABASE_URL}
 
-Archives holding secrets: 2  (a chosen archive is moved whole to .secrets-quarantine; nothing inside it is rewritten)
-  #  Archive                   File inside    Secrets           Action
-  2  build/blob.txt.gz (gzip)  blob.txt       Stripe sk_l...23  move to .secrets-quarantine/build/blob.txt.gz
-  3  build/keys.zip (zip)      conf/prod.env  Stripe sk_l...fE  move to .secrets-quarantine/build/keys.zip
-  Offered because this run asks first: y moves them too, s lets you leave them in place. A --yes run moves archives only with --quarantine.
+Files holding secrets that cannot be fixed in place: 3  (a chosen file is moved whole to .secrets-quarantine; nothing in it is rewritten)
+  #  File               Why / inside        Secrets           Action
+  2  .env.example       example env file    Stripe sk_l...23  move to .secrets-quarantine/.env.example
+  3  build/blob.txt.gz  gzip: blob.txt      Stripe sk_l...23  move to .secrets-quarantine/build/blob.txt.gz
+  4  build/keys.zip     zip: conf/prod.env  Stripe sk_l...fE  move to .secrets-quarantine/build/keys.zip
+  Offered because this run asks first: y moves them too, s lets you leave them in place. A --yes run moves files only with --quarantine.
 
 Already encrypted with dotenvx (left as is): 1
   Key          Where
@@ -339,14 +381,18 @@ Dry run: nothing was changed.
 
 Reading the listing:
 
-- The **first table** is the secrets in text files. The Stripe key already
-  lives in `.env`, so it is encrypted where it is. The webhook, the AWS pair and
-  the database URL live in code and docs, so each is moved into `.env` and
-  replaced by a placeholder; the second copy of the webhook in `docs/notes.md`
-  reuses the entry the first one creates ("value already in .env").
-- **Archives holding secrets** names each archive, the file inside it that
-  holds the secret, and the secret. The run is interactive, so the archives are
-  offered for quarantine; `s` can leave them in place.
+- Every run starts with where its log went and the notice about what the tool
+  does; the last sentence of the notice names the mode.
+- The **first table** is the secrets in text files that can be fixed in place.
+  The Stripe key already lives in `.env`, so it is encrypted where it is. The
+  webhook, the AWS pair and the database URL live in code and docs, so each is
+  moved into `.env` and replaced by a placeholder; the second copy of the
+  webhook in `docs/notes.md` reuses the entry the first one creates ("value
+  already in .env").
+- **Files holding secrets that cannot be fixed in place** lists each such file
+  with the reason, for archives the file inside that holds the secret, the
+  secret, and the action. The run is interactive, so they are offered for
+  quarantine; `s` can leave any of them in place.
 - **Already encrypted** shows what dotenvx already protects. **Other plaintext
   keys** are env values TruffleHog did not flag (`PORT=3000` is not a secret,
   but a plain password would land here too); `--env-all` encrypts them as well.
@@ -361,7 +407,7 @@ does everything listed:
 $ sweep-and-secure
 ...the listing above...
 
-Encrypt 6 secret(s) and move 2 archive(s) to quarantine now? [y/N/s]  (s = choose which): y
+Encrypt 6 secret(s) and move 3 file(s) to quarantine now? [y/N/s]  (s = choose which): y
   [ok] added .env.keys* to /home/me/shop/.gitignore
   [ok] added /.secrets-quarantine/ to /home/me/shop/.gitignore
 
@@ -370,21 +416,22 @@ Encrypting ...
   [ok] config/app.json: replaced 1 occurrence(s) of 1 secret(s) with placeholders (SLACK_WEBHOOK)
   [ok] docs/notes.md: replaced 1 occurrence(s) of 1 secret(s) with placeholders (SLACK_WEBHOOK)
   [ok] src/settings.py: replaced 3 occurrence(s) of 3 secret(s) with placeholders (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, DATABASE_URL)
+  [ok] .env.example: moved to .secrets-quarantine/.env.example
   [ok] build/blob.txt.gz: moved to .secrets-quarantine/build/blob.txt.gz
   [ok] build/keys.zip: moved to .secrets-quarantine/build/keys.zip
 
   [ok] private key file: .env.keys
 
-Done: 5 secret(s) stored encrypted; 5 plaintext occurrence(s) removed from 3 file(s); 2 archive(s) moved to .secrets-quarantine
+Done: 5 secret(s) stored encrypted; 5 plaintext occurrence(s) removed from 3 file(s); 3 file(s) moved to .secrets-quarantine
 
 Next steps
   1. Your files now contain placeholders such as ${SLACK_WEBHOOK} where secrets used to be. Change the code to
      read them from the environment instead (os.environ["SLACK_WEBHOOK"], process.env.SLACK_WEBHOOK, ...).
   2. Run your app through dotenvx so the values are decrypted at run time:
        dotenvx run -- <your command>
-  3. 2 archive(s) holding secrets were moved to .secrets-quarantine (see its MANIFEST.txt for where each came from).
-     Nothing reads them from there. Inspect them, rebuild them without the secrets, or delete
-     them; never commit that folder. If an archive was tracked by git, commit its removal.
+  3. 3 file(s) holding secrets were moved to .secrets-quarantine; its MANIFEST.txt and index.json map each one to where it came from.
+     Nothing reads them from there. Fix or rebuild them without the secrets and move them back, or
+     delete them; never commit that folder. If a file was tracked by git, commit its removal.
   4. The private decryption key lives in .env.keys.
      NEVER commit it. Share it through a password manager or your CI's secret store
      (the DOTENV_PRIVATE_KEY* variables). The encrypted .env files themselves are safe to commit.
@@ -416,12 +463,12 @@ DOTENV_PUBLIC_KEY="02a1b2c3d4...e5f6" # -fk .env.keys
 
 # .env
 PORT=3000
-STRIPE_SECRET_KEY=encrypted:BJ9e5K9SZuUG...
+STRIPE_SECRET_KEY=encrypted:BClCFQt3Fi1S...
 APP_NAME=shop
-SLACK_WEBHOOK='encrypted:BH2ix8bykeSe...'
-AWS_ACCESS_KEY_ID='encrypted:BPjJ8HYq9U7M...'
-AWS_SECRET_ACCESS_KEY='encrypted:BPjZcoDabkKy...'
-DATABASE_URL='encrypted:BM7hTTJ4vVGd...'
+SLACK_WEBHOOK='encrypted:BPyvIUm1ajXa...'
+AWS_ACCESS_KEY_ID='encrypted:BLQdDU78sdrq...'
+AWS_SECRET_ACCESS_KEY='encrypted:BLAYULRQNlAi...'
+DATABASE_URL='encrypted:BD2/M0XgEC0E...'
 
 $ cat src/settings.py
 DEBUG = False
@@ -445,17 +492,62 @@ __pycache__/
 # dotenvx private decryption keys - never commit (added by sweep_and_secure.py)
 .env.keys*
 
-# archives with secrets, moved by --quarantine - never commit (added by sweep_and_secure.py)
+# files with secrets moved to quarantine - never commit (added by sweep_and_secure.py)
 /.secrets-quarantine/
 
 $ cat .secrets-quarantine/MANIFEST.txt
-2026-10-23T09:22:03Z  build/blob.txt.gz  <- build/blob.txt.gz  (Stripe)  inside: blob.txt
-2026-10-23T09:22:03Z  build/keys.zip  <- build/keys.zip  (Stripe)  inside: conf/prod.env
+2026-10-23T10:33:49Z  .env.example  <- .env.example  (Stripe)  why: example env file
+2026-10-23T10:33:49Z  build/blob.txt.gz  <- build/blob.txt.gz  (Stripe)  why: gzip archive  inside: blob.txt
+2026-10-23T10:33:49Z  build/keys.zip  <- build/keys.zip  (Stripe)  why: zip archive  inside: conf/prod.env
+
+$ cat .secrets-quarantine/index.json
+[
+  {
+    "quarantined": ".env.example",
+    "original": ".env.example",
+    "original_absolute": "/home/me/shop/.env.example",
+    "moved_at": "2026-10-23T10:33:49Z",
+    "why": "example env file",
+    "detectors": [
+      "Stripe"
+    ],
+    "inside": []
+  },
+  {
+    "quarantined": "build/blob.txt.gz",
+    "original": "build/blob.txt.gz",
+    "original_absolute": "/home/me/shop/build/blob.txt.gz",
+    "moved_at": "2026-10-23T10:33:49Z",
+    "why": "gzip archive",
+    "detectors": [
+      "Stripe"
+    ],
+    "inside": [
+      "blob.txt"
+    ]
+  },
+  {
+    "quarantined": "build/keys.zip",
+    "original": "build/keys.zip",
+    "original_absolute": "/home/me/shop/build/keys.zip",
+    "moved_at": "2026-10-23T10:33:49Z",
+    "why": "zip archive",
+    "detectors": [
+      "Stripe"
+    ],
+    "inside": [
+      "conf/prod.env"
+    ]
+  }
+]
 ```
 
 (The ciphertexts are shortened here; real ones are longer.) The `.env` file,
 `src/settings.py` and `config/app.json` can be committed. `.env.keys` and
-`.secrets-quarantine/` must not be, and are now ignored.
+`.secrets-quarantine/` must not be, and are now ignored. The manifest and the
+index map every quarantined file to where it came from; a file whose quarantine
+name was already taken gets a numeric suffix (`keys.zip.1`), and the records
+carry the name actually used.
 
 ### Running it again
 
@@ -466,12 +558,16 @@ twice.
 
 ```
 $ sweep-and-secure --dry-run
-sweep-and-secure 1.3.2  (TruffleHog + dotenvx)
+sweep-and-secure 1.4.0  (TruffleHog + dotenvx)
+Log: /home/me/.local/state/sweep-and-secure/logs/2026-10-23T10-33-49Z-shop-48213.log
 Folder: /home/me/shop
+  Note: this is a security tool that changes files on purpose: it encrypts env files, rewrites
+  source files and moves files to quarantine. The changes are deliberate and it cannot undo them;
+  commit or back up first. This is a dry run: nothing is changed.
   [ok] trufflehog  3.99.3     /usr/local/bin/trufflehog
   [ok] dotenvx     2.38.2     /usr/local/bin/dotenvx
 Scanning with TruffleHog (this can take a while on big trees) ...
-  Scanned 8 file(s) in 0:03; TruffleHog reported 0 finding(s).
+  Scanned 8 file(s) in 0:02; TruffleHog reported 0 finding(s).
 
 TruffleHog found no plaintext secrets to encrypt.
 
@@ -494,12 +590,13 @@ Nothing to encrypt.
 ### Choosing which items
 
 `s` at the question takes item numbers (`1 3 5-7`, or `all`). Here only the AWS
-pair is encrypted; everything else, the archives included, is left in place:
+pair is encrypted; everything else, the quarantine candidates included, is left
+in place and counted as needing attention:
 
 ```
-Encrypt 6 secret(s) and move 2 archive(s) to quarantine now? [y/N/s]  (s = choose which): s
-Numbers to encrypt (e.g. 1 3 5-7, or 'all'; empty to go back): 6 7
-Selected: #6 AWS_ACCESS_KEY_ID, #7 AWS_SECRET_ACCESS_KEY
+Encrypt 6 secret(s) and move 3 file(s) to quarantine now? [y/N/s]  (s = choose which): s
+Numbers to encrypt (e.g. 1 3 5-7, or 'all'; empty to go back): 7-8
+Selected: #7 AWS_ACCESS_KEY_ID, #8 AWS_SECRET_ACCESS_KEY
 Go ahead with these 2? [Y/n]: y
   [ok] added .env.keys* to /home/me/shop/.gitignore
 
@@ -509,7 +606,7 @@ Encrypting ...
 
   [ok] private key file: .env.keys
 
-Done: 2 secret(s) stored encrypted; 2 plaintext occurrence(s) removed from 1 file(s)
+Done: 2 secret(s) stored encrypted; 2 plaintext occurrence(s) removed from 1 file(s); 3 file(s) need manual attention (see above)
 ```
 
 ### Saying no
@@ -522,7 +619,7 @@ plaintext copy of an env file. Names starting with `.sweep-and-secure-` are
 reserved for that staging.)
 
 ```
-Encrypt 6 secret(s) and move 2 archive(s) to quarantine now? [y/N/s]  (s = choose which): n
+Encrypt 6 secret(s) and move 3 file(s) to quarantine now? [y/N/s]  (s = choose which): n
 Nothing encrypted.
 $ echo $?
 2
@@ -531,26 +628,28 @@ $ echo $?
 ### Unattended runs: scripts and CI
 
 `--yes` encrypts everything listed without asking. It never moves files it was
-not told to, so archives stay where they are unless `--quarantine` is given:
+not told to, so the files that cannot be fixed in place stay where they are
+unless `--quarantine` is given:
 
 ```
 $ sweep-and-secure --yes
 ...
-Archives holding secrets: 2  (not rewritten; with --yes, pass --quarantine to move them out of the tree)
-  #  Archive                   File inside    Secrets           Action
-  -  build/blob.txt.gz (gzip)  blob.txt       Stripe sk_l...23  stays in place (pass --quarantine to move it)
-  -  build/keys.zip (zip)      conf/prod.env  Stripe sk_l...fE  stays in place (pass --quarantine to move it)
+Files holding secrets that cannot be fixed in place: 3  (not rewritten; with --yes, pass --quarantine to move them out of the tree)
+  #  File               Why / inside        Secrets           Action
+  -  .env.example       example env file    Stripe sk_l...23  stays in place (pass --quarantine to move it)
+  -  build/blob.txt.gz  gzip: blob.txt      Stripe sk_l...23  stays in place (pass --quarantine to move it)
+  -  build/keys.zip     zip: conf/prod.env  Stripe sk_l...fE  stays in place (pass --quarantine to move it)
 ...
-Done: 5 secret(s) stored encrypted; 5 plaintext occurrence(s) removed from 3 file(s); 2 need manual attention (see above)
+Done: 5 secret(s) stored encrypted; 5 plaintext occurrence(s) removed from 3 file(s); 3 file(s) need manual attention (see above)
 ```
 
 ```
 $ sweep-and-secure --yes --quarantine
 ...
+  [ok] .env.example: moved to .secrets-quarantine/.env.example
   [ok] build/blob.txt.gz: moved to .secrets-quarantine/build/blob.txt.gz
   [ok] build/keys.zip: moved to .secrets-quarantine/build/keys.zip
-...
-Done: 5 secret(s) stored encrypted; 5 plaintext occurrence(s) removed from 3 file(s); 2 archive(s) moved to .secrets-quarantine
+Done: 5 secret(s) stored encrypted; 5 plaintext occurrence(s) removed from 3 file(s); 3 file(s) moved to .secrets-quarantine
 ```
 
 The exit code tells a script how it went: 0 done, 1 something failed (the
@@ -571,8 +670,12 @@ Plaintext secrets found: 9 in 5 file(s)
   1   env file      PORT                   ***        .env:1                    encrypt in place
   2   Stripe        STRIPE_SECRET_KEY      sk_l...23  .env:2                    encrypt in place
   3   env file      APP_NAME               ***        .env:3                    encrypt in place
-  6   env file      LOG_LEVEL              ***        config/.env.production:8  encrypt in place
-  7   SlackWebhook  SLACK_WEBHOOK          http...wX  config/app.json:5         move to .env, replace with ${SLACK_WEBHOOK}
+  7   env file      LOG_LEVEL              ***        config/.env.production:8  encrypt in place
+  8   SlackWebhook  SLACK_WEBHOOK          http...wX  config/app.json:5         move to .env, replace with ${SLACK_WEBHOOK}
+  9   SlackWebhook  SLACK_WEBHOOK          http...wX  docs/notes.md:4           replace with ${SLACK_WEBHOOK} (value already in .env)
+  10  AWS           AWS_ACCESS_KEY_ID      AKIA...M2  src/settings.py:2         move to .env, replace with ${AWS_ACCESS_KEY_ID}
+  11  AWS           AWS_SECRET_ACCESS_KEY  1tUm...IU  src/settings.py:3         move to .env, replace with ${AWS_SECRET_ACCESS_KEY}
+  12  Postgres      DATABASE_URL           post...pp  src/settings.py:4         move to .env, replace with ${DATABASE_URL}
 ...
 ```
 
@@ -612,12 +715,13 @@ directly: `dotenvx set NEW_KEY "value"` encrypts it straight into `.env`.
   without the flag does only the rewriting.
 - Leave test fixtures alone: `sweep-and-secure --exclude '(^|/)fixtures(/|$)'`.
 - Scan `node_modules` and `.git` as well: `--no-default-excludes`.
-- Move archives to a folder outside the tree:
+- Move the quarantined files to a folder outside the tree:
   `sweep-and-secure --quarantine-dir ../quarantine`.
 - Ask TruffleHog to verify credentials against the issuing services (this
   sends them over the network): `--verify`; live ones are marked `*`.
 - Sweep a folder other than the current one: `sweep-and-secure path/to/project`.
-- See every command the script runs: `-v`.
+- See every command the script runs: `-v`. Keep the run's log somewhere else,
+  or not at all: `--log-dir DIR`, `--no-log`.
 
 ## Reference
 
@@ -673,20 +777,23 @@ directly: `dotenvx set NEW_KEY "value"` encrypts it straight into `.env`.
 - `--no-rewrite`: store the secrets encrypted but leave the source files as they
   are. A later run without the flag recognises the stored values and only does
   the rewriting; it does not store them twice.
-- `--quarantine`: with `--yes`, also move every archive that TruffleHog found a
-  secret inside (zip, jar, tar, gz, bz2, xz, 7z, rar, zstd ...) out of the tree
-  into the quarantine folder, `.secrets-quarantine` inside the swept folder by
-  default, keeping its relative path (`build/keys.zip` becomes
+- `--quarantine`: with `--yes`, also move every file that holds a secret and
+  cannot be fixed in place (archives, binaries, PDFs, generated lock files,
+  example env files, files too large or unreadable, text files whose only
+  secrets are encoded, too short or unstorable) out of the tree into the
+  quarantine folder, `.secrets-quarantine` inside the swept folder by default,
+  keeping its relative path (`build/keys.zip` becomes
   `.secrets-quarantine/build/keys.zip`, with a numeric suffix if that name is
-  taken). The folder's `MANIFEST.txt` gets a line per file with the time, the
-  original path, the detectors and the files inside that held the secrets. The
+  taken). The folder's `MANIFEST.txt` gets a line per file and its `index.json`
+  a record per file: the time, the stored name, the original path, the reason,
+  the detectors and, for archives, the files inside that held the secrets. The
   folder is added to `.gitignore` before anything is moved and is never scanned
-  afterwards. An interactive run offers this without the flag: archives appear
+  afterwards. An interactive run offers this without the flag: the files appear
   as numbered items ("move to ..."), `y` includes them and `s` lets you leave
-  them out. Every run, with or without the flag, lists the archives in their own
-  section with the files inside that hold the secrets, so you can see what you
-  would be moving. Other binary files are never moved; they stay under "cannot
-  fix automatically".
+  them out. Every run, with or without the flag, lists these files in their own
+  section with the reason, so you can see what you would be moving. A text file
+  some of whose secrets are fixed in place is never moved; symbolic links are
+  never moved.
 - `--quarantine-dir DIR`: use DIR as the quarantine folder instead (relative to
   the swept folder, or absolute, including a folder outside the tree); implies
   `--quarantine`. A folder inside the tree is excluded from the scan for that
@@ -718,6 +825,10 @@ directly: `dotenvx set NEW_KEY "value"` encrypts it straight into `.env`.
 - `-v`, `--verbose`: print every command run (TruffleHog, `dotenvx encrypt`, and
   the `dotenvx get` calls that verify each stored value) and the tools' output.
   Secret values are never printed, only key names and masked previews.
+- `--log-dir DIR`: write this run's log into DIR instead of the user's log folder
+  (`~/.local/state/sweep-and-secure/logs`, `~/Library/Logs/sweep-and-secure`,
+  `%LOCALAPPDATA%\sweep-and-secure\logs`; `SWEEP_AND_SECURE_LOG_DIR` also
+  overrides it). `--no-log`: write no log. The newest 100 logs are kept.
 - `--no-color`: plain output. Colour is only used on a terminal, and the
   `NO_COLOR` environment variable has the same effect.
 - `-h`, `--help`: the short reference. `--version`: print
@@ -746,7 +857,7 @@ it yourself for a downloaded `sweep_and_secure.py`, from the folder it was
 downloaded into:
 
 ```
-curl -sSfL -O https://github.com/voxgig/sweep-and-secure/releases/download/v1.3.2/SHA256SUMS
+curl -sSfL -O https://github.com/voxgig/sweep-and-secure/releases/download/v1.4.0/SHA256SUMS
 ```
 
 ```
@@ -760,13 +871,19 @@ On macOS use `shasum -a 256 -c -` in place of `sha256sum -c -`.
 * TruffleHog only knows the credential formats it has detectors for; a plain
   `DB_PASSWORD=hunter2` in a `.env` file is listed under "other plaintext keys"
   and is encrypted only with `--env-all`.
-* Secrets inside binaries, PDFs, lock files or base64-encoded text are reported
-  but not rewritten. Archives (TruffleHog looks inside them) are not rewritten
-  either; they can only be moved to the quarantine folder as a whole. The
-  listing shows which files inside hold the secrets for zip, tar (any
-  compression), gzip, bzip2 and xz archives, nested up to three deep and up to
-  512 MB of content; 7z, rar and zstd archives cannot be opened from here and
-  are listed with their secrets only.
+* Several TruffleHog detectors match long random-looking strings, so package
+  integrity hashes in `package-lock.json`, `yarn.lock`, `go.sum` and Python lock
+  files show up as findings. Matches that sit inside such a hash are set aside
+  and counted rather than treated as secrets. A lock file that still appears in
+  the listing holds something outside a hash, such as a token in a registry URL,
+  and `--verify` lets TruffleHog confirm a credential against its service.
+* Secrets inside binaries, PDFs, lock files or base64-encoded text are never
+  rewritten; such files can only be moved to the quarantine folder as a whole,
+  and so can archives (TruffleHog looks inside them). The listing shows which
+  files inside hold the secrets for zip, tar (any compression), gzip, bzip2 and
+  xz archives, nested up to three deep and up to 512 MB of content; 7z, rar and
+  zstd archives cannot be opened from here and are listed with their secrets
+  only.
 * dotenvx expands `$NAME` and backslash escapes in double-quoted and backtick
   values and keeps `\"` and `\\` as they are, so a value containing an apostrophe
   together with a backslash (or with a backtick and a double quote) cannot be
@@ -800,7 +917,7 @@ wheel, runs the console script and exercises `install.sh` with and without the
 tools present.
 
 To release: set `__version__` in `sweep_and_secure.py`, merge, then either push
-a matching tag (`git tag v1.3.2 && git push origin v1.3.2`) or run the release
+a matching tag (`git tag v1.4.0 && git push origin v1.4.0`) or run the release
 workflow from the Actions tab with the version, which creates the tag for you.
 The workflow (`.github/workflows/release.yml`) checks that the tag matches the
 version, runs the tests, builds the sdist and wheel, and publishes a GitHub
