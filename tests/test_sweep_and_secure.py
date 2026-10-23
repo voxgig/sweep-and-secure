@@ -1070,7 +1070,7 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("decrypts them is in .env.keys next to each env file. Day to day you use dotenvx itself, not this tool:", out)
         self.assertRegex(out, r"dotenvx native up\s+moves the private key from \.env\.keys into the %s, so that nothing is"
                               r" left on disk" % re.escape(store))
-        self.assertIn("then in .env.keys\n  next to the env file, then in the %s." % store, out)
+        self.assertRegex(out, r"then in \.env\.keys\s+next to the env file, then in the %s\." % re.escape(store))
         self.assertIn("Docs: https://dotenvx.com/docs", out)
         self.assertIn("# -fk .env.keys", self.tree.read(".env"))
         # a key that exists already is left alone, even with a store at hand
