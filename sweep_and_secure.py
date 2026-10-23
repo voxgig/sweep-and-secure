@@ -278,13 +278,23 @@ INTEGRITY_HASH_RE = re.compile(br"(?:\bsha1-[A-Za-z0-9+/]{27}=?|\bsha256-[A-Za-z
 # The other long random strings a generated lock file is made of: bare checksums and commit ids, hex of
 # a digest's length (a commit id, the sha1 URL fragment in yarn.lock, Cargo.lock's checksum, yarn berry's
 # 10c0/...) or base64 of one (packages.lock.json's contentHash). TruffleHog's keyword detectors take
-# them for tokens when a package is called cloudflare, sentry, datadog ... A credential can only sit in
-# a URL there (user:secret@host, ?token=secret) or after a telling word, which LOCK_CREDENTIAL_RE spots.
+# them for tokens when a package is called cloudflare, sentry, datadog ... One is set aside only where
+# it is seen to be public: a URL's fragment or path (LOCK_URL_CONTEXT_RE), a checksum, revision or
+# reference field, a mix.lock entry (LOCK_FIELD_CONTEXT_RE), or an entry of a checksum section such as
+# Podfile.lock's SPEC CHECKSUMS (LOCK_SECTION_RE on the header line); and never where it looks like a
+# credential: a URL's user information (user:secret@host), after an equals sign (?token=secret) or after
+# a telling word (LOCK_CREDENTIAL_RE). Anything else in a lock file stays a finding.
 LOCK_DIGEST_RE = re.compile(br"(?<![0-9A-Za-z+=])(?:[0-9a-fA-F]{128}|[0-9a-fA-F]{96}|[0-9a-fA-F]{64}|[0-9a-fA-F]{40}"
                             br"|[0-9a-fA-F]{32}|[A-Za-z0-9+/]{86}==|[A-Za-z0-9+/]{64}|[A-Za-z0-9+/]{43}=|[A-Za-z0-9+/]{27}=)"
                             br"(?![0-9A-Za-z+/=])")
 LOCK_CREDENTIAL_RE = re.compile(br"(?i)(?:token|passw(?:or)?d|pwd|secret|auth|api[_-]?key|access[_-]?key|private|credential)"
                                 br"[^0-9A-Za-z]{0,8}$")
+LOCK_URL_CONTEXT_RE = re.compile(br"://[^\s\"'<>]*(?:[#/]|[\"']\s*:\s*[\"'])$")   # ...tgz#<digest>, .../tar.gz/<digest>, "<url>": "<digest>"
+LOCK_FIELD_CONTEXT_RE = re.compile(br"(?i)(?:integrity|checksum|hash|sha(?:1|256|384|512)?|md5|digest|reference|revision|\b[pr]?rev"
+                                   br"|commit|resolved|resolution|version|shasum|head|signature|fingerprint)s?[\"']?\s*[:=]\s*[\"']?"
+                                   br"(?:[0-9a-z]{1,8}[/:])?\s*$"
+                                   br"|\{:(?:hex|git),")   # mix.lock: {:hex, :name, "1.0.0", "<checksum>", ...}
+LOCK_SECTION_RE = re.compile(br"(?i)integrity|checksum|hash|digest|revision|commit|resolution|sha(?:1|256|384|512)?\b")
 
 ALWAYS_EXCLUDES = [
     r"(^|[/\\])\.env\.keys(\.[^/\\]*)?$",   # dotenvx private keys: .env.keys, .env.keys.bak ... (files, not folders)
@@ -1717,12 +1727,29 @@ def inside_integrity_hash(finding, data):
     return found
 
 
+def section_header(data, line_start, indent):
+    """The nearest line above the one at line_start that is indented less than indent: the header
+    of the YAML-like section the line belongs to (Podfile.lock's SPEC CHECKSUMS:, a hashes = [ block).
+    b"" when there is none within 400 lines, or the line is not indented."""
+    pos = line_start
+    for _ in range(400):
+        if pos <= 0 or indent <= 0:
+            return b""
+        prev_start = data.rfind(b"\n", 0, pos - 1) + 1
+        prev = data[prev_start:pos - 1].rstrip(b"\r")
+        stripped = prev.lstrip()
+        if stripped and len(prev) - len(stripped) < indent:
+            return prev
+        pos = prev_start
+    return b""
+
+
 def lockfile_identifier(finding, data):
     """In a generated lock file: True when every occurrence of the reported text is a bare checksum
-    or commit id (LOCK_DIGEST_RE) that does not sit in a URL's user information (user:secret@host),
-    after an equals sign (?token=secret) or after a telling word ("password": ...). Lock files are
-    made of such strings, and a credential can only sit in a URL there. False when the text is not
-    found at all."""
+    or commit id (LOCK_DIGEST_RE) in a place seen to be public (a URL's fragment or path, a checksum,
+    revision or reference field, a mix.lock entry, an entry of a checksum section) and in none that
+    looks like a credential (a URL's user information, after an equals sign or after a telling word).
+    Anything else, and text that is not found at all, is False: it stays a finding."""
     if not data:
         return False
     found = False
@@ -1745,6 +1772,10 @@ def lockfile_identifier(finding, data):
             before, after = line[:span.start()], line[span.end():]
             if after.lstrip()[:1] == b"@" or before.rstrip()[-1:] == b"=" or LOCK_CREDENTIAL_RE.search(before):
                 return False   # a credential, whatever its shape
+            if not (LOCK_URL_CONTEXT_RE.search(before) or LOCK_FIELD_CONTEXT_RE.search(before)):
+                header = section_header(data, line_start, len(line) - len(line.lstrip()))
+                if not LOCK_SECTION_RE.search(header):
+                    return False   # a digest nobody vouches for: it is listed
             start = data.find(needle, start + 1)
     return found
 

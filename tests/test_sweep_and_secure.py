@@ -1734,20 +1734,32 @@ class UnitTests(unittest.TestCase):
         def finding(raw):
             return sas.Finding("x", 1, "CloudflareApiToken", raw, "", False, "PLAIN", {})
 
+        # public: a URL's fragment or path, a checksum / revision / reference field, a mix.lock entry
         public = ('resolved "https://registry.yarnpkg.com/cloudflare/-/cloudflare-1.0.0.tgz#%s"',
+                  '"url": "https://api.github.com/repos/acme/thing/zipball/%s",',
+                  '"https://deno.land/std@0.224.0/path/mod.ts": "%s",',
                   '      "reference": "%s",', '  revision: %s', '  checksum: 10c0/%s', 'checksum = "%s"',
-                  '"resolved": "git+ssh://git@github.com/cloudflare/x.git#%s"', '  Sentry: %s', '"rev": "%s",')
+                  'digest = "1:%s"', '"resolved": "git+ssh://git@github.com/cloudflare/x.git#%s"', '"rev": "%s",',
+                  '      "revision" : "%s",', '"RemoteSha": "%s",', '      sha256: "%s"', '  :commit: %s',
+                  '  "sentry": {:hex, :sentry, "10.0.0", "%s", [:mix], [], "hexpm", "0123"},')
         for line in public:
             self.assertTrue(sas.lockfile_identifier(finding(sha1), (line % sha1).encode("utf-8")), line)
         self.assertTrue(sas.lockfile_identifier(finding(sha1 * 3 + "deadbeef"), ("  checksum: 10c0/%s\n" % (sha1 * 3 + "deadbeef")).encode("utf-8")))
         self.assertTrue(sas.lockfile_identifier(finding(b64[10:50]), ('"contentHash": "%s"\n' % b64).encode("utf-8")))
-        self.assertTrue(sas.lockfile_identifier(finding(sha1), ("#%s\n#%s\n" % (sha1, sha1)).encode("utf-8")))   # every occurrence
+        # an entry of a checksum section (Podfile.lock), a hashes block (.terraform.lock.hcl): the header vouches
+        self.assertTrue(sas.lockfile_identifier(finding(sha1), ("SPEC CHECKSUMS:\n  Sentry: %s\n  Other: abc\n" % sha1).encode("utf-8")))
+        self.assertTrue(sas.lockfile_identifier(finding(sha1), ('  hashes = [\n    "h1:abc=",\n    "zh:%s",\n  ]\n' % sha1).encode("utf-8")))
+        self.assertTrue(sas.lockfile_identifier(finding(sha1), ("#x\nresolved \"https://a/b.tgz#%s\"\nresolved \"https://a/c.tgz#%s\"\n" % (sha1, sha1)).encode("utf-8")))   # every occurrence
+        # a credential, whatever its shape; and a digest nobody vouches for stays a finding
         credentials = ('resolved "https://cloudflare:%s@npm.example.com/x.tgz"', 'tarball: https://npm.example.com/x.tgz?token=%s',
-                       '"token": "%s"', '  password: %s', 'NPM_TOKEN = %s', 'https://%s@npm.example.com/x.tgz')
+                       '"token": "%s"', '  password: %s', 'NPM_TOKEN = %s', 'https://%s@npm.example.com/x.tgz',
+                       '"key": "%s"', '  Sentry: %s', '%s', '  value: %s', '"authToken": "%s"')
         for line in credentials:
             self.assertFalse(sas.lockfile_identifier(finding(sha1), (line % sha1).encode("utf-8")), line)
+        self.assertFalse(sas.lockfile_identifier(finding(sha1), ("password:\n  %s\n" % sha1).encode("utf-8")))   # the header does not vouch
+        self.assertFalse(sas.lockfile_identifier(finding(sha1), ("#x\nresolved \"https://a/b.tgz#%s\"\nkey: %s\n" % (sha1, sha1)).encode("utf-8")))   # once unvouched
         self.assertFalse(sas.lockfile_identifier(finding(sha1[:-1]), ('#%s"' % sha1[:-1]).encode("utf-8")))   # 39 digits: not a digest
-        self.assertFalse(sas.lockfile_identifier(finding(sha1), ("#%s\nkey=%s\n" % (sha1, sha1)).encode("utf-8")))  # once as a value
+        self.assertFalse(sas.lockfile_identifier(finding(sha1), ('resolved "https://a/b.tgz#%s"\nkey=%s\n' % (sha1, sha1)).encode("utf-8")))  # once as a value
         self.assertFalse(sas.lockfile_identifier(finding(sha1), b"nothing here\n"))
         self.assertFalse(sas.lockfile_identifier(finding(sha1), b""))
         for name in ("go.sum", "Podfile.lock", "Package.resolved", "deno.lock", "mix.lock", "yarn.lock"):

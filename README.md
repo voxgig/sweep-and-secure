@@ -73,7 +73,7 @@ between:
 | a file that cannot be fixed in place: an archive TruffleHog looked inside (`.zip`, `.jar`, `.tar.gz`, ...), a binary, a PDF, a generated lock file (`package-lock.json`, `poetry.lock`, ...), an example env file (`.env.example`, `.env.sample`, ...), a file too large or unreadable, or a text file whose only secrets are encoded, shorter than `--min-length` or impossible for dotenvx to store exactly | listed in the "Files holding secrets that cannot be fixed in place" section with the reason, and for archives the files inside that hold each secret (zip, tar with any compression, gzip, bzip2 and xz are opened, nested ones too). The whole file is moved out of the tree into the quarantine folder (`.secrets-quarantine` in the swept folder, `--quarantine-dir` to change), keeping its relative path; the folder's `MANIFEST.txt` and `index.json` record where it came from, why, and which files inside held secrets. An interactive run offers this as a numbered item, so `s` can leave a file in place; a `--yes` run moves files only when `--quarantine` is given |
 | a text file some of whose secrets are fixed in place and one of which cannot be (encoded, too short, unstorable) | the fixable ones are handled; the file is listed with the other one for you to handle by hand, and is never moved, because moving it would undo the fixes |
 | a symbolic link | listed; fix the file it points to |
-| a match that sits inside a package integrity hash (`sha512-...` in `package-lock.json` or `yarn.lock`, `h1:...` in `go.sum`, `sha256:...` in a Python lock file), or that is a bare checksum or commit id in a generated lock file (the sha1 fragment of a `resolved` URL in `yarn.lock`, a commit id in `package-lock.json`, `composer.lock` or `Gemfile.lock`, the checksum in `Cargo.lock`, `mix.lock` or `Podfile.lock`) | set aside and counted, not treated as a secret: those are public identifiers that happen to match a detector's pattern, which TruffleHog's keyword detectors do whenever a package is called `cloudflare`, `sentry`, `datadog` and so on. Only a digest of its algorithm's exact length counts, a string that sits in a URL's user information (`user:secret@host`), after `=` (`?token=...`) or after a word like `token` or `password` is still a secret, and each set-aside is named in the run log |
+| a match that sits inside a package integrity hash (`sha512-...` in `package-lock.json` or `yarn.lock`, `h1:...` in `go.sum`, `sha256:...` in a Python lock file), or that is a checksum or commit id in a generated lock file where the file vouches for it: in a URL's fragment or path (the sha1 fragment of a `resolved` URL in `yarn.lock`, a commit id in `package-lock.json`), in a checksum, revision or reference field (`Cargo.lock`, `composer.lock`, `Gemfile.lock`), in a `mix.lock` entry, or under a checksum section header (`Podfile.lock`) | set aside and counted, not treated as a secret: those are public identifiers that happen to match a detector's pattern, which TruffleHog's keyword detectors do whenever a package is called `cloudflare`, `sentry`, `datadog` and so on. Only a digest of its algorithm's exact length counts; a digest in a URL's user information (`user:secret@host`), after `=` (`?token=...`), after a word like `token` or `password`, or in any place the file does not vouch for stays a finding; and each set-aside is named in the run log |
 | a program or library: `.so`, `.dll`, `.dylib`, `.exe`, `.o`, `.a`, `.pyc`, `.class`, `.wasm`, ... or a file whose first bytes say ELF, PE, Mach-O or WebAssembly | not scanned, and counted: "Skipped N compiled file(s)". A secret compiled into a program cannot be fixed here, and moving the file would break whatever uses it; what an old TruffleHog matches in such files is mostly exported symbol names (TruffleHog 3.75 and later skip them itself). `--scan-compiled` lists what TruffleHog finds in them, each match with the string around it as `strings` would show it, and never rewrites or moves them |
 
 Variable names come from the code around the secret (`AWS_SECRET_ACCESS_KEY =
@@ -895,16 +895,18 @@ On macOS use `shasum -a 256 -c -` in place of `sha256sum -c -`.
   files show up as findings, and their keyword detectors take the sha1 URL
   fragments, commit ids and checksums next to a package called `cloudflare`,
   `sentry` or `datadog` for tokens (every release from 3.0 to 3.99 does this).
-  Matches that sit inside such a hash, and bare checksums or commit ids in a
-  generated lock file, are set aside and counted rather than treated as
-  secrets, and the run log names each one. A string counts as a hash only at
-  its algorithm's exact length (88 characters for `sha512-`, 44 for `h1:`, 40,
-  64 or 128 hex digits for a bare digest), so a shorter or longer random string
-  is never taken for one, and a string in a URL's user information or after
-  `=` or a word like `token` stays a finding. A lock file that still appears in
-  the listing holds something like that, such as a token in a registry URL; its
-  row names the detector and the line, and `--verify` lets TruffleHog confirm a
-  credential against its service.
+  Matches that sit inside such a hash, and checksums or commit ids that a
+  generated lock file vouches for (in a URL's fragment or path, a checksum,
+  revision or reference field, a `mix.lock` entry or a checksum section), are
+  set aside and counted rather than treated as secrets, and the run log names
+  each one. A string counts as a hash only at its algorithm's exact length (88
+  characters for `sha512-`, 44 for `h1:`, 40, 64 or 128 hex digits for a bare
+  digest), so a shorter or longer random string is never taken for one, and a
+  digest in a URL's user information, after `=` or a word like `token`, or in
+  a place the file does not vouch for, stays a finding. A lock file that still
+  appears in the listing holds something like that, such as a token in a
+  registry URL; its row names the detector and the line, and `--verify` lets
+  TruffleHog confirm a credential against its service.
 * Programs and libraries (`.so`, `.dll`, `.exe`, `.pyc`, ...) are not scanned
   unless `--scan-compiled` is given, and are never changed. TruffleHog releases
   before 3.75 read them as raw bytes and match exported symbol names: in a test
