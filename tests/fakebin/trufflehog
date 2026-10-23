@@ -10,9 +10,15 @@ It understands just enough of the real command line:
 and prints TruffleHog-shaped JSON lines for a handful of secret patterns.
 Set FAKE_TRUFFLEHOG_FAIL=1 to make it exit with status 1 before scanning, or
 FAKE_TRUFFLEHOG_PARTIAL=1 to exit with status 1 after printing its findings.
+FAKE_TRUFFLEHOG_VINTAGE=3.12 (or 3.20, 3.40, ...) makes it behave like that old release,
+as measured against the real ones: before 3.80 --log-level is an unknown flag, before 3.34
+the folder must come as --directory=PATH, before 3.28 --exclude-paths is unknown, and
+before 3.20 Raw is base64 of the bytes with no DecoderName or RawV2 (so an AWS key pair
+is reported as its id alone).
 """
 from __future__ import print_function
 
+import base64
 import gzip
 import io
 import json
@@ -20,6 +26,9 @@ import os
 import re
 import sys
 import zipfile
+
+VINTAGE = tuple(int(part) for part in os.environ.get("FAKE_TRUFFLEHOG_VINTAGE", "").split(".") if part.isdigit())
+LEGACY_JSON = bool(VINTAGE) and VINTAGE < (3, 20)
 
 DETECTORS = [
     ("Github", re.compile(r"\bghp_[A-Za-z0-9]{36}\b"),
@@ -46,7 +55,16 @@ def emit(path, text, offset, detector, raw, raw_v2, extra, decoder="PLAIN"):
         "Verified": False, "Raw": raw, "RawV2": raw_v2, "Redacted": raw[:6] + "...",
         "ExtraData": extra or None,
     }
+    if LEGACY_JSON:  # Go bytes shown as base64, no decoder, no RawV2
+        obj["Raw"] = base64.b64encode(raw.encode("utf-8")).decode("ascii")
+        del obj["DecoderName"]
+        del obj["RawV2"]
     sys.stdout.write(json.dumps(obj) + "\n")
+
+
+def kingpin_error(message):
+    sys.stderr.write("trufflehog: error: %s, try --help\n" % message)
+    return 1
 
 
 def scan_file(path, log_level=0):
@@ -88,7 +106,7 @@ def scan_file(path, log_level=0):
 
 def main(argv):
     if "--version" in argv:
-        print("trufflehog 3.99.0")
+        print("trufflehog %s" % (".".join(str(p) for p in VINTAGE) + ".0" if VINTAGE else "3.99.0"))
         return 0
     if os.environ.get("FAKE_TRUFFLEHOG_FAIL"):
         sys.stderr.write("fake trufflehog: simulated failure\n")
@@ -96,7 +114,16 @@ def main(argv):
     if len(argv) < 2 or argv[0] != "filesystem":
         sys.stderr.write("fake trufflehog: usage: trufflehog filesystem ROOT --json\n")
         return 2
-    root = argv[1]
+    if VINTAGE and VINTAGE < (3, 80) and any(arg.startswith("--log-level") for arg in argv):
+        return kingpin_error("unknown long flag '--log-level'")
+    if VINTAGE and VINTAGE < (3, 28) and "--exclude-paths" in argv:
+        return kingpin_error("unknown long flag '--exclude-paths'")
+    if argv[1].startswith("--directory="):
+        root = argv[1].split("=", 1)[1]
+    elif VINTAGE and VINTAGE < (3, 34):
+        return kingpin_error("unexpected %s" % argv[1])
+    else:
+        root = argv[1]
     log_level = 0
     for arg in argv:
         if arg.startswith("--log-level="):

@@ -168,7 +168,7 @@ Without installing anything, straight from the repository:
 uvx --from git+https://github.com/voxgig/sweep-and-secure sweep-and-secure --dry-run
 ```
 
-To pin a release, append `@v1.3.1` to the git URL, or pass `-v v1.3.1` to the
+To pin a release, append `@v1.3.2` to the git URL, or pass `-v v1.3.2` to the
 installer. To upgrade, run the same command again (`pipx upgrade
 sweep-and-secure` or `uv tool upgrade sweep-and-secure` for those routes). The
 installer takes `-b DIR` for another folder (without `-b` it uses
@@ -181,8 +181,8 @@ run `python sweep_and_secure.py` from wherever it sits.
 
 ### 2. Install TruffleHog and dotenvx
 
-sweep-and-secure needs both on your `PATH`: TruffleHog 3.x finds the secrets,
-dotenvx 1.0 or newer encrypts them. Skip whichever you already have.
+sweep-and-secure needs both on your `PATH`: TruffleHog (3.6 or newer) finds the
+secrets, dotenvx (1.4 or newer) encrypts them. Skip whichever you already have.
 
 TruffleHog with Homebrew (macOS, Linux):
 
@@ -221,6 +221,21 @@ that is not on your `PATH` can be pointed at with `--trufflehog PATH` and
 `--dotenvx PATH`, or the `TRUFFLEHOG_BIN` and `DOTENVX_BIN` environment
 variables; a project-local `node_modules/.bin/dotenvx` is found on its own.
 
+**Older releases are used as they are.** Old machines are a normal target for
+this tool, so it does not insist on a current TruffleHog: it runs the command a
+current release takes and, when the installed one rejects an option, runs again
+without it and says what that costs. Without `--log-level` (added in the 3.8x
+releases) the progress line shows findings and time but not the file being
+scanned. Without `--exclude-paths` (before about 3.28) TruffleHog scans the
+excluded folders as well; their findings are dropped by the script, so the scan
+only takes longer. Before about 3.34 the folder is passed as `--directory`.
+Releases from 3.6 to 3.12 encode their results differently and report an AWS
+key pair as the id alone; the script decodes them and finds the secret access
+key next to the id. 3.0 to 3.5 are refused, because their results do not name
+the detector, and dotenvx before 1.4 is refused because `encrypt -k` did not
+exist. An old TruffleHog does have fewer detectors (database URLs, for example,
+are found from 3.70 on), so updating it is still worth doing when you can.
+
 ### 3. Check the setup
 
 ```
@@ -237,7 +252,7 @@ everything.
 
 ```
 $ sweep-and-secure --check-setup
-sweep-and-secure 1.3.1  (TruffleHog + dotenvx)
+sweep-and-secure 1.3.2  (TruffleHog + dotenvx)
 Python 3.13.16 (/usr/bin/python3) on Linux-6.8.0-x86_64-with-glibc2.39
   [ok] trufflehog  3.99.3     /usr/local/bin/trufflehog
   [ok] dotenvx     2.38.2     /usr/local/bin/dotenvx
@@ -280,7 +295,7 @@ audit.
 ```
 $ cd shop
 $ sweep-and-secure --dry-run
-sweep-and-secure 1.3.1  (TruffleHog + dotenvx)
+sweep-and-secure 1.3.2  (TruffleHog + dotenvx)
 Folder: /home/me/shop
   [ok] trufflehog  3.99.3     /usr/local/bin/trufflehog
   [ok] dotenvx     2.38.2     /usr/local/bin/dotenvx
@@ -440,7 +455,7 @@ twice.
 
 ```
 $ sweep-and-secure --dry-run
-sweep-and-secure 1.3.1  (TruffleHog + dotenvx)
+sweep-and-secure 1.3.2  (TruffleHog + dotenvx)
 Folder: /home/me/shop
   [ok] trufflehog  3.99.3     /usr/local/bin/trufflehog
   [ok] dotenvx     2.38.2     /usr/local/bin/dotenvx
@@ -716,7 +731,7 @@ it yourself for a downloaded `sweep_and_secure.py`, from the folder it was
 downloaded into:
 
 ```
-curl -sSfL -O https://github.com/voxgig/sweep-and-secure/releases/download/v1.3.1/SHA256SUMS
+curl -sSfL -O https://github.com/voxgig/sweep-and-secure/releases/download/v1.3.2/SHA256SUMS
 ```
 
 ```
@@ -747,6 +762,8 @@ On macOS use `shasum -a 256 -c -` in place of `sha256sum -c -`.
 * Replacing a literal with `${KEY}` removes the secret but does not make the
   program read the variable; that is the follow-up work the script lists.
 * Only the working tree is changed, never git history.
+* An old TruffleHog release works but knows fewer credential formats, so a sweep
+  with one may find less than a sweep with the current release.
 * Python 3.8 or newer is needed. The script still carries Python 2.7
   compatibility code and may well work there, but only 3.8 to 3.13 are tested.
 
@@ -768,7 +785,7 @@ wheel, runs the console script and exercises `install.sh` with and without the
 tools present.
 
 To release: set `__version__` in `sweep_and_secure.py`, merge, then either push
-a matching tag (`git tag v1.3.1 && git push origin v1.3.1`) or run the release
+a matching tag (`git tag v1.3.2 && git push origin v1.3.2`) or run the release
 workflow from the Actions tab with the version, which creates the tag for you.
 The workflow (`.github/workflows/release.yml`) checks that the tag matches the
 version, runs the tests, builds the sdist and wheel, and publishes a GitHub

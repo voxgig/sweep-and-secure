@@ -30,6 +30,8 @@ where to get them.
 from __future__ import absolute_import, division, print_function
 
 import argparse
+import base64
+import binascii
 import bz2
 import gzip
 import hashlib
@@ -55,7 +57,7 @@ try:
 except ImportError:  # pragma: no cover - Python 2 without the backport
     lzma = None
 
-__version__ = "1.3.1"
+__version__ = "1.3.2"
 
 # --------------------------------------------------------------------------
 # Python 2 / 3 compatibility
@@ -144,8 +146,9 @@ TOOLS = OrderedDict([
             "curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh"
             " | sh -s -- -b /usr/local/bin",
         ],
-        "min_version": (3, 0, 0),
-        "why_version": "TruffleHog 3.x is needed (the 'filesystem' scanner and --json output).",
+        "min_version": (3, 6, 0),
+        "why_version": "TruffleHog 3.6 or newer is needed (JSON results that name the detector; 3.0 to 3.5"
+                       " do not). Later options it may lack are worked around.",
     }),
     ("dotenvx", {
         "job": "encrypts the secrets",
@@ -159,8 +162,8 @@ TOOLS = OrderedDict([
             "brew install dotenvx/brew/dotenvx",
             "npm install -g @dotenvx/dotenvx",
         ],
-        "min_version": (1, 0, 0),
-        "why_version": "dotenvx 1.0 or newer is needed (per-value 'encrypted:' .env files).",
+        "min_version": (1, 4, 0),
+        "why_version": "dotenvx 1.4 or newer is needed (encrypt -k encrypts one key at a time; 1.0 rejects -k).",
     }),
 ])
 
@@ -769,8 +772,9 @@ def check_setup(args, root, style):
 
 def check_trufflehog(binary, scratch, args, style):
     """Scan a scratch folder holding one harmless file with the exact TruffleHog command a
-    run uses. Proves the binary runs here and accepts the options; the file count proves the
-    progress signal (its per-file log lines) is understood."""
+    run uses. Proves the binary runs here and that its options (or the fallbacks an older
+    release needs) work; with a current TruffleHog the file count also proves the progress
+    signal (its per-file log lines) is understood."""
     probe = os.path.join(scratch, "probe.txt")
     try:
         with io.open(probe, "w", encoding="utf-8") as fh:
@@ -781,11 +785,11 @@ def check_trufflehog(binary, scratch, args, style):
         return False
     progress = ScanProgress(stream=None)
     try:
-        findings, code = run_trufflehog(binary, scratch, list(ALWAYS_EXCLUDES), args, progress)
+        findings, code, notes = run_trufflehog(binary, scratch, list(ALWAYS_EXCLUDES), args, progress)
     except ToolError as exc:
         say(style.bad(u"[!!] trufflehog could not scan a scratch folder: %s" % to_text(str(exc))), sys.stderr)
         return False
-    if progress.files < 1:
+    if progress.files_known and progress.files < 1:
         say(style.bad(u"[!!] trufflehog scanned the scratch folder but did not report the file in it;"
                       u" its progress output is not what this version of the script understands"
                       u" (the scan would still run, but without a live file count)."), sys.stderr)
@@ -794,8 +798,14 @@ def check_trufflehog(binary, scratch, args, style):
         say(style.bad(u"[!!] trufflehog reported %d finding(s) in a file that holds no secret; check the"
                       u" installed version" % len(findings)), sys.stderr)
         return False
-    say(u"  %s trufflehog  ran in a scratch folder: exit status %d, %d file(s) scanned, no findings"
-        % (style.ok("[ok]"), code, progress.files))
+    if progress.files_known:
+        say(u"  %s trufflehog  ran in a scratch folder: exit status %d, %d file(s) scanned, no findings"
+            % (style.ok("[ok]"), code, progress.files))
+    else:
+        say(u"  %s trufflehog  ran in a scratch folder: exit status %d, no findings (an older TruffleHog, used as"
+            u" it is)" % (style.ok("[ok]"), code))
+    for note in notes:
+        say(style.dim(u"       %s" % note))
     return True
 
 
@@ -869,16 +879,66 @@ class Finding(object):
         except (TypeError, ValueError):
             line = 0
         extra = obj.get("ExtraData")
+        raw, raw_v2 = to_text(obj.get("Raw") or ""), to_text(obj.get("RawV2") or "")
+        if "DecoderName" not in obj and "RawV2" not in obj:
+            # TruffleHog 3.6 to 3.12 wrote Raw as Go bytes, which its JSON shows as base64
+            raw, raw_v2 = legacy_bytes_field(raw), legacy_bytes_field(raw_v2)
         return cls(
             path=os.path.normpath(path),
             line=line,
             detector=to_text(obj.get("DetectorName") or "Unknown"),
-            raw=to_text(obj.get("Raw") or ""),
-            raw_v2=to_text(obj.get("RawV2") or ""),
+            raw=raw,
+            raw_v2=raw_v2,
             verified=bool(obj.get("Verified")),
             decoder=to_text(obj.get("DecoderName") or "PLAIN"),
             extra=extra if isinstance(extra, dict) else {},
         )
+
+
+LEGACY_BASE64_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
+AWS_ID_RE = re.compile(r"^(?:AKIA|ABIA|ACCA|ASIA)[A-Z0-9]{16}$")
+AWS_SECRET_RE = re.compile(br"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{40}(?![A-Za-z0-9+/])")
+AWS_PAIR_WINDOW = 400   # bytes either side of a key id in which its secret is looked for
+
+
+def legacy_bytes_field(text):
+    """A Raw/RawV2 value as TruffleHog 3.6 to 3.12 wrote it: base64 of the bytes. Decoded
+    when it is valid base64 holding UTF-8 text, else returned as it is."""
+    if not text or len(text) % 4 or not LEGACY_BASE64_RE.match(text):
+        return text
+    try:
+        return base64.b64decode(text).decode("utf-8")
+    except (ValueError, TypeError, binascii.Error, UnicodeDecodeError):
+        return text
+
+
+def complete_aws_pairs(findings):
+    """A TruffleHog before 3.34 reports an AWS key pair as its id alone (no RawV2 with the
+    secret access key), which would leave the secret in place. Like the current AWS detector,
+    look next to the id in the same file for the one 40-character secret and pair them, so
+    both are handled. Returns the number of pairs completed."""
+    completed = 0
+    cache = {}
+    for finding in findings:
+        if finding.detector != "AWS" or finding.raw_v2 or not AWS_ID_RE.match(finding.raw):
+            continue
+        if finding.path not in cache:
+            try:
+                data = read_bytes(finding.path) if os.path.getsize(finding.path) <= MAX_FILE_BYTES else b""
+            except (IOError, OSError):
+                data = b""
+            cache[finding.path] = b"" if b"\x00" in data else data
+        data = cache[finding.path]
+        key_id = finding.raw.encode("ascii")
+        position = data.find(key_id)
+        if position < 0:
+            continue
+        window = data[max(0, position - AWS_PAIR_WINDOW):position + len(key_id) + AWS_PAIR_WINDOW]
+        secrets = set(match.group(0) for match in AWS_SECRET_RE.finditer(window)) - set([key_id])
+        if len(secrets) == 1:
+            finding.raw_v2 = finding.raw + u":" + secrets.pop().decode("ascii")
+            completed += 1
+    return completed
 
 
 class ScanProgress(object):
@@ -897,6 +957,7 @@ class ScanProgress(object):
         self.is_tty = is_tty
         self.heartbeat = self.HEARTBEAT if heartbeat is None else heartbeat
         self.files = 0
+        self.files_known = True   # False when this TruffleHog cannot log the file it is scanning
         self.findings = 0
         self.start = time.time()
         self.last_draw = None
@@ -918,7 +979,15 @@ class ScanProgress(object):
         return u"%d:%02d" % (seconds // 60, seconds % 60)
 
     def text(self):
+        if not self.files_known:
+            return u"  scanning ... %d finding(s) so far, %s" % (self.findings, self.elapsed())
         return u"  scanning ... %d file(s), %d finding(s) so far, %s" % (self.files, self.findings, self.elapsed())
+
+    def summary(self, findings):
+        """The line printed when the scan is over."""
+        if not self.files_known:
+            return u"  Scan took %s; TruffleHog reported %d finding(s)." % (self.elapsed(), findings)
+        return u"  Scanned %d file(s) in %s; TruffleHog reported %d finding(s)." % (self.files, self.elapsed(), findings)
 
     def tick(self):
         """Called regularly by the waiting thread; draws when it is time to."""
@@ -1004,28 +1073,103 @@ def run_streaming(cmd, cwd, on_stdout, on_stderr, tick, keep_stderr=200):
     return proc.returncode, out_lines, list(err_lines)
 
 
+UNKNOWN_FLAG_RE = re.compile(r"unknown (?:long|short) flag '(-{1,2}[A-Za-z0-9-]+)'")
+UNEXPECTED_ARG_RE = re.compile(r"\berror: unexpected ")
+
+# Options a current TruffleHog takes that older 3.x releases lack (measured: --exclude-paths
+# arrived around 3.28, a positional path around 3.34, --log-level in the 3.8x releases), and
+# what a run loses without each.
+TRUFFLEHOG_OPTION_NOTES = {
+    u"--log-level": u"this TruffleHog has no --log-level, so it cannot say which file it is scanning: the"
+                    u" progress line shows findings and time only",
+    u"--exclude-paths": u"this TruffleHog has no --exclude-paths, so it scanned the excluded folders (.git,"
+                        u" node_modules, ...) as well; findings there are ignored here, but the scan takes longer",
+    u"--no-verification": u"this TruffleHog has no --no-verification, so it checked the credentials it found"
+                          u" against their services over the network",
+    u"--no-update": u"",
+}
+
+
+def drop_flag(flags, flag):
+    """Remove flag (given as --name) and any value it carries from flags; True if it was there."""
+    for index, entry in enumerate(flags):
+        if entry == flag or entry.startswith(flag + u"="):
+            takes_value = entry == flag and flag in (u"--exclude-paths",)
+            del flags[index:index + (2 if takes_value else 1)]
+            return True
+    return False
+
+
 def run_trufflehog(binary, root, exclude_patterns, args, progress=None):
-    # --log-level=3 makes TruffleHog log every file it scans to stderr: that is the
-    # progress signal; results stay on stdout as JSON lines.
-    cmd = [binary, "filesystem", root, "--json", "--no-update", "--log-level=3"]
-    if not args.verify:
-        cmd.append("--no-verification")
+    """Run TruffleHog over root and read its JSON results: (findings, exit status, notes).
+
+    The command is the one a current TruffleHog takes. An older 3.x that rejects an option
+    ("unknown long flag") is run again without it, and one that takes no path argument is
+    given --directory instead, so an old install is used as it is. The notes say what was
+    left out and what that costs. --json is the one option that cannot go: without it there
+    are no results to read."""
     exclude_file = None
     if exclude_patterns:
         handle, exclude_file = tempfile.mkstemp(prefix="sweep-and-secure-", suffix=".txt")
         with io.open(handle, "w", encoding="utf-8") as fh:
             fh.write(u"\n".join(to_text(p) for p in exclude_patterns) + u"\n")
-        cmd.extend(["--exclude-paths", exclude_file])
-    if args.verbose:
-        say(u"  $ " + u" ".join(cmd))
+    # --log-level=3 makes TruffleHog log every file it scans to stderr: that is the
+    # progress signal; results stay on stdout as JSON lines.
+    flags = [u"--json", u"--no-update", u"--log-level=3"]
+    if not args.verify:
+        flags.append(u"--no-verification")
+    if exclude_file:
+        flags.extend([u"--exclude-paths", exclude_file])
+    positional = True
+    notes = []
     if progress is None:
         progress = ScanProgress(stream=None)
     try:
-        try:
-            code, out_lines, err_lines = run_streaming(cmd, root, progress.saw_stdout, progress.saw_stderr,
-                                                      progress.tick)
-        except (OSError, IOError) as exc:
-            raise ToolError(u"could not run %s: %s" % (binary, to_text(str(exc))))
+        for attempt in range(8):
+            cmd = [binary, "filesystem"] + ([root] if positional else [u"--directory=" + root]) + flags
+            if args.verbose:
+                say(u"  $ " + u" ".join(cmd))
+            try:
+                code, out_lines, err_lines = run_streaming(cmd, root, progress.saw_stdout, progress.saw_stderr,
+                                                          progress.tick)
+            except (OSError, IOError) as exc:
+                raise ToolError(u"could not run %s: %s" % (binary, to_text(str(exc))))
+            findings = []
+            for raw in out_lines:
+                line = to_text(raw).strip()
+                if not line.startswith("{"):
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                finding = Finding.from_json(obj, root)
+                if finding is not None:
+                    findings.append(finding)
+            err = u"\n".join(to_text(line).rstrip(u"\r\n") for line in err_lines
+                             if b'"scanning file"' not in line)
+            if code == 0 or findings:
+                break
+            # No results and a non-zero status: an option this TruffleHog does not know?
+            match = UNKNOWN_FLAG_RE.search(err)
+            if match:
+                flag = match.group(1)
+                if flag == u"--json":
+                    raise ToolError(u"this TruffleHog has no --json output, so its results cannot be read;"
+                                    u" TruffleHog 3.6 or newer is needed")
+                if drop_flag(flags, flag):
+                    note = TRUFFLEHOG_OPTION_NOTES.get(flag, u"this TruffleHog has no %s; it was left out" % flag)
+                    if note:
+                        notes.append(note)
+                    continue
+            elif positional and UNEXPECTED_ARG_RE.search(err):
+                positional = False   # before about 3.34 the folder went in --directory
+                continue
+            tail = u"\n".join(err.strip().splitlines()[-8:])
+            raise ToolError(u"trufflehog exited with status %d:\n%s" % (code, tail))
+        else:
+            raise ToolError(u"trufflehog kept rejecting its options; last error:\n%s"
+                            % u"\n".join(err.strip().splitlines()[-4:]))
     finally:
         progress.finish()
         if exclude_file:
@@ -1033,28 +1177,12 @@ def run_trufflehog(binary, root, exclude_patterns, args, progress=None):
                 os.remove(exclude_file)
             except OSError:
                 pass
-    findings = []
-    for raw in out_lines:
-        line = to_text(raw).strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            obj = json.loads(line)
-        except ValueError:
-            continue
-        finding = Finding.from_json(obj, root)
-        if finding is not None:
-            findings.append(finding)
-    err = u"\n".join(to_text(line).rstrip(u"\r\n") for line in err_lines
-                     if b'"scanning file"' not in line)
-    if code != 0 and not findings:
-        tail = u"\n".join(err.strip().splitlines()[-8:])
-        raise ToolError(u"trufflehog exited with status %d:\n%s" % (code, tail))
-    say(u"  Scanned %d file(s) in %s; TruffleHog reported %d finding(s)."
-        % (progress.files, progress.elapsed(), len(findings)))
+    if not any(entry.startswith(u"--log-level") for entry in flags):
+        progress.files_known = False
+    say(progress.summary(len(findings)))
     if args.verbose and err.strip():
         say(style_dim_block(err))
-    return findings, code
+    return findings, code, notes
 
 
 def style_dim_block(text):
@@ -2835,11 +2963,17 @@ def main(argv=None):
 
     say(u"Scanning with TruffleHog (this can take a while on big trees) ...")
     try:
-        findings, code = run_trufflehog(tools["trufflehog"]["path"], root, exclude_patterns, args,
-                                        ScanProgress(sys.stdout))
+        findings, code, notes = run_trufflehog(tools["trufflehog"]["path"], root, exclude_patterns, args,
+                                               ScanProgress(sys.stdout))
     except ToolError as exc:
         say(style.bad(u"[!!] %s" % to_text(str(exc))), sys.stderr)
         return 1
+    for note in notes:
+        say(style.dim(u"  %s" % note))
+    completed = complete_aws_pairs(findings)
+    if completed:
+        say(style.dim(u"  this TruffleHog reported %d AWS key id(s) without the secret access key beside them; the"
+                      u" 40-character secret found next to each is included" % completed))
     scan_incomplete = code != 0
     if scan_incomplete:
         say(style.bad(u"[!!] trufflehog exited with status %d after reporting some results, so the scan is"

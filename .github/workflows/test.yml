@@ -51,6 +51,15 @@ jobs:
         env:
           SWEEP_TEST_REAL_TOOLS: "1"
         run: python -m unittest discover -s tests -v
+      - name: Older TruffleHog releases are used as they are
+        # 3.12: base64 results, no --exclude-paths, --directory only; 3.40: only --log-level missing
+        run: |
+          for v in 3.12.0 3.40.0; do
+            curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b "$RUNNER_TEMP/th-$v" "v$v"
+            python sweep_and_secure.py --check-setup --trufflehog "$RUNNER_TEMP/th-$v/trufflehog" | tee "check-$v.log"
+            grep -q 'an older TruffleHog, used as it is' "check-$v.log"
+            python sweep_and_secure.py --dry-run --trufflehog "$RUNNER_TEMP/th-$v/trufflehog" tests | grep -q 'Scan took'
+          done
       - name: Exercise install.sh where the tools are present (its setup check must pass)
         run: |
           mkdir fake-release
