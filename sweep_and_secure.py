@@ -37,10 +37,12 @@ import gzip
 import hashlib
 import io
 import json
+import mmap
 import os
 import platform
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
@@ -179,12 +181,13 @@ def open_run_log(args, root):
         return None, u"no run log: cannot write to %s (%s)" % (folder, to_text(str(exc)))
 
 
-def say(text=u"", stream=None):
+def say(text=u"", stream=None, log_text=None):
     """print() that never dies: odd terminal encodings, a closed pipe or a missing
     stdout (pythonw) must not take the run down half way through a rewrite. Every line
-    also goes to the run log, when there is one."""
+    also goes to the run log, when there is one (log_text in its place, when given)."""
     if RUN_LOG is not None:
-        RUN_LOG.write(text, u"" if (stream is None or stream is sys.stdout) else u"! ")
+        RUN_LOG.write(text if log_text is None else log_text,
+                      u"" if (stream is None or stream is sys.stdout) else u"! ")
     stream = stream or sys.stdout
     if stream is None:
         return
@@ -295,6 +298,20 @@ INSPECT_MAX_DEPTH = 3                        # archives inside archives inside a
 INSPECT_BUDGET_BYTES = 512 * 1024 * 1024     # uncompressed content read per archive, at most
 INSPECT_FULL_READ_BYTES = 64 * 1024 * 1024   # members up to this size are searched in memory
 INSPECT_CHUNK = 4 * 1024 * 1024              # bigger members are searched in chunks of this size
+# Compiled code: programs and libraries. A secret compiled into one cannot be fixed here, and moving
+# the file breaks whatever uses it, while what an old TruffleHog matches in them is mostly symbol
+# names and random bytes (TruffleHog 3.75 and later skip them itself). Recognised by name and by the
+# first bytes; not scanned unless --scan-compiled, and then only listed.
+COMPILED_EXTENSIONS = ("so", "dll", "dylib", "exe", "o", "a", "pyc", "pyo", "pyd", "class", "wasm", "node",
+                       "ko", "ocx", "dex", "elf")   # not .sys, .obj, .lib: text files carry those names too
+COMPILED_NAME_PATTERN = r"(?i)\.(%s)(?:\.\d+)*$" % "|".join(COMPILED_EXTENSIONS)   # libz.so.1.2 too
+COMPILED_NAME_RE = re.compile(COMPILED_NAME_PATTERN)
+COMPILED_MAGIC = [
+    (b"\x7fELF", u"ELF binary"), (b"\xfe\xed\xfa\xce", u"Mach-O binary"), (b"\xce\xfa\xed\xfe", u"Mach-O binary"),
+    (b"\xfe\xed\xfa\xcf", u"Mach-O binary"), (b"\xcf\xfa\xed\xfe", u"Mach-O binary"),
+    (b"\xca\xfe\xba\xbe", u"Mach-O or Java class"), (b"\x00asm", u"WebAssembly module"),
+]
+TRUFFLEHOG_SKIPS_COMPILED = (3, 75, 0)   # measured: 3.70 reads an ELF library, 3.75 and later do not
 # Skipped unless --no-default-excludes: version control, vendored and generated trees.
 DEFAULT_EXCLUDES = [
     r"(^|[/\\])\.git([/\\]|$)",
@@ -578,6 +595,103 @@ def archive_kind(path):
         if name.endswith(ext):
             return ext.lstrip(".")
     return None
+
+
+def read_head(path, size=4096):
+    """The first bytes of a file; b"" when it cannot be read."""
+    try:
+        with io.open(path, "rb") as fh:
+            return fh.read(size)
+    except (IOError, OSError):
+        return b""
+
+
+def compiled_kind(path, cache=None):
+    """'.so file', 'ELF binary', 'Windows PE binary' ... when the file is compiled code, a program
+    or a library, by its name or by its first bytes; else None."""
+    if cache is not None and path in cache:
+        return cache[path]
+    kind = None
+    match = COMPILED_NAME_RE.search(os.path.basename(path))
+    if match:
+        kind = u".%s file" % match.group(1).lower()
+    else:
+        head = read_head(path)
+        for magic, label in COMPILED_MAGIC:
+            if head.startswith(magic):
+                kind = label
+                break
+        if kind is None and head[:2] == b"MZ" and len(head) >= 64:
+            # a DOS stub followed by the PE header: an .exe or .dll without its extension
+            offset = struct.unpack("<I", head[60:64])[0]
+            if 64 <= offset <= len(head) - 4 and head[offset:offset + 4] == b"PE\x00\x00":
+                kind = u"Windows PE binary"
+    if cache is not None:
+        cache[path] = kind
+    return kind
+
+
+class CompiledFile(object):
+    """A program or library TruffleHog reported secrets in (--scan-compiled): listed, never changed."""
+
+    def __init__(self, path, kind):
+        self.path = path
+        self.kind = kind
+        self.findings = []
+
+
+def strings_near(path, finding, secrets, width=40):
+    """What surrounds the reported text in the file, the way `strings` shows it: the printable run
+    around its first occurrence, cut at NUL bytes and line ends and at most width characters either
+    side, with every secret reported for the file masked. u"" when the text is not in the file as
+    such (an encoded match) or the file cannot be read."""
+    needles = []
+    for candidate in candidate_secrets(finding):
+        needle = to_bytes(candidate)
+        # an old TruffleHog sometimes reports a byte or two beyond the string: try without them too
+        for trimmed in (needle, needle[:-1], needle[:-2]) if len(needle) > 16 else (needle,):
+            if trimmed and trimmed not in needles:
+                needles.append(trimmed)
+    if not needles:
+        return u""
+    pad = width + max([len(secret) for secret in secrets] + [0])   # room to mask a secret that starts in view
+    try:
+        with io.open(path, "rb") as fh:
+            try:
+                view = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+            except (ValueError, EnvironmentError):   # an empty file, or a file system without mmap
+                view = fh.read(INSPECT_FULL_READ_BYTES)
+            try:
+                total = len(view)
+                for needle in needles:
+                    start = view.find(needle)
+                    if start >= 0:
+                        break
+                else:
+                    return u""
+                lo, hi = max(0, start - pad), min(total, start + len(needle) + pad)
+                chunk = bytearray(view[lo:hi])
+            finally:
+                if hasattr(view, "close"):
+                    view.close()
+    except (IOError, OSError, ValueError):
+        return u""
+    pos = start - lo
+    begin, end = pos, pos + len(needle)
+    while begin > 0 and 0x20 <= chunk[begin - 1] <= 0x7e:
+        begin -= 1
+    while end < len(chunk) and 0x20 <= chunk[end] <= 0x7e:
+        end += 1
+    left, right = bytes(chunk[begin:pos]), bytes(chunk[pos + len(needle):end])
+    # Mask before clipping, so that a reported secret cut by the edge of the view cannot show in part.
+    # (A secret TruffleHog did not report cannot be masked; the width keeps what is shown short.)
+    for secret in sorted(set(secrets), key=len, reverse=True):
+        hidden = to_bytes(mask(to_text(secret)))
+        left, right = left.replace(secret, hidden), right.replace(secret, hidden)
+    clipped_left = len(left) > width or (begin == 0 and lo > 0)
+    clipped_right = len(right) > width or (end == len(chunk) and hi < total)
+    text = to_text(left[-width:] if width else b"") + mask(to_text(needle)) + to_text(right[:width])
+    return (u"..." if clipped_left else u"") + text + (u"..." if clipped_right else u"")
 
 
 def find_closing_quote(body, quote):
@@ -1295,11 +1409,12 @@ def style_dim_block(text):
 # What is already in the env files
 # --------------------------------------------------------------------------
 
-def inventory_env_files(root, exclude_res, protect=()):
+def inventory_env_files(root, exclude_res, protect=(), compiled=None):
     """Return (encrypted, plaintext, stale) over all dotenv files: lists of
     (path, key, line) / (path, key, line, value), and the staging files or folders
     an earlier interrupted run left behind. Paths in protect (the store) are never
-    reported as stale, whatever they are called."""
+    reported as stale, whatever they are called. When a list is passed as compiled,
+    every file whose name says compiled code (.so, .dll, .pyc, ...) is added to it."""
     protected = set(os.path.normpath(path) for path in protect)
     encrypted, plaintext, stale = [], [], []
     for dirpath, dirnames, filenames in os.walk(root):
@@ -1316,6 +1431,9 @@ def inventory_env_files(root, exclude_res, protect=()):
             if name.startswith(TEMP_PREFIX) and os.path.normpath(path) not in protected:
                 stale.append(path)
                 continue
+            if (compiled is not None and COMPILED_NAME_RE.search(name) and not os.path.islink(path)
+                    and not is_excluded(path, exclude_res)):
+                compiled.append(path)
             if not is_env_file(name) or is_example_env_file(name):
                 continue
             if is_excluded(path, exclude_res) or os.path.islink(path):
@@ -1390,6 +1508,9 @@ class Plan(object):
         self.plain_env = []          # (path, key, line, value) unflagged plaintext env keys
         self.extra_env_keys = {}     # env path -> [keys] that must be encrypted as well
         self.ignored = 0             # findings inside excluded folders (TruffleHog on Windows)
+        self.compiled = OrderedDict()  # path -> CompiledFile: findings in programs and libraries (--scan-compiled)
+        self.compiled_skipped = OrderedDict()  # path -> kind: compiled files TruffleHog read anyway, set aside
+        self.compiled_by_name = []   # compiled files seen in the tree and left out of the scan
 
     def rel(self, path):
         try:
@@ -1848,10 +1969,23 @@ def build_plan(findings, root, store, args, env_plaintext, exclude_res=(), decry
     raw_cache = {}
     seen = {}
     leftovers = []   # (finding, why): secrets in text files that could not be handled
+    compiled_cache = {}
     ordered = sorted(findings, key=lambda f: (f.path, f.line, f.raw))
     for finding in ordered:
         if exclude_res and is_excluded(finding.path, exclude_res):
             plan.ignored += 1   # TruffleHog did not honour the exclude (Windows paths); we do
+            continue
+        kind = compiled_kind(finding.path, compiled_cache)
+        if kind:
+            # a program or library: never rewritten or moved; listed with --scan-compiled, else set aside
+            if args.scan_compiled:
+                entry = plan.compiled.get(finding.path)
+                if entry is None:
+                    entry = plan.compiled[finding.path] = CompiledFile(finding.path, kind)
+                entry.findings.append(finding)
+            else:
+                plan.compiled_skipped[finding.path] = kind
+                log_only(u"set aside, compiled code: %s (%s) %s" % (plan.rel(finding.path), kind, finding.detector))
             continue
         data, reason = load_for_edit(finding.path, cache)
         if data is None:
@@ -2259,6 +2393,47 @@ def print_unfixable(plan, args, style):
                       u" A --yes run moves files only with --quarantine."))
 
 
+def compiled_skipped(plan):
+    """The compiled files this run left out of the scan, path -> kind: the ones recognised by name while
+    walking the tree, and the ones TruffleHog read anyway (no extension, or an old release that takes no
+    exclusions) whose findings were set aside."""
+    skipped = OrderedDict()
+    for path in plan.compiled_by_name:
+        skipped[os.path.normpath(path)] = u".%s file" % COMPILED_NAME_RE.search(os.path.basename(path)).group(1).lower()
+    for path, kind in plan.compiled_skipped.items():
+        skipped.setdefault(os.path.normpath(path), kind)
+    return skipped
+
+
+def print_compiled(plan, args, style):
+    """--scan-compiled: the findings TruffleHog reported in programs and libraries, listed and left
+    alone, with what surrounds each match as `strings` would show it (on the screen only: the run
+    log gets the rows without it)."""
+    rows, logged, seen = [], [], set()
+    for entry in plan.compiled.values():
+        secrets = [to_bytes(c) for finding in entry.findings for c in candidate_secrets(finding) if c]
+        for finding in entry.findings:
+            if (entry.path, finding.detector, finding.raw) in seen:
+                continue
+            seen.add((entry.path, finding.detector, finding.raw))
+            near = strings_near(entry.path, finding, secrets) or (
+                u"(decoded from %s: not in the file as such)" % finding.decoder
+                if (finding.decoder or u"PLAIN").upper() != u"PLAIN" else u"(not found in the file as such)")
+            row = (plan.rel(entry.path), entry.kind, finding.detector + (u" *" if finding.verified else u""),
+                   mask(finding.raw))
+            rows.append(row + (near,))
+            logged.append(row + (u"(shown on the screen only)",))
+    say(u"")
+    say(style.bold(u"Findings in compiled code: %d in %d file(s)" % (len(rows), len(plan.compiled)))
+        + style.dim(u"  (listed only: never rewritten or moved)"))
+    headers = (u"File", u"Kind", u"Type", u"Secret", u"Near")
+    for line, log_line in zip(table(rows, headers), table(logged, headers)):
+        say(line, log_text=log_line)
+    say(style.dim(u"  Matches in compiled code are usually symbol names or random bytes that happen to fit a detector's"))
+    say(style.dim(u"  pattern; --verify lets TruffleHog check each one against its service (* = verified live). A real"))
+    say(style.dim(u"  credential compiled into a program has to be rotated, and the program rebuilt without it."))
+
+
 def print_report(plan, args, style, verified_any):
     say(u"")
     secrets = [item for item in plan.items if item.kind != "quarantine"]
@@ -2282,6 +2457,21 @@ def print_report(plan, args, style, verified_any):
             say(style.dim(u"  * = TruffleHog verified this credential is live"))
     if plan.unfixable:
         print_unfixable(plan, args, style)
+    if plan.compiled:
+        print_compiled(plan, args, style)
+    skipped = compiled_skipped(plan)
+    if skipped:
+        kinds = OrderedDict()
+        for kind in skipped.values():
+            kinds[kind] = kinds.get(kind, 0) + 1
+        shown = sorted(kinds.items(), key=lambda pair: -pair[1])
+        summary = u", ".join(u"%s %d" % (kind.replace(u" file", u""), count) for kind, count in shown[:4])
+        if len(shown) > 4:
+            summary += u", ..."
+        say(u"")
+        say(style.dim(u"Skipped %d compiled file(s) (%s): a secret compiled into a program cannot be fixed by this tool,"
+                      u" and moving such a file would break what uses it. --scan-compiled lists what TruffleHog finds in them."
+                      % (len(skipped), summary)))
     if plan.hashes:
         say(u"")
         say(style.dim(u"Set aside %d finding(s) that sit inside package integrity hashes (sha512-..., h1:..., sha256:...):"
@@ -2937,6 +3127,9 @@ def print_next_steps(plan, chosen, keys_files, args, style):
                % (len(quarantined), plan.rel(plan.quarantine), QUARANTINE_MANIFEST, QUARANTINE_INDEX))
         say(u"     Nothing reads them from there. Fix or rebuild them without the secrets and move them back, or")
         say(u"     delete them; never commit that folder. If a file was tracked by git, commit its removal.")
+    if plan.compiled:
+        bullet(u"The findings in compiled code were listed and left alone. Check each with  strings <file> |"
+               u" grep -n <start of the value>;  a real credential there has to be rotated, and the program rebuilt without it.")
     if keys_files:
         bullet(u"The private decryption key lives in %s." % u", ".join(plan.rel(k) for k in keys_files))
         say(u"     NEVER commit it. Share it through a password manager or your CI's secret store")
@@ -3018,6 +3211,11 @@ def parse_args(argv):
     parser.add_argument("--no-default-excludes", action="store_true",
                         help="also scan .git, node_modules, virtualenvs and friends "
                              "(.env.keys and staging files stay excluded)")
+    parser.add_argument("--scan-compiled", action="store_true",
+                        help="also scan compiled code (.so, .dll, .exe, .pyc, .class, ... and files whose first bytes say "
+                             "ELF, PE, Mach-O or WebAssembly) and list what TruffleHog finds there; such files are never "
+                             "rewritten or moved. Skipped by default: TruffleHog 3.75 and later skip them anyway, and "
+                             "older releases match symbol names in them")
     parser.add_argument("--min-length", type=int, default=8, metavar="N",
                         help="ignore secrets shorter than N characters (default: 8)")
     parser.add_argument("--trufflehog", metavar="PATH", help="trufflehog executable (default: search PATH)")
@@ -3230,15 +3428,23 @@ def main(argv=None):
             say(style.bad(u"[!!] bad --exclude pattern %r: %s" % (pattern, exc)), sys.stderr)
             return 1
 
+    scan_excludes = list(exclude_patterns)
+    if not args.scan_compiled:
+        scan_excludes.append(COMPILED_NAME_PATTERN)   # programs and libraries: by name here, by first bytes below
     say(u"Scanning with TruffleHog (this can take a while on big trees) ...")
     try:
-        findings, code, notes = run_trufflehog(tools["trufflehog"]["path"], root, exclude_patterns, args,
+        findings, code, notes = run_trufflehog(tools["trufflehog"]["path"], root, scan_excludes, args,
                                                ScanProgress(sys.stdout))
     except ToolError as exc:
         say(style.bad(u"[!!] %s" % to_text(str(exc))), sys.stderr)
         return 1
     for note in notes:
         say(style.dim(u"  %s" % note))
+    version = tools["trufflehog"].get("version")
+    if args.scan_compiled and version and version >= TRUFFLEHOG_SKIPS_COMPILED:
+        say(style.dim(u"  --scan-compiled: this TruffleHog (%s) skips compiled files itself, as every release from %s does;"
+                      u" only the ones it still reads can be listed"
+                      % (u".".join(str(v) for v in version), u".".join(str(v) for v in TRUFFLEHOG_SKIPS_COMPILED))))
     completed = complete_aws_pairs(findings)
     if completed:
         say(style.dim(u"  this TruffleHog reported %d AWS key id(s) without the secret access key beside them; the"
@@ -3249,7 +3455,9 @@ def main(argv=None):
                       u" probably INCOMPLETE. What it did report is handled below; the exit code will be 1."
                       % code))
 
-    encrypted, plaintext, stale = inventory_env_files(root, exclude_res, protect=(store,))
+    compiled_by_name = []
+    encrypted, plaintext, stale = inventory_env_files(root, exclude_res, protect=(store,),
+                                                      compiled=None if args.scan_compiled else compiled_by_name)
     if stale:
         names = u", ".join(slash_path(os.path.relpath(path, root)) for path in stale)
         if args.dry_run:
@@ -3259,6 +3467,7 @@ def main(argv=None):
             say(style.dim(u"Removed %d leftover staging file(s) from an interrupted run: %s" % (len(removed), names)))
     decryptor = make_decryptor(tools["dotenvx"]["path"], root, args)
     plan = build_plan(findings, root, store, args, plaintext, exclude_res, decryptor, quarantine)
+    plan.compiled_by_name = compiled_by_name
     plan.encrypted = encrypted
     plan.plain_env = plaintext
     plan.quarantine_flagged = quarantine_flagged

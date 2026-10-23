@@ -74,6 +74,7 @@ between:
 | a text file some of whose secrets are fixed in place and one of which cannot be (encoded, too short, unstorable) | the fixable ones are handled; the file is listed with the other one for you to handle by hand, and is never moved, because moving it would undo the fixes |
 | a symbolic link | listed; fix the file it points to |
 | a match that sits inside a package integrity hash (`sha512-...` in `package-lock.json` or `yarn.lock`, `h1:...` in `go.sum`, `sha256:...` in a Python lock file) | set aside and counted, not treated as a secret: those are public checksums that happen to match a detector's pattern, a known weakness of several TruffleHog detectors. Only a digest of its algorithm's exact length counts, and each set-aside is named in the run log |
+| a program or library: `.so`, `.dll`, `.dylib`, `.exe`, `.o`, `.a`, `.pyc`, `.class`, `.wasm`, ... or a file whose first bytes say ELF, PE, Mach-O or WebAssembly | not scanned, and counted: "Skipped N compiled file(s)". A secret compiled into a program cannot be fixed here, and moving the file would break whatever uses it; what an old TruffleHog matches in such files is mostly exported symbol names (TruffleHog 3.75 and later skip them itself). `--scan-compiled` lists what TruffleHog finds in them, each match with the string around it as `strings` would show it, and never rewrites or moves them |
 
 Variable names come from the code around the secret (`AWS_SECRET_ACCESS_KEY =
 "..."`, `"apiKey": "..."`, `password: ...`), made specific with the detector name
@@ -176,6 +177,9 @@ removed (they may hold a plaintext copy of an env file, so they never stay).
   and encrypted only with `--env-all`.
 - It does not edit binaries, PDFs or lock files, and it does not edit inside
   archives; such files are moved whole to quarantine, or left for you.
+- It does not scan programs and libraries unless asked (`--scan-compiled`), and
+  it never changes them: a credential compiled into a program has to be rotated,
+  and the program rebuilt without it.
 
 ## Install
 
@@ -745,6 +749,17 @@ directly: `dotenvx set NEW_KEY "value"` encrypts it straight into `.env`.
   `__pycache__`, `.venv`, `venv` and `.tox`, which are skipped by default. The
   dotenvx key files (`.env.keys*`), legacy `.env.vault` files and the script's
   own staging files are never scanned or rewritten, whatever you pass.
+- `--scan-compiled`: also scan programs and libraries (`.so`, `.dll`, `.dylib`,
+  `.exe`, `.o`, `.a`, `.pyc`, `.class`, `.wasm`, ... and any file whose first
+  bytes say ELF, PE, Mach-O or WebAssembly) and list what TruffleHog finds in
+  them in a section of their own, each match with the printable string around
+  it as `strings` would show it (on the screen only, never in the run log) and
+  with `*` when `--verify` confirmed it. Such files are never rewritten or moved.
+  Off by default: a secret compiled into a program cannot be fixed by this tool,
+  and what an old TruffleHog matches in compiled code is mostly exported symbol
+  names; TruffleHog 3.75 and later skip compiled files themselves, so with one
+  of those the option only lists what that TruffleHog still reads. Without the
+  option the run says how many compiled files it skipped.
 - `--min-length N`: ignore secrets shorter than N characters (default 8). They
   are listed under "cannot fix automatically" rather than rewritten.
 - `--verify`: let TruffleHog check each credential against the service that
@@ -884,7 +899,13 @@ On macOS use `shasum -a 256 -c -` in place of `sha256sum -c -`.
   shorter random string is never taken for one. A lock file that still appears in
   the listing holds something outside a hash, such as a token in a registry URL,
   and `--verify` lets TruffleHog confirm a credential against its service.
-* Secrets inside binaries, PDFs, lock files or base64-encoded text are never
+* Programs and libraries (`.so`, `.dll`, `.exe`, `.pyc`, ...) are not scanned
+  unless `--scan-compiled` is given, and are never changed. TruffleHog releases
+  before 3.75 read them as raw bytes and match exported symbol names: in a test
+  over 60 system libraries, TruffleHog 3.70 reported 34 "secrets", all C++
+  symbol names in LLVM; 3.75 and later skip such files themselves. A credential
+  really compiled into a program has to be rotated and the program rebuilt.
+* Secrets inside data binaries, PDFs, lock files or base64-encoded text are never
   rewritten; such files can only be moved to the quarantine folder as a whole,
   and so can archives (TruffleHog looks inside them). The listing shows which
   files inside hold the secrets for zip, tar (any compression), gzip, bzip2 and

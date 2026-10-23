@@ -847,6 +847,58 @@ class EndToEndTests(unittest.TestCase):
         finally:
             tree.cleanup()
 
+    def test_compiled_code_is_skipped_by_default_and_only_listed_with_scan_compiled(self):
+        tree = ProjectTree({"app/settings.py": 'STRIPE = "%s"\n' % STRIPE_KEY})
+        try:
+            planted = ("\0AWS_ACCESS_KEY_ID=%s\0AWS_SECRET_ACCESS_KEY=%s\0%s\0" % (AWS_ID, AWS_SECRET, SLACK)).encode("utf-8")
+            elf = b"\x7fELF\x02\x01\x01" + b"\x00" * 9 + b"\x03\x00\x3e\x00" + planted + b"\x00" * 64
+            tree.write("lib/libplanted.so.1", elf)       # compiled by name
+            tree.write("bin/tool", elf)                    # compiled by its first bytes only
+            tree.write("app/mod.cpython-311.pyc", b"\xa7\r\r\n" + b"\x00" * 12 + ("token %s\0" % GITHUB_TOKEN).encode("utf-8"))
+            tree.write("vendor/blob.bin", b"\x00\x01data " + SLACK.encode("utf-8") + b"\x00")   # a data file, not a program
+            code, out, err = run_script(tree.root, ["--dry-run"])
+            self.assertEqual(code, 0, out + err)
+            self.assertIn("Skipped 3 compiled file(s) (.pyc 1, .so 1, ELF binary 1): a secret compiled into a program", out)
+            self.assertNotIn("move to .secrets-quarantine/lib", out)
+            self.assertNotIn("move to .secrets-quarantine/bin", out)
+            self.assertNotIn("move to .secrets-quarantine/app", out)
+            self.assertIn("move to .secrets-quarantine/vendor/blob.bin", out)    # data binaries keep the offer
+            self.assertIn("Files holding secrets that cannot be fixed in place: 3", out)   # the tree's two archives, and it
+            # --scan-compiled lists them read-only, with the surrounding string and every secret masked
+            code, out, err = run_script(tree.root, ["--dry-run", "--scan-compiled"])
+            self.assertEqual(code, 0, out + err)
+            self.assertIn("Findings in compiled code: 5 in 3 file(s)  (listed only: never rewritten or moved)", out)
+            self.assertRegex(out, r"lib/libplanted\.so\.1\s+\.so file\s+AWS\s+AKIA\.\.\.M2\s+AWS_ACCESS_KEY_ID=AKIA\.\.\.M2")
+            self.assertRegex(out, r"bin/tool\s+ELF binary\s+SlackWebhook\s+http\.\.\.wX\s+http\.\.\.wX")
+            self.assertRegex(out, r"app/mod\.cpython-311\.pyc\s+\.pyc file\s+Github\s+ghp_\.\.\.ij\s+token ghp_\.\.\.ij")
+            self.assertIn("this TruffleHog (3.99.0) skips compiled files itself", out)   # the stand-in says it is 3.99
+            self.assertNotIn("Skipped", out)
+            for secret in (AWS_ID, AWS_SECRET, SLACK, GITHUB_TOKEN):
+                self.assertNotIn(secret, out)
+            log = read_file(re.search(r"^Log: (.*)$", out, re.M).group(1).strip())
+            self.assertIn("(shown on the screen only)", log)      # the surroundings stay off the log
+            self.assertNotIn("AWS_ACCESS_KEY_ID=", log)
+            self.assertNotIn(AWS_ID, log)
+            # nothing in compiled code is ever rewritten or moved, whatever the flags
+            before = tree.snapshot()
+            code, out, err = run_script(tree.root, ["--yes", "--quarantine", "--scan-compiled"])
+            self.assertEqual(code, 0, out + err)
+            for rel in ("lib/libplanted.so.1", "bin/tool", "app/mod.cpython-311.pyc"):
+                self.assertEqual(tree.read_bytes(rel), before[rel.replace("/", os.sep)], rel)
+            self.assertFalse(os.path.exists(tree.path("vendor/blob.bin")))   # the data file was moved
+            self.assertIn("were listed and left alone", out)
+            # an old TruffleHog that takes no exclusions reads them anyway: still set aside, same count
+            code, out, err = run_script(tree.root, ["--dry-run"], extra_env={"FAKE_TRUFFLEHOG_VINTAGE": "3.12"})
+            self.assertEqual(code, 0, out + err)
+            self.assertIn("Skipped 3 compiled file(s) (.pyc 1, .so 1, ELF binary 1)", out)
+            self.assertNotIn("libplanted", out)
+            code, out, err = run_script(tree.root, ["--dry-run", "--scan-compiled"], extra_env={"FAKE_TRUFFLEHOG_VINTAGE": "3.12"})
+            self.assertEqual(code, 0, out + err)
+            self.assertIn("Findings in compiled code: 5 in 3 file(s)", out)
+            self.assertNotIn("skips compiled files itself", out)   # 3.12 still reads them: no such note
+        finally:
+            tree.cleanup()
+
     def test_integrity_hashes_in_lock_files_are_not_secrets(self):
         # an AWS-looking string inside an npm sha512 integrity hash: a checksum, not a key
         hash_line = '"integrity": "%s"' % integrity_hash("sha512", AWS_ID)
@@ -1552,6 +1604,75 @@ class UnitTests(unittest.TestCase):
             self.assertEqual(archive.note, "")
         finally:
             sas.INSPECT_FULL_READ_BYTES, sas.INSPECT_CHUNK, sas.INSPECT_BUDGET_BYTES = saved
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_compiled_kind(self):
+        folder = tempfile.mkdtemp(prefix="sweep-compiled-")
+        try:
+            def make(name, data=b"\x00" * 8):
+                path = os.path.join(folder, name)
+                with io.open(path, "wb") as fh:
+                    fh.write(data)
+                return path
+            self.assertEqual(sas.compiled_kind(make("libz.so.1.2.11")), ".so file")
+            self.assertEqual(sas.compiled_kind(make("Thing.DLL")), ".dll file")
+            self.assertEqual(sas.compiled_kind(make("mod.cpython-311.pyc")), ".pyc file")
+            self.assertEqual(sas.compiled_kind(make("Main.class", b"text")), ".class file")
+            self.assertEqual(sas.compiled_kind(make("tool", b"\x7fELF" + b"\x00" * 60)), "ELF binary")
+            self.assertEqual(sas.compiled_kind(make("mach", b"\xcf\xfa\xed\xfe" + b"\x00" * 60)), "Mach-O binary")
+            self.assertEqual(sas.compiled_kind(make("module.wasm2", b"\x00asm\x01\x00\x00\x00")), "WebAssembly module")
+            pe = b"MZ" + b"\x00" * 58 + b"\x40\x00\x00\x00" + b"PE\x00\x00" + b"\x00" * 16
+            self.assertEqual(sas.compiled_kind(make("setup", pe)), "Windows PE binary")
+            # MZ without a PE header is text that happens to start with MZ, not a program
+            self.assertIsNone(sas.compiled_kind(make("notes.txt", b"MZ Corp quarterly notes\n" + b"x" * 64)))
+            self.assertIsNone(sas.compiled_kind(make("data.bin", b"\x00\x01\x02binary")))
+            self.assertIsNone(sas.compiled_kind(make("archive.zip", b"PK\x03\x04")))
+            self.assertIsNone(sas.compiled_kind(make("README.so.txt", b"text")))
+            self.assertIsNone(sas.compiled_kind(os.path.join(folder, "missing")))
+            cache = {}
+            path = make("cached", b"\x7fELF" + b"\x00" * 60)
+            self.assertEqual(sas.compiled_kind(path, cache), "ELF binary")
+            os.remove(path)
+            self.assertEqual(sas.compiled_kind(path, cache), "ELF binary")   # answered from the cache
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_strings_near_masks_every_reported_secret_and_stops_at_string_ends(self):
+        folder = tempfile.mkdtemp(prefix="sweep-near-")
+        try:
+            def make(name, data):
+                path = os.path.join(folder, name)
+                with io.open(path, "wb") as fh:
+                    fh.write(data)
+                return path
+            path = make("lib.so", ("\0\x01junk\0AWS_ACCESS_KEY_ID=%s\0AWS_SECRET_ACCESS_KEY=%s\0" % (AWS_ID, AWS_SECRET)).encode("utf-8"))
+            aws = sas.Finding(path, 0, "AWS", AWS_ID, AWS_ID + ":" + AWS_SECRET, False, "PLAIN", {})
+            secrets = [sas.to_bytes(c) for c in sas.candidate_secrets(aws)]
+            # cut at the NUL byte: the secret key in the next string is not shown
+            self.assertEqual(sas.strings_near(path, aws, secrets), "AWS_ACCESS_KEY_ID=AKIA...M2")
+            key = sas.Finding(path, 0, "AWS", AWS_SECRET, "", False, "PLAIN", {})
+            self.assertEqual(sas.strings_near(path, key, secrets), "AWS_SECRET_ACCESS_KEY=1tUm...IU")
+            # both on one line: the other reported secret is masked too
+            one_line = make("one.so", ("id=%s secret=%s\n" % (AWS_ID, AWS_SECRET)).encode("utf-8"))
+            self.assertEqual(sas.strings_near(one_line, aws, secrets), "id=AKIA...M2 secret=1tUm...IU")
+            # a long printable run is clipped either side
+            long_run = make("long.so", b"x" * 100 + AWS_ID.encode("utf-8") + b"y" * 100)
+            near = sas.strings_near(long_run, aws, secrets)
+            self.assertEqual(near, "..." + "x" * 40 + "AKIA...M2" + "y" * 40 + "...")
+            # a reported secret that starts inside the shown width but runs past it is masked, not cut
+            edge = make("edge.so", ("id=%s " % AWS_ID).encode("utf-8") + b"x" * 30 + AWS_SECRET.encode("utf-8") + b"\n")
+            near = sas.strings_near(edge, aws, secrets)
+            self.assertNotIn(AWS_SECRET[:8], near)
+            self.assertIn("1tUm...IU", near)
+            # a byte TruffleHog tacked on beyond the string (old releases) does not hide the match
+            extra = sas.Finding(path, 0, "AWS", AWS_ID + "Q", "", False, "PLAIN", {})
+            self.assertEqual(sas.strings_near(path, extra, secrets), "AWS_ACCESS_KEY_ID=AKIA...M2")
+            # not in the file as such, unreadable, empty
+            encoded = sas.Finding(path, 0, "X", "not-there-at-all-1234", "", False, "BASE64", {})
+            self.assertEqual(sas.strings_near(path, encoded, secrets), "")
+            self.assertEqual(sas.strings_near(os.path.join(folder, "missing"), aws, secrets), "")
+            self.assertEqual(sas.strings_near(make("empty.so", b""), aws, secrets), "")
+        finally:
             shutil.rmtree(folder, ignore_errors=True)
 
     def test_inside_integrity_hash(self):
