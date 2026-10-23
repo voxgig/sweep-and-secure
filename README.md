@@ -152,8 +152,17 @@ hands over; it keeps no keys and takes no part in day-to-day use.
   `private key file: .env.keys  (file custody: failed to save private key to
   Linux Secret Service)`. Later, `dotenvx native up -f .env` moves it into the
   store and `dotenvx native down -f .env` brings it back to the file.
-- An env file that already had a key pair keeps it, wherever its private key
-  is; the run never makes a second one for it, and never moves it.
+- An env file that already had a key pair keeps it; the run never makes a
+  second one for it. When its private key sits in a `.env.keys` file and
+  dotenvx could keep it in the secret store, the run lists that under "Setup
+  to tighten" and offers to move it there (`dotenvx native up`, checked by
+  decrypting a value afterwards; `dotenvx native down` puts it back if that
+  fails). `--yes` does it without asking; `--no-native` leaves it in the file.
+  The same offer covers files an earlier version moved to the quarantine as
+  they were: they are encrypted in place, their passphrases kept by dotenvx.
+  A run with nothing to encrypt still says where each env file's key is.
+- On CI (the `CI` variable set) keys stay in files, as dotenvx itself keeps
+  them there: an ephemeral runner's secret store is gone with the runner.
 - The quarantine's passphrases are encrypted to the project's key pair whenever
   its private key is at hand here, so one key opens everything; a project with
   nothing but files to quarantine gets one key pair for the quarantine, under
@@ -281,7 +290,7 @@ Without installing anything, straight from the repository:
 uvx --from git+https://github.com/voxgig/sweep-and-secure sweep-and-secure --dry-run
 ```
 
-To pin a release, append `@v1.5.0` to the git URL, or pass `-v v1.5.0` to the
+To pin a release, append `@v1.5.1` to the git URL, or pass `-v v1.5.1` to the
 installer. To upgrade, run the same command again (`pipx upgrade
 sweep-and-secure` or `uv tool upgrade sweep-and-secure` for those routes). The
 installer takes `-b DIR` for another folder (without `-b` it uses
@@ -375,7 +384,7 @@ everything.
 
 ```
 $ sweep-and-secure --check-setup
-sweep-and-secure 1.5.0  (TruffleHog + dotenvx)
+sweep-and-secure 1.5.1  (TruffleHog + dotenvx)
 Log: /home/me/.local/state/sweep-and-secure/logs/2026-10-23T16-38-58Z-shop-48213.log
 Python 3.13.16 (/usr/bin/python3) on Linux-6.8.0-x86_64-with-glibc2.39
   [ok] trufflehog  3.99.3     /usr/local/bin/trufflehog
@@ -421,7 +430,7 @@ audit.
 ```
 $ cd shop
 $ sweep-and-secure --dry-run
-sweep-and-secure 1.5.0  (TruffleHog + dotenvx)
+sweep-and-secure 1.5.1  (TruffleHog + dotenvx)
 Log: /home/me/.local/state/sweep-and-secure/logs/2026-10-23T16-39-04Z-shop-48213.log
 Folder: /home/me/shop
   Note: this is a security tool that changes files on purpose: it encrypts env files, rewrites
@@ -693,14 +702,17 @@ the name actually used.
 
 ### Running it again
 
-A second run finds nothing to do and shows what is protected. Running after an
-interruption, or after adding one more secret to a file, picks up exactly what
-is still in plaintext; values already stored are recognised and never stored
-twice.
+A second run finds nothing to do, shows what is protected and says where each
+env file's private key is. Where an earlier run, or an earlier version, left a
+private key in `.env.keys` that the secret store could hold, or files in the
+quarantine as they were, it lists that under "Setup to tighten" and offers to
+do it. Running after an interruption, or after adding one more secret to a
+file, picks up exactly what is still in plaintext; values already stored are
+recognised and never stored twice.
 
 ```
 $ sweep-and-secure --dry-run
-sweep-and-secure 1.5.0  (TruffleHog + dotenvx)
+sweep-and-secure 1.5.1  (TruffleHog + dotenvx)
 Log: /home/me/.local/state/sweep-and-secure/logs/2026-10-23T16-39-20Z-shop-48213.log
 Folder: /home/me/shop
   Note: this is a security tool that changes files on purpose: it encrypts env files, rewrites
@@ -741,7 +753,7 @@ a file put back with its secret still inside is found again by the next run.
 
 ```
 $ sweep-and-secure --restore build/keys.zip
-sweep-and-secure 1.5.0  (TruffleHog + dotenvx)
+sweep-and-secure 1.5.1  (TruffleHog + dotenvx)
 Log: /home/me/.local/state/sweep-and-secure/logs/2026-10-23T16-39-24Z-shop-48213.log
 Folder: /home/me/shop
   [ok] dotenvx     2.38.2     /usr/local/bin/dotenvx
@@ -945,7 +957,10 @@ sweep-and-secure again or use `dotenvx set`.
   is found (1 only if the scan itself failed), so it suits install checks and
   CI audits.
 - `-y`, `--yes`: encrypt everything listed without asking; use it in scripts
-  and CI. Archives that hold secrets are moved to quarantine only if
+  and CI. It also tightens an earlier setup without asking: a private key in
+  `.env.keys` goes into the secret store where dotenvx can keep it there, and
+  files the quarantine holds as they are get encrypted (the latter only with
+  `--quarantine`). Archives that hold secrets are moved to quarantine only if
   `--quarantine` is also given, so an unattended run never relocates files it
   was not told to. Without `--yes` the question is asked even when stdin is not
   a terminal and the answer is read from there: a piped `y` is accepted, and no
@@ -1006,11 +1021,11 @@ sweep-and-secure again or use `dotenvx set`.
   the record as restored and adds a line to the manifest; nothing is scanned,
   and only dotenvx (and openssl) are needed. A file that was moved without
   encryption is moved back as it is.
-- `--no-native`: keep a fresh private key in `.env.keys` next to its env file
-  even where dotenvx could put it in the operating system's secret store.
-  `DOTENVX_NO_NATIVE=true` in the environment has the same effect (dotenvx
-  itself honours it too). Existing key pairs are never moved either way, and
-  `dotenvx native up -f .env` moves a key into the store later.
+- `--no-native`: keep private keys in `.env.keys` files, a fresh one and any
+  an earlier run left there, even where dotenvx could put them in the
+  operating system's secret store. `DOTENVX_NO_NATIVE=true` in the environment
+  has the same effect (dotenvx itself honours it too), and so does a set `CI`
+  variable. `dotenvx native up -f .env` moves a key into the store later.
 - `--placeholder TEMPLATE`: the text that replaces a secret in a source file,
   with `NAME` standing for the variable name. Default `${NAME}`;
   `process.env.NAME`, `os.environ["NAME"]` or `<NAME>` are common alternatives.
@@ -1078,7 +1093,7 @@ it yourself for a downloaded `sweep_and_secure.py`, from the folder it was
 downloaded into:
 
 ```
-curl -sSfL -O https://github.com/voxgig/sweep-and-secure/releases/download/v1.5.0/SHA256SUMS
+curl -sSfL -O https://github.com/voxgig/sweep-and-secure/releases/download/v1.5.1/SHA256SUMS
 ```
 
 ```
@@ -1167,7 +1182,7 @@ tools present.
 
 
 To release: set `__version__` in `sweep_and_secure.py`, merge, then either push
-a matching tag (`git tag v1.5.0 && git push origin v1.5.0`) or run the release
+a matching tag (`git tag v1.5.1 && git push origin v1.5.1`) or run the release
 workflow from the Actions tab with the version, which creates the tag for you.
 The workflow (`.github/workflows/release.yml`) checks that the tag matches the
 version, runs the tests, builds the sdist and wheel, and publishes a GitHub

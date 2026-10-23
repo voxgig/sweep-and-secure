@@ -212,7 +212,7 @@ def private_key(path, suffix, keys_files, key_id=None, where=None):
                         if where is not None:
                             where.append(".env.keys")
                         return match.group(1)
-        if store_path():
+        if store_path() and os.environ.get("DOTENVX_NO_NATIVE", "").lower() != "true":
             found = store_load().get("02fake" + key_id)
             if found:
                 if where is not None:
