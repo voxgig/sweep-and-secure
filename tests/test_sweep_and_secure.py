@@ -328,6 +328,7 @@ class EndToEndTests(unittest.TestCase):
         code, out, err = run_script(self.tree.root, ["--dry-run"], extra_env=old)
         self.assertEqual(code, 0, out + err)
         self.assertIn("[ok] trufflehog  3.20.0", out)
+        self.assertIn("an old release, used as it is; 3.75.0 and later skip compiled files themselves", out)
         self.assertIn("Scan took ", out)
         self.assertNotIn("Scanned ", out)
         self.assertIn("no --log-level", out)
@@ -342,6 +343,10 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("no --log-level", out)
         self.assertNotIn("no --exclude-paths", out)
         self.assertNotIn("Ignored", out)
+        self.assertIn("an old release", out)
+        code, out, err = run_script(self.tree.root, ["--dry-run"])   # the stand-in is 3.99 by default: no note
+        self.assertEqual(code, 0, out + err)
+        self.assertNotIn("an old release", out)
         # a real run works the same, quarantine included, and the quarantine folder stays out of later listings
         code, out, err = run_script(self.tree.root, ["--yes", "--quarantine"], extra_env=old)
         self.assertEqual(code, 0, out + err)
@@ -899,6 +904,53 @@ class EndToEndTests(unittest.TestCase):
         finally:
             tree.cleanup()
 
+    def test_checksums_and_commit_ids_in_lock_files_are_not_secrets(self):
+        # TruffleHog's keyword detectors take the long hex strings next to a package called cloudflare or
+        # sentry for tokens: the sha1 URL fragment in yarn.lock, a commit id in package-lock.json, the
+        # checksum in mix.lock. Those are public identifiers; a credential in a lock file sits in a URL.
+        sha1 = "2e85b818" + "17ebec4241b8f55ef1b62e4f150abcee"
+        sha256 = "7452a46f185b7cc1e0a33b7b5bc3ecb9" + "4dc85968268cf63e08314caae3c96e2f"
+        self.tree.write("yarn.lock", ('# yarn lockfile v1\n\n\ncloudflare@^1.0.0:\n  version "1.0.0"\n'
+                                      '  resolved "https://registry.yarnpkg.com/cloudflare/-/cloudflare-1.0.0.tgz#%s"\n'
+                                      '  integrity %s\n' % (sha1, integrity_hash("sha512", "cf"))).encode("utf-8"))
+        self.tree.write("mix.lock", ('%%{\n  "sentry": {:hex, :sentry, "10.0.0", "%s", [:mix], [], "hexpm", "%s"},\n}\n'
+                                     % (sha256, sha256[::-1])).encode("utf-8"))
+        self.tree.write("package-lock.json", json.dumps({"name": "demo", "lockfileVersion": 3, "packages": {
+            "node_modules/cf-worker": {"version": "1.0.0",
+                                       "resolved": "git+ssh://git@github.com/cloudflare/cf-worker.git#%s" % sha1}}},
+            indent=2).encode("utf-8"))
+        code, out, err = run_script(self.tree.root, ["--dry-run"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("Set aside 3 finding(s) that are package integrity hashes (sha512-..., h1:..., sha256:...) or"
+                      " checksums and commit ids in lock files", out)
+        for rel in ("yarn.lock", "mix.lock", "package-lock.json"):
+            self.assertNotIn(rel, out)
+        log = read_file(re.search(r"^Log: (.*)$", out, re.M).group(1).strip())
+        self.assertIn("set aside, a checksum or commit id in a lock file: yarn.lock line 6 (CloudflareApiToken)", log)
+        self.assertIn("set aside, a checksum or commit id in a lock file: mix.lock line 2 (SentryToken)", log)
+        self.assertNotIn(sha1, log)
+        # a credential in a lock file is still one (user:secret@host, ?token=...), and the row says where
+        self.tree.write("sub/yarn.lock", ('# yarn lockfile v1\n\ncloudflare-sdk@^2.0.0:\n  version "2.0.0"\n'
+                                          '  resolved "https://cloudflare:%s@npm.example.com/cloudflare-sdk-2.0.0.tgz"\n'
+                                          % sha1).encode("utf-8"))
+        self.tree.write("sub/pnpm-lock.yaml", ("lockfileVersion: '9.0'\n\npackages:\n\n  cloudflare@1.0.0:\n"
+                                               "    resolution: {tarball: https://npm.example.com/cloudflare-1.0.0.tgz?token=%s}\n"
+                                               % sha1).encode("utf-8"))
+        code, out, err = run_script(self.tree.root, ["--dry-run"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("Set aside 3 finding(s)", out)
+        self.assertRegex(out, r"sub/yarn\.lock\s+generated lock file\s+CloudflareApiToken 2e85\.\.\.ee \(line 5\)")
+        self.assertRegex(out, r"sub/pnpm-lock\.yaml\s+generated lock file\s+CloudflareApiToken 2e85\.\.\.ee \(line 6\)")
+        # --yes --quarantine moves those two; the lock files whose matches were set aside stay
+        code, out, err = run_script(self.tree.root, ["--yes", "--quarantine"])
+        self.assertEqual(code, 0, out + err)
+        for rel in ("yarn.lock", "mix.lock", "package-lock.json"):
+            self.assertTrue(os.path.isfile(self.tree.path(rel)), rel)
+        for rel in ("sub/yarn.lock", "sub/pnpm-lock.yaml"):
+            self.assertFalse(os.path.exists(self.tree.path(rel)), rel)
+            self.assertTrue(os.path.isfile(self.tree.path(".secrets-quarantine/" + rel)), rel)
+        self.assertNoLeftovers()
+
     def test_integrity_hashes_in_lock_files_are_not_secrets(self):
         # an AWS-looking string inside an npm sha512 integrity hash: a checksum, not a key
         hash_line = '"integrity": "%s"' % integrity_hash("sha512", AWS_ID)
@@ -908,7 +960,7 @@ class EndToEndTests(unittest.TestCase):
         self.tree.write("yarn.lock", ("  integrity %s\n" % integrity_hash("sha512", AWS_ID, 5)).encode("utf-8"))
         code, out, err = run_script(self.tree.root, ["--dry-run"])
         self.assertEqual(code, 0, out + err)
-        self.assertIn("Set aside 2 finding(s) that sit inside package integrity hashes", out)
+        self.assertIn("Set aside 2 finding(s) that are package integrity hashes", out)
         self.assertIn("Each is named in the run log.", out)
         self.assertNotIn("package-lock.json", out)
         self.assertNotIn("go.sum", out)
@@ -1675,6 +1727,32 @@ class UnitTests(unittest.TestCase):
         finally:
             shutil.rmtree(folder, ignore_errors=True)
 
+    def test_lockfile_identifier(self):
+        sha1 = "2e85b818" + "17ebec4241b8f55ef1b62e4f150abcee"
+        b64 = integrity_hash("sha512", "x")[len("sha512-"):]   # 86 characters and ==, as packages.lock.json stores it
+
+        def finding(raw):
+            return sas.Finding("x", 1, "CloudflareApiToken", raw, "", False, "PLAIN", {})
+
+        public = ('resolved "https://registry.yarnpkg.com/cloudflare/-/cloudflare-1.0.0.tgz#%s"',
+                  '      "reference": "%s",', '  revision: %s', '  checksum: 10c0/%s', 'checksum = "%s"',
+                  '"resolved": "git+ssh://git@github.com/cloudflare/x.git#%s"', '  Sentry: %s', '"rev": "%s",')
+        for line in public:
+            self.assertTrue(sas.lockfile_identifier(finding(sha1), (line % sha1).encode("utf-8")), line)
+        self.assertTrue(sas.lockfile_identifier(finding(sha1 * 3 + "deadbeef"), ("  checksum: 10c0/%s\n" % (sha1 * 3 + "deadbeef")).encode("utf-8")))
+        self.assertTrue(sas.lockfile_identifier(finding(b64[10:50]), ('"contentHash": "%s"\n' % b64).encode("utf-8")))
+        self.assertTrue(sas.lockfile_identifier(finding(sha1), ("#%s\n#%s\n" % (sha1, sha1)).encode("utf-8")))   # every occurrence
+        credentials = ('resolved "https://cloudflare:%s@npm.example.com/x.tgz"', 'tarball: https://npm.example.com/x.tgz?token=%s',
+                       '"token": "%s"', '  password: %s', 'NPM_TOKEN = %s', 'https://%s@npm.example.com/x.tgz')
+        for line in credentials:
+            self.assertFalse(sas.lockfile_identifier(finding(sha1), (line % sha1).encode("utf-8")), line)
+        self.assertFalse(sas.lockfile_identifier(finding(sha1[:-1]), ('#%s"' % sha1[:-1]).encode("utf-8")))   # 39 digits: not a digest
+        self.assertFalse(sas.lockfile_identifier(finding(sha1), ("#%s\nkey=%s\n" % (sha1, sha1)).encode("utf-8")))  # once as a value
+        self.assertFalse(sas.lockfile_identifier(finding(sha1), b"nothing here\n"))
+        self.assertFalse(sas.lockfile_identifier(finding(sha1), b""))
+        for name in ("go.sum", "Podfile.lock", "Package.resolved", "deno.lock", "mix.lock", "yarn.lock"):
+            self.assertTrue(sas.is_lockfile(name), name)
+
     def test_inside_integrity_hash(self):
         aws = sas.Finding("x", 1, "AWS", AWS_ID, "", False, "PLAIN", {})
         inside = ('"integrity": "%s"\n' % integrity_hash("sha512", AWS_ID)).encode("utf-8")
@@ -1871,6 +1949,23 @@ class RealToolsTests(unittest.TestCase):
         self.assertIn("dotenvx     ran in a scratch folder: encrypted a value, decrypted it back, wrote .env.keys", out)
         self.assertIn("Setup looks good", out)
         self.assertEqual(self.tree.leftovers(), [])
+
+    def test_lock_file_checksums_next_to_vendor_names_are_set_aside(self):
+        # measured: every real TruffleHog from 3.0 to 3.99 reports CloudflareApiToken for the sha1 URL
+        # fragment of a package called cloudflare in yarn.lock, and SentryToken for sentry's checksum in mix.lock
+        sha1 = "2e85b818" + "17ebec4241b8f55ef1b62e4f150abcee"
+        sha256 = "7452a46f185b7cc1e0a33b7b5bc3ecb9" + "4dc85968268cf63e08314caae3c96e2f"
+        self.tree.write("yarn.lock", ('# yarn lockfile v1\n\n\ncloudflare@^1.0.0:\n  version "1.0.0"\n'
+                                      '  resolved "https://registry.yarnpkg.com/cloudflare/-/cloudflare-1.0.0.tgz#%s"\n'
+                                      '  integrity %s\n' % (sha1, integrity_hash("sha512", "cf"))).encode("utf-8"))
+        self.tree.write("mix.lock", ('%%{\n  "sentry": {:hex, :sentry, "10.0.0", "%s", [:mix], [], "hexpm", "%s"},\n}\n'
+                                     % (sha256, sha256[::-1])).encode("utf-8"))
+        code, out, err = run_script(self.tree.root, ["--dry-run"], path=self.path)
+        self.assertEqual(code, 0, out + err)
+        self.assertRegex(out, r"Set aside [1-9]\d* finding\(s\) that are package integrity hashes")
+        self.assertNotIn("generated lock file", out)
+        self.assertNotIn("yarn.lock", out)
+        self.assertNotIn("mix.lock", out)
 
     def test_quoting_round_trips_through_real_dotenvx(self):
         values = {"PLAIN": "pa$$word${HOME} #x", "PEM": PEM, "APOS": "it's#a$ecret", "APOS_TICK": "it's `x` $HOME",

@@ -42,6 +42,11 @@ DETECTORS = [
     # A made-up credential format whose value may contain quotes, $ and backslashes, so
     # that the test-suite can exercise dotenvx's quoting rules.
     ("Password", re.compile(r"PWD-[A-Za-z0-9$'`\"\\]{8,}"), {}),
+    # Like TruffleHog's keyword detectors: a vendor name within 40 characters before a run of the
+    # right shape; the run alone is reported. Lock files trip them with checksums and commit ids
+    # next to package names (measured: every real release from 3.0 to 3.99 does this).
+    ("SentryToken", re.compile(r"(?i)sentry(?:.|\n){0,40}?\b([a-f0-9]{64})\b"), {}),
+    ("CloudflareApiToken", re.compile(r"(?i)cloudflare(?:.|\n){0,40}?\b([A-Za-z0-9_-]{40})\b"), {}),
 ]
 AWS_ID = re.compile(r"\bAKIA[0-9A-Z]{16}\b")
 AWS_SECRET = re.compile(r"(?<![A-Za-z0-9/+=])[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])")
@@ -92,10 +97,11 @@ def scan_file(path, log_level=0):
         text = data.decode("utf-8", "replace")
     for detector, pattern, extra in DETECTORS:
         for match in pattern.finditer(text):
-            raw = match.group(0)
+            group = 1 if match.lastindex else 0   # keyword detectors report the run after the keyword
+            raw = match.group(group)
             if detector == "PrivateKey":  # like the real detector: report the decoded key
                 raw = raw.replace("\\n", "\n")
-            emit(path, text, match.start(), detector, raw, "", extra, decoder)
+            emit(path, text, match.start(group), detector, raw, "", extra, decoder)
     ids = list(AWS_ID.finditer(text))
     if ids:
         secrets = [m.group(0) for m in AWS_SECRET.finditer(text) if not m.group(0).startswith("AKIA")]
