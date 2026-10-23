@@ -17,11 +17,13 @@ import gzip
 import lzma
 import hashlib
 import io
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import atexit
 import tempfile
 import unittest
 import tarfile
@@ -82,6 +84,17 @@ FILES = {
     "node_modules/pkg/.env": "TOKEN=%s\n" % GITHUB_TOKEN,
 }
 ENCRYPTED_LINE = r'^%s=[\'"`]?encrypted:'   # dotenvx keeps the quote style of the line it rewrites
+
+B64_FILL = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ+/" * 2
+DIGEST_SHAPES = {"sha1": (27, "="), "sha256": (43, "="), "sha384": (64, ""), "sha512": (86, "=="), "h1": (43, "=")}
+
+
+def integrity_hash(algo, token, extra=0):
+    """A package integrity hash as package-lock.json, yarn.lock and go.sum hold them, of the
+    algorithm's exact base64 length (extra lengthens or shortens it) with token inside it."""
+    length, padding = DIGEST_SHAPES[algo]
+    body = (token + "/" + B64_FILL)[:length + extra]
+    return "%s%s%s%s" % (algo, ":" if algo == "h1" else "-", body, padding)
 
 
 def encrypted(key, text):
@@ -149,10 +162,15 @@ FAKE_KNOBS = ("TRUFFLEHOG_BIN", "DOTENVX_BIN", "FAKE_DOTENVX_FAIL", "FAKE_DOTENV
               "FAKE_TRUFFLEHOG_FAIL", "FAKE_TRUFFLEHOG_PARTIAL", "FAKE_DOTENVX_VERSION", "FAKE_TRUFFLEHOG_VINTAGE")
 
 
+LOG_TMP = tempfile.mkdtemp(prefix="sweep-logs-")   # run logs of the tests, removed at exit
+atexit.register(shutil.rmtree, LOG_TMP, True)
+
+
 def clean_env(extra_env=None, path=None):
     env = dict(os.environ)
     env["PATH"] = (FAKEBIN + os.pathsep + env.get("PATH", "")) if path is None else path
     env["NO_COLOR"] = "1"
+    env["SWEEP_AND_SECURE_LOG_DIR"] = LOG_TMP
     for name in FAKE_KNOBS:
         env.pop(name, None)
     if extra_env:
@@ -179,6 +197,11 @@ def dotenvx_get(root, key, env_file=".env", keys_file=None, binary=None):
     out, _ = proc.communicate()
     out = out.decode("utf-8")
     return out[:-1] if out.endswith("\n") else out
+
+
+def read_file(path):
+    with io.open(path, encoding="utf-8") as fh:
+        return fh.read()
 
 
 def item_number(listing, detector, key, where=None):
@@ -385,12 +408,12 @@ class EndToEndTests(unittest.TestCase):
         # archives get their own section: which files inside hold which secrets, and the action.
         # An interactive run offers to quarantine them, and a dry run previews that.
         self.assertIn("Plaintext secrets found: 11 in 8 file(s)", out)   # archives are not counted here
-        self.assertIn("Archives holding secrets: 2", out)
-        self.assertIn("File inside", out)
-        self.assertIn("build/keys.zip (zip)", out)
+        self.assertIn("Files holding secrets that cannot be fixed in place: 2", out)
+        self.assertIn("Why / inside", out)
+        self.assertIn("zip: config/prod.env", out)
         self.assertIn("config/prod.env", out)        # the member that holds the Stripe key
         self.assertIn("Stripe sk_l", out)
-        self.assertIn("build/blob.txt.gz (gzip)", out)
+        self.assertIn("gzip: blob.txt", out)
         self.assertIn("blob.txt ", out)              # gzip: the original file name from the header
         self.assertIn("Github ghp_", out)
         self.assertIn("move to .secrets-quarantine/build/blob.txt.gz", out)
@@ -400,7 +423,7 @@ class EndToEndTests(unittest.TestCase):
         code, out, err = run_script(self.tree.root, ["--dry-run", "--yes"])
         self.assertEqual(code, 0, out + err)
         self.assertIn("Plaintext secrets found: 11 in 8 file(s)", out)
-        self.assertIn("Archives holding secrets: 2", out)
+        self.assertIn("Files holding secrets that cannot be fixed in place: 2", out)
         self.assertIn("config/prod.env", out)
         self.assertIn("stays in place (pass --quarantine to move it)", out)
         self.assertNotIn("move to .secrets-quarantine", out)
@@ -417,7 +440,7 @@ class EndToEndTests(unittest.TestCase):
     def test_answering_no_changes_nothing(self):
         code, out, err = run_script(self.tree.root, [], stdin_text="n\n")
         self.assertEqual(code, 2, out + err)
-        self.assertIn("Encrypt 11 secret(s) and move 2 archive(s) to quarantine now?", out)
+        self.assertIn("Encrypt 11 secret(s) and move 2 file(s) to quarantine now?", out)
         self.assertIn("Nothing encrypted", out)
         self.assertUnchanged()
 
@@ -427,7 +450,7 @@ class EndToEndTests(unittest.TestCase):
         for rel in ("build/keys.zip", "build/blob.txt.gz"):
             self.assertFalse(os.path.exists(self.tree.path(rel)), rel)
             self.assertTrue(os.path.isfile(self.tree.path(".secrets-quarantine/" + rel)), rel)
-        self.assertIn("2 archive(s) moved to .secrets-quarantine", out)
+        self.assertIn("2 file(s) moved to .secrets-quarantine", out)
         self.assertIn("/.secrets-quarantine/", self.tree.read(".gitignore"))
         self.assertTrue(encrypted("STRIPE_SECRET_KEY", self.tree.read(".env")))
 
@@ -473,7 +496,7 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn(".env.keys*", self.tree.read(".gitignore"))
         self.assertUnchanged("node_modules/pkg/.env", "build/blob.txt.gz", "build/keys.zip", "config/.env.production")
         self.assertIn("Done: 7 secret(s) stored encrypted; 11 plaintext occurrence(s) removed from 7 file(s);"
-                      " 2 need manual attention", out)
+                      " 2 file(s) need manual attention", out)
         self.assertIn("Next steps", out)
         self.assertIn("dotenvx run -- <your command>", out)
         self.assertNotIn(" -fk ", out)                   # .env and .env.keys share a folder
@@ -653,7 +676,9 @@ class EndToEndTests(unittest.TestCase):
         self.tree.write("docs/pw.md", ("login: %s\nadmin: %s\n" % (PWD_APOS_DOLLAR, PWD_APOS_BACKSLASH)).encode("utf-8"))
         code, out, err = run_script(self.tree.root, ["--yes"])
         self.assertEqual(code, 0, out + err)
-        self.assertIn("dotenvx cannot store this value exactly (it contains both an apostrophe and a backslash)", out)
+        self.assertIn("value cannot be stored exactly by dotenvx (it contains both an apostrophe and a backslash)", out)
+        self.assertIn("stays in place: its other secrets are fixed above; handle this one by hand", out)
+        self.assertNotIn("move to .secrets-quarantine/docs/pw.md", out)
         pw = self.tree.read("docs/pw.md")
         self.assertIn(PWD_APOS_BACKSLASH, pw)            # left alone
         self.assertNotIn(PWD_APOS_DOLLAR, pw)            # moved
@@ -702,22 +727,267 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("node_modules/pkg/.env", out)     # the vendor folder is scanned now
         self.assertNotIn(".env.keys", out.split("Plaintext secrets found")[1])   # the key file never is
 
-    def test_example_env_files_are_left_for_manual_attention(self):
+    def test_example_env_files_are_offered_for_quarantine_not_encrypted(self):
         self.tree.write(".env.example", ("STRIPE_SECRET_KEY=%s\nPORT=1\n" % STRIPE_KEY).encode("utf-8"))
         code, out, err = run_script(self.tree.root, ["--dry-run", "--env-all"])
         self.assertEqual(code, 0, out + err)
-        self.assertIn("example/template env file", out)
-        self.assertNotIn(".env.example:1", out)          # not a numbered item
+        self.assertIn("example env file", out)
+        self.assertIn("move to .secrets-quarantine/.env.example", out)
+        self.assertNotIn(".env.example:1", out)          # not an encrypt-in-place item
         self.assertNotIn(".env.example: PORT", out)      # not in the --env-all inventory either
 
-    def test_lock_files_and_pdfs_are_left_for_manual_attention(self):
+    def test_every_file_that_cannot_be_fixed_in_place_is_offered_for_quarantine(self):
         self.tree.write("package-lock.json", ('{"resolved": "https://npm.pkg.github.com/x?token=%s"}\n'
                                               % GITHUB_TOKEN).encode("utf-8"))
         self.tree.write("docs/report.pdf", ("%%PDF-1.4 token %s\n" % GITHUB_TOKEN).encode("utf-8"))
+        self.tree.write("vendor/thing.bin", b"\x00\x01binary " + SLACK.encode("utf-8") + b"\x00\xff")
+        self.tree.write(".secrets-quarantine/build/keys.zip", b"earlier copy")   # a name that is taken
+        self.before = self.tree.snapshot()
         code, out, err = run_script(self.tree.root, ["--dry-run"])
         self.assertEqual(code, 0, out + err)
-        self.assertIn("generated lock file", out)
-        self.assertIn("PDF - rewriting bytes would corrupt it", out)
+        self.assertIn("Files holding secrets that cannot be fixed in place: 5", out)
+        for rel, why in (("package-lock.json", "generated lock file"), ("docs/report.pdf", "PDF"),
+                         ("vendor/thing.bin", "binary file"), ("build/keys.zip", "zip: config/prod.env"),
+                         ("build/blob.txt.gz", "gzip: blob.txt")):
+            self.assertIn("move to .secrets-quarantine/" + rel, out)
+            self.assertIn(why, out)
+        # --yes alone leaves them; --yes --quarantine moves them, a taken name gets a suffix
+        code, out, err = run_script(self.tree.root, ["--dry-run", "--yes"])
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(out.count("stays in place (pass --quarantine to move it)"), 5)
+        self.assertNotIn("move to .secrets-quarantine", out)
+        code, out, err = run_script(self.tree.root, ["--yes", "--quarantine"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("5 file(s) moved to .secrets-quarantine", out)
+        self.assertIn("build/keys.zip: moved to .secrets-quarantine/build/keys.zip.1", out)
+        for rel in ("package-lock.json", "docs/report.pdf", "vendor/thing.bin", "build/blob.txt.gz", "build/keys.zip"):
+            self.assertFalse(os.path.exists(self.tree.path(rel)), rel)
+        self.assertEqual(self.tree.read_bytes(".secrets-quarantine/build/keys.zip"), b"earlier copy")
+        self.assertEqual(self.tree.read_bytes(".secrets-quarantine/build/keys.zip.1"), self.before[os.path.join("build", "keys.zip")])
+        manifest = self.tree.read(".secrets-quarantine/MANIFEST.txt")
+        self.assertIn("build/keys.zip.1  <- build/keys.zip  (Stripe)  why: zip archive  inside: config/prod.env", manifest)
+        self.assertIn("package-lock.json  <- package-lock.json  (Github)  why: generated lock file", manifest)
+        self.assertIn("docs/report.pdf  <- docs/report.pdf  (Github)  why: PDF", manifest)
+        index = json.loads(self.tree.read(".secrets-quarantine/index.json"))
+        by_original = dict((r["original"], r) for r in index)
+        self.assertEqual(by_original["build/keys.zip"]["quarantined"], "build/keys.zip.1")
+        self.assertEqual(by_original["vendor/thing.bin"]["why"], "binary file")
+        self.assertEqual(by_original["vendor/thing.bin"]["detectors"], ["SlackWebhook"])
+        self.assertTrue(by_original["docs/report.pdf"]["original_absolute"].endswith("docs/report.pdf"))
+        self.assertIn("moved to quarantine:   build/keys.zip  ->  .secrets-quarantine/build/keys.zip.1", out) if "moved to quarantine:" in out else None
+        # afterwards nothing is left to offer, and the quarantine folder itself is never listed
+        code, out, err = run_script(self.tree.root, ["--dry-run"])
+        self.assertEqual(code, 0, out + err)
+        self.assertNotIn("cannot be fixed in place", out)
+        self.assertNotIn(".secrets-quarantine/", out)
+        self.assertNoLeftovers()
+
+    def test_quarantine_never_overwrites_its_own_manifest_or_index(self):
+        # files in the swept folder named like the quarantine's own records get a suffix
+        for name in ("index.json", "MANIFEST.txt"):
+            self.tree.write(name, b"\x00binary " + SLACK.encode("utf-8") + b"\x00")
+        self.before = self.tree.snapshot()
+        code, out, err = run_script(self.tree.root, ["--dry-run"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("move to .secrets-quarantine/index.json.1", out)
+        self.assertIn("move to .secrets-quarantine/MANIFEST.txt.1", out)
+        code, out, err = run_script(self.tree.root, ["--yes", "--quarantine"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("index.json: moved to .secrets-quarantine/index.json.1", out)
+        self.assertIn("MANIFEST.txt: moved to .secrets-quarantine/MANIFEST.txt.1", out)
+        self.assertEqual(self.tree.read_bytes(".secrets-quarantine/index.json.1"), self.before["index.json"])
+        self.assertEqual(self.tree.read_bytes(".secrets-quarantine/MANIFEST.txt.1"), self.before["MANIFEST.txt"])
+        index = json.loads(self.tree.read(".secrets-quarantine/index.json"))
+        by_original = dict((r["original"], r) for r in index)
+        self.assertEqual(by_original["index.json"]["quarantined"], "index.json.1")
+        self.assertEqual(by_original["MANIFEST.txt"]["quarantined"], "MANIFEST.txt.1")
+        manifest = self.tree.read(".secrets-quarantine/MANIFEST.txt")
+        self.assertIn("index.json.1  <- index.json  (SlackWebhook)  why: binary file", manifest)
+        self.assertIn("MANIFEST.txt.1  <- MANIFEST.txt  (SlackWebhook)  why: binary file", manifest)
+        self.assertEqual(len(index), 4)   # both, and the two archives of the tree
+        self.assertNoLeftovers()
+
+    def test_an_unstorable_value_in_several_files_leaves_every_copy_for_quarantine(self):
+        for rel in ("docs/a.md", "docs/b.md"):
+            self.tree.write(rel, ("admin: %s\n" % PWD_APOS_BACKSLASH).encode("utf-8"))
+        code, out, err = run_script(self.tree.root, ["--dry-run"])
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(out.count("value cannot be stored exactly by dotenvx"), 2)
+        self.assertNotIn("replace with ${ADMIN}", out)   # the second copy must not point at a key never written
+        self.assertIn("move to .secrets-quarantine/docs/a.md", out)
+        self.assertIn("move to .secrets-quarantine/docs/b.md", out)
+        code, out, err = run_script(self.tree.root, ["--yes", "--quarantine"])
+        self.assertEqual(code, 0, out + err)
+        self.assertNotIn("[!!]", out)
+        for rel in ("docs/a.md", "docs/b.md"):
+            self.assertFalse(os.path.exists(self.tree.path(rel)), rel)
+            self.assertIn(PWD_APOS_BACKSLASH, self.tree.read(".secrets-quarantine/" + rel))
+        self.assertNoLeftovers()
+
+    def test_the_env_file_receiving_secrets_is_never_quarantined(self):
+        # .env holds only a secret that cannot be fixed (too short), yet it is where the secrets
+        # moved out of src/app.py go: moving it would leave their placeholders pointing at nothing
+        tree = ProjectTree({".env": "PORT=3000\nSHORT=PWD-abcdefgh\n",
+                            "src/app.py": 'STRIPE = "%s"\n' % STRIPE_KEY})
+        try:
+            code, out, err = run_script(tree.root, ["--dry-run", "--yes", "--quarantine", "--min-length", "16"])
+            self.assertEqual(code, 0, out + err)
+            self.assertIn("secret shorter than 16 characters (--min-length)", out)
+            self.assertIn("stays in place: secrets from other files are stored in it; handle this one by hand", out)
+            self.assertNotIn("move to .secrets-quarantine/.env", out)
+            code, out, err = run_script(tree.root, ["--yes", "--quarantine", "--min-length", "16"])
+            self.assertEqual(code, 0, out + err)
+            self.assertTrue(os.path.isfile(tree.path(".env")))
+            env = tree.read(".env")
+            self.assertIn("SHORT=PWD-abcdefgh", env)                    # left for the hand
+            self.assertTrue(encrypted("STRIPE", env), env)              # the moved secret landed here
+            self.assertIn("${STRIPE}", tree.read("src/app.py"))
+            self.assertIn("1 file(s) need manual attention", out)
+            self.assertFalse(os.path.exists(tree.path(".secrets-quarantine/.env")))
+        finally:
+            tree.cleanup()
+
+    def test_compiled_code_is_skipped_by_default_and_only_listed_with_scan_compiled(self):
+        tree = ProjectTree({"app/settings.py": 'STRIPE = "%s"\n' % STRIPE_KEY})
+        try:
+            planted = ("\0AWS_ACCESS_KEY_ID=%s\0AWS_SECRET_ACCESS_KEY=%s\0%s\0" % (AWS_ID, AWS_SECRET, SLACK)).encode("utf-8")
+            elf = b"\x7fELF\x02\x01\x01" + b"\x00" * 9 + b"\x03\x00\x3e\x00" + planted + b"\x00" * 64
+            tree.write("lib/libplanted.so.1", elf)       # compiled by name
+            tree.write("bin/tool", elf)                    # compiled by its first bytes only
+            tree.write("app/mod.cpython-311.pyc", b"\xa7\r\r\n" + b"\x00" * 12 + ("token %s\0" % GITHUB_TOKEN).encode("utf-8"))
+            tree.write("vendor/blob.bin", b"\x00\x01data " + SLACK.encode("utf-8") + b"\x00")   # a data file, not a program
+            code, out, err = run_script(tree.root, ["--dry-run"])
+            self.assertEqual(code, 0, out + err)
+            self.assertIn("Skipped 3 compiled file(s) (.pyc 1, .so 1, ELF binary 1): a secret compiled into a program", out)
+            self.assertNotIn("move to .secrets-quarantine/lib", out)
+            self.assertNotIn("move to .secrets-quarantine/bin", out)
+            self.assertNotIn("move to .secrets-quarantine/app", out)
+            self.assertIn("move to .secrets-quarantine/vendor/blob.bin", out)    # data binaries keep the offer
+            self.assertIn("Files holding secrets that cannot be fixed in place: 3", out)   # the tree's two archives, and it
+            # --scan-compiled lists them read-only, with the surrounding string and every secret masked
+            code, out, err = run_script(tree.root, ["--dry-run", "--scan-compiled"])
+            self.assertEqual(code, 0, out + err)
+            self.assertIn("Findings in compiled code: 5 in 3 file(s)  (listed only: never rewritten or moved)", out)
+            self.assertRegex(out, r"lib/libplanted\.so\.1\s+\.so file\s+AWS\s+AKIA\.\.\.M2\s+AWS_ACCESS_KEY_ID=AKIA\.\.\.M2")
+            self.assertRegex(out, r"bin/tool\s+ELF binary\s+SlackWebhook\s+http\.\.\.wX\s+http\.\.\.wX")
+            self.assertRegex(out, r"app/mod\.cpython-311\.pyc\s+\.pyc file\s+Github\s+ghp_\.\.\.ij\s+token ghp_\.\.\.ij")
+            self.assertIn("this TruffleHog (3.99.0) skips compiled files itself", out)   # the stand-in says it is 3.99
+            self.assertNotIn("Skipped", out)
+            for secret in (AWS_ID, AWS_SECRET, SLACK, GITHUB_TOKEN):
+                self.assertNotIn(secret, out)
+            log = read_file(re.search(r"^Log: (.*)$", out, re.M).group(1).strip())
+            self.assertIn("(shown on the screen only)", log)      # the surroundings stay off the log
+            self.assertNotIn("AWS_ACCESS_KEY_ID=", log)
+            self.assertNotIn(AWS_ID, log)
+            # nothing in compiled code is ever rewritten or moved, whatever the flags
+            before = tree.snapshot()
+            code, out, err = run_script(tree.root, ["--yes", "--quarantine", "--scan-compiled"])
+            self.assertEqual(code, 0, out + err)
+            for rel in ("lib/libplanted.so.1", "bin/tool", "app/mod.cpython-311.pyc"):
+                self.assertEqual(tree.read_bytes(rel), before[rel.replace("/", os.sep)], rel)
+            self.assertFalse(os.path.exists(tree.path("vendor/blob.bin")))   # the data file was moved
+            self.assertIn("were listed and left alone", out)
+            # an old TruffleHog that takes no exclusions reads them anyway: still set aside, same count
+            code, out, err = run_script(tree.root, ["--dry-run"], extra_env={"FAKE_TRUFFLEHOG_VINTAGE": "3.12"})
+            self.assertEqual(code, 0, out + err)
+            self.assertIn("Skipped 3 compiled file(s) (.pyc 1, .so 1, ELF binary 1)", out)
+            self.assertNotIn("libplanted", out)
+            code, out, err = run_script(tree.root, ["--dry-run", "--scan-compiled"], extra_env={"FAKE_TRUFFLEHOG_VINTAGE": "3.12"})
+            self.assertEqual(code, 0, out + err)
+            self.assertIn("Findings in compiled code: 5 in 3 file(s)", out)
+            self.assertNotIn("skips compiled files itself", out)   # 3.12 still reads them: no such note
+        finally:
+            tree.cleanup()
+
+    def test_integrity_hashes_in_lock_files_are_not_secrets(self):
+        # an AWS-looking string inside an npm sha512 integrity hash: a checksum, not a key
+        hash_line = '"integrity": "%s"' % integrity_hash("sha512", AWS_ID)
+        self.tree.write("package-lock.json", ('{"pkg": {%s}}\n' % hash_line).encode("utf-8"))
+        self.tree.write("go.sum", ("example.com/mod v1.0.0 %s\n" % integrity_hash("h1", AWS_ID)).encode("utf-8"))
+        # a string of the wrong length for its algorithm is not a checksum, whatever its prefix
+        self.tree.write("yarn.lock", ("  integrity %s\n" % integrity_hash("sha512", AWS_ID, 5)).encode("utf-8"))
+        code, out, err = run_script(self.tree.root, ["--dry-run"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("Set aside 2 finding(s) that sit inside package integrity hashes", out)
+        self.assertIn("Each is named in the run log.", out)
+        self.assertNotIn("package-lock.json", out)
+        self.assertNotIn("go.sum", out)
+        self.assertIn("move to .secrets-quarantine/yarn.lock", out)
+        log = read_file(re.search(r"^Log: (.*)$", out, re.M).group(1).strip())
+        self.assertIn("set aside, inside a package integrity hash: package-lock.json line 1 (AWS)", log)
+        self.assertIn("set aside, inside a package integrity hash: go.sum line 1 (AWS)", log)
+        self.assertNotIn(AWS_ID, log)
+        code, out, err = run_script(self.tree.root, ["--yes", "--quarantine"])
+        self.assertEqual(code, 0, out + err)
+        self.assertTrue(os.path.isfile(self.tree.path("package-lock.json")))   # never moved over a checksum
+        self.assertTrue(os.path.isfile(self.tree.path("go.sum")))
+        self.assertFalse(os.path.exists(self.tree.path("yarn.lock")))
+
+    def test_a_text_file_with_fixable_and_unfixable_secrets_stays_in_place(self):
+        self.tree.write("conf/app.yml", ("stripe: %s\ntoken: PWD-abcdefgh\n" % STRIPE_KEY).encode("utf-8"))
+        code, out, err = run_script(self.tree.root, ["--yes", "--quarantine", "--min-length", "16"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("secret shorter than 16 characters (--min-length)", out)
+        self.assertIn("stays in place: its other secrets are fixed above; handle this one by hand", out)
+        text = self.tree.read("conf/app.yml")
+        self.assertNotIn(STRIPE_KEY, text)                 # the fixable secret was handled
+        self.assertIn("PWD-abcdefgh", text)                # the short one is still there, for the hand
+        self.assertTrue(os.path.isfile(self.tree.path("conf/app.yml")))   # not moved
+
+    def test_run_warning_names_the_mode_and_the_setup_check_has_none(self):
+        notice = "this is a security tool that changes files on purpose"
+        code, out, err = run_script(self.tree.root, ["--dry-run"])
+        self.assertIn(notice, out)
+        self.assertIn("This is a dry run: nothing is changed.", out)
+        code, out, err = run_script(self.tree.root, ["--yes", "--no-rewrite"])
+        self.assertIn("--yes was given: it will not ask before changing them.", out)
+        code, out, err = run_script(self.tree.root, [], stdin_text="n\n")
+        self.assertIn("Nothing is changed before you confirm.", out)
+        code, out, err = run_script(self.tree.root, ["--check-setup"])
+        self.assertNotIn(notice, out)
+
+    def test_a_log_of_every_run_is_kept_in_the_common_folder(self):
+        logs = tempfile.mkdtemp(prefix="sweep-logtest-")
+        try:
+            for n in range(101):   # old logs beyond LOG_KEEP are dropped
+                with io.open(os.path.join(logs, "2020-01-01T00-00-%02dZ-old-%d.log" % (n % 60, n)), "w") as fh:
+                    fh.write(u"old\n")
+            foreign = ("1999-app.log", "server.log", "2020-01-01.log", "notes.txt")   # a shared folder: not ours
+            for name in foreign:
+                with io.open(os.path.join(logs, name), "w") as fh:
+                    fh.write(u"someone else's\n")
+            code, out, err = run_script(self.tree.root, ["--dry-run"], extra_env={"SWEEP_AND_SECURE_LOG_DIR": logs})
+            self.assertEqual(code, 0, out + err)
+            for name in foreign:
+                self.assertTrue(os.path.isfile(os.path.join(logs, name)), name)
+            names = sorted(name for name in os.listdir(logs) if sas.RUN_LOG_NAME_RE.match(name))
+            self.assertEqual(len(names), sas.LOG_KEEP)
+            newest = os.path.join(logs, names[-1])
+            self.assertIn("Log: " + newest, out)
+            text = read_file(newest)
+            for needle in ("sweep-and-secure %s" % sas.__version__, "| $ ", "trufflehog", "Plaintext secrets found",
+                           "Dry run: nothing was changed.", "| exit code 0"):
+                self.assertIn(needle, text)
+            self.assertNotIn(STRIPE_KEY, text)             # masked previews only, never the values
+            self.assertNotIn(AWS_SECRET, text)
+            # --log-dir picks the folder, --no-log writes nothing
+            other = os.path.join(logs, "elsewhere")
+            code, out, err = run_script(self.tree.root, ["--dry-run", "--log-dir", other], extra_env={"SWEEP_AND_SECURE_LOG_DIR": logs})
+            self.assertEqual(code, 0, out + err)
+            self.assertEqual(len(os.listdir(other)), 1)
+            before = set(os.listdir(logs))
+            code, out, err = run_script(self.tree.root, ["--dry-run", "--no-log"], extra_env={"SWEEP_AND_SECURE_LOG_DIR": logs})
+            self.assertEqual(code, 0, out + err)
+            self.assertNotIn("Log: ", out)
+            self.assertEqual(set(os.listdir(logs)), before)
+            # the prompts and answers are logged too
+            code, out, err = run_script(self.tree.root, [], stdin_text="n\n", extra_env={"SWEEP_AND_SECURE_LOG_DIR": logs})
+            newest = sorted(name for name in os.listdir(logs) if sas.RUN_LOG_NAME_RE.match(name))[-1]
+            text = read_file(os.path.join(logs, newest))
+            self.assertIn("(s = choose which): n", text)
+            self.assertIn("| exit code 2", text)
+        finally:
+            shutil.rmtree(logs, ignore_errors=True)
 
     def test_utf16_source_file_is_rewritten_in_its_own_encoding(self):
         text = u"token = '%s'\r\n" % GITHUB_TOKEN
@@ -750,7 +1020,7 @@ class EndToEndTests(unittest.TestCase):
             tf.addfile(info, io.BytesIO(data))
         self.before = self.tree.snapshot()
         _, listing, _ = run_script(self.tree.root, ["--dry-run", "--quarantine"])
-        self.assertIn(u"build/old.tar.gz (tar.gz)", listing)
+        self.assertIn(u"build/old.tar.gz", listing)
         # the undecodable byte shows as U+FFFD, or as ? on a console that cannot show that
         self.assertTrue(u"caf\ufffd.txt" in listing or u"caf?.txt" in listing, listing)
         self.assertIn("move to .secrets-quarantine/build/keys.zip", listing)
@@ -762,13 +1032,19 @@ class EndToEndTests(unittest.TestCase):
             self.assertFalse(os.path.exists(self.tree.path(rel)), rel)
             self.assertEqual(self.tree.read_bytes(".secrets-quarantine/" + rel), self.before[rel.replace("/", os.sep)])
         manifest = self.tree.read(".secrets-quarantine/MANIFEST.txt")
-        self.assertIn("build/keys.zip  <- build/keys.zip  (Stripe)  inside: config/prod.env", manifest)
-        self.assertIn("build/blob.txt.gz  <- build/blob.txt.gz  (Github)  inside: blob.txt", manifest)
-        self.assertIn(u"build/old.tar.gz  <- build/old.tar.gz  (Stripe)  inside: caf\ufffd.txt", manifest)
+        self.assertIn("build/keys.zip  <- build/keys.zip  (Stripe)  why: zip archive  inside: config/prod.env", manifest)
+        self.assertIn("build/blob.txt.gz  <- build/blob.txt.gz  (Github)  why: gzip archive  inside: blob.txt", manifest)
+        self.assertIn(u"build/old.tar.gz  <- build/old.tar.gz  (Stripe)  why: tar.gz archive  inside: caf\ufffd.txt", manifest)
         self.assertTrue(os.path.isfile(self.tree.path(".secrets-quarantine/build/old.tar.gz")))
-        self.assertIn("3 archive(s) moved to .secrets-quarantine", out)
+        index = json.loads(self.tree.read(".secrets-quarantine/index.json"))
+        self.assertEqual(sorted((r["original"], r["quarantined"]) for r in index),
+                         [("build/blob.txt.gz", "build/blob.txt.gz"), ("build/keys.zip", "build/keys.zip"),
+                          ("build/old.tar.gz", "build/old.tar.gz")])
+        self.assertEqual([r["why"] for r in index if r["original"] == "build/keys.zip"], ["zip archive"])
+        self.assertEqual([r["inside"] for r in index if r["original"] == "build/keys.zip"], [["config/prod.env"]])
+        self.assertIn("3 file(s) moved to .secrets-quarantine", out)
         self.assertIn("/.secrets-quarantine/", self.tree.read(".gitignore"))
-        self.assertIn("moved to .secrets-quarantine (see its MANIFEST.txt", out)
+        self.assertIn("moved to .secrets-quarantine; its MANIFEST.txt and index.json map each one to where it came from", out)
         # the quarantine folder is never scanned, with or without the flag
         for extra in ([], ["--quarantine"], ["--no-default-excludes"]):
             code, out, err = run_script(self.tree.root, ["--dry-run"] + extra)
@@ -1152,7 +1428,7 @@ class UnitTests(unittest.TestCase):
             args = sas.parse_args([folder, "--yes"])
             rules = [re.compile(p) for p in sas.DEFAULT_EXCLUDES]
             plan = sas.build_plan([finding], folder, os.path.join(folder, ".env"), args, [], rules)
-            self.assertEqual((plan.ignored, plan.items, plan.skipped), (1, [], []))
+            self.assertEqual((plan.ignored, plan.items, list(plan.unfixable)), (1, [], []))
             plan = sas.build_plan([finding], folder, os.path.join(folder, ".env"), args, [], [])
             self.assertEqual(len(plan.items), 1)
         finally:
@@ -1210,7 +1486,7 @@ class UnitTests(unittest.TestCase):
                 z.writestr("nested/keys.zip", inner.getvalue())
                 z.writestr("nested/docs.tar.gz", tgz.getvalue())
                 z.writestr("misc/notes.txt", "the stripe key again: %s\n" % STRIPE_KEY)
-            archive = sas.Archive(outer, "zip")
+            archive = sas.Unfixable(outer, "zip" + u" archive", "zip")
             archive.findings = [self.finding(outer, "Stripe", STRIPE_KEY),
                                 self.finding(outer, "AWS", AWS_ID, "%s:%s" % (AWS_ID, AWS_SECRET)),
                                 self.finding(outer, "SlackWebhook", SLACK),
@@ -1227,7 +1503,7 @@ class UnitTests(unittest.TestCase):
             gz = os.path.join(folder, "dump.sql.gz")
             with gzip.open(gz, "wb") as fh:
                 fh.write(("insert %s\n" % STRIPE_KEY).encode("utf-8"))
-            archive = sas.Archive(gz, "gzip")
+            archive = sas.Unfixable(gz, "gzip" + u" archive", "gzip")
             archive.findings = [self.finding(gz, "Stripe", STRIPE_KEY)]
             sas.inspect_archive(archive)
             self.assertEqual([m for m, _ in archive.inside], ["dump.sql"])
@@ -1236,7 +1512,7 @@ class UnitTests(unittest.TestCase):
             seven = os.path.join(folder, "old.7z")
             with io.open(seven, "wb") as fh:
                 fh.write(b"7z\xbc\xaf\x27\x1c" + b"\x00" * 40)
-            archive = sas.Archive(seven, "7z")
+            archive = sas.Unfixable(seven, "7z" + u" archive", "7z")
             archive.findings = [self.finding(seven, "Stripe", STRIPE_KEY)]
             sas.inspect_archive(archive)
             self.assertEqual(archive.inside, [])
@@ -1259,7 +1535,7 @@ class UnitTests(unittest.TestCase):
                 fh.write(body)
             for name, kind, member in (("dump.sql.gz", "gzip", "dump.sql"), ("notes.bz2", "bzip2", "notes"),
                                        ("report.txt.xz", "xz", "report.txt")):
-                archive = sas.Archive(os.path.join(folder, name), kind)
+                archive = sas.Unfixable(os.path.join(folder, name), kind + u" archive", kind)
                 archive.findings = [self.finding(archive.path, "Stripe", STRIPE_KEY)]
                 sas.inspect_archive(archive)
                 self.assertEqual([m for m, _ in archive.inside], [member], name)
@@ -1276,7 +1552,7 @@ class UnitTests(unittest.TestCase):
                 info = tarfile.TarInfo(u"caf\u00e9.txt")
                 info.size = len(data)
                 tf.addfile(info, io.BytesIO(data))
-            archive = sas.Archive(path, "tar")
+            archive = sas.Unfixable(path, "tar" + u" archive", "tar")
             archive.findings = [self.finding(path, "Stripe", STRIPE_KEY)]
             sas.inspect_archive(archive)
             self.assertEqual([m for m, _ in archive.inside], [u"caf\ufffd.txt"])
@@ -1301,14 +1577,14 @@ class UnitTests(unittest.TestCase):
             with zipfile.ZipFile(path, "w") as z:
                 z.writestr("logs/huge.log", padding + STRIPE_KEY.encode("utf-8") + b"\n" + b"y" * 3000)
                 z.writestr("logs/other.log", b"z" * 5000)
-            archive = sas.Archive(path, "zip")
+            archive = sas.Unfixable(path, "zip" + u" archive", "zip")
             archive.findings = [self.finding(path, "Stripe", STRIPE_KEY)]
             sas.INSPECT_FULL_READ_BYTES, sas.INSPECT_CHUNK = 1000, 1024   # the key straddles a chunk boundary
             sas.inspect_archive(archive)
             self.assertEqual([m for m, _ in archive.inside], ["logs/huge.log"])
             self.assertEqual(archive.note, "")
             sas.INSPECT_BUDGET_BYTES = 2000   # not enough to read everything: say so, keep what was seen
-            archive = sas.Archive(path, "zip")
+            archive = sas.Unfixable(path, "zip" + u" archive", "zip")
             archive.findings = [self.finding(path, "Stripe", STRIPE_KEY)]
             sas.inspect_archive(archive)
             self.assertIn("stopped looking after 0 MB of content; the rest was not checked", archive.note)
@@ -1321,7 +1597,7 @@ class UnitTests(unittest.TestCase):
             path = os.path.join(folder, "wrapped.zip")
             with zipfile.ZipFile(path, "w") as z:
                 z.writestr("logs/big.log.gz", inner.getvalue())
-            archive = sas.Archive(path, "zip")
+            archive = sas.Unfixable(path, "zip" + u" archive", "zip")
             archive.findings = [self.finding(path, "Stripe", STRIPE_KEY)]
             sas.inspect_archive(archive)
             self.assertEqual([m for m, _ in archive.inside], ["logs/big.log.gz!big.log"])
@@ -1329,6 +1605,114 @@ class UnitTests(unittest.TestCase):
         finally:
             sas.INSPECT_FULL_READ_BYTES, sas.INSPECT_CHUNK, sas.INSPECT_BUDGET_BYTES = saved
             shutil.rmtree(folder, ignore_errors=True)
+
+    def test_compiled_kind(self):
+        folder = tempfile.mkdtemp(prefix="sweep-compiled-")
+        try:
+            def make(name, data=b"\x00" * 8):
+                path = os.path.join(folder, name)
+                with io.open(path, "wb") as fh:
+                    fh.write(data)
+                return path
+            self.assertEqual(sas.compiled_kind(make("libz.so.1.2.11")), ".so file")
+            self.assertEqual(sas.compiled_kind(make("Thing.DLL")), ".dll file")
+            self.assertEqual(sas.compiled_kind(make("mod.cpython-311.pyc")), ".pyc file")
+            self.assertEqual(sas.compiled_kind(make("Main.class", b"text")), ".class file")
+            self.assertEqual(sas.compiled_kind(make("tool", b"\x7fELF" + b"\x00" * 60)), "ELF binary")
+            self.assertEqual(sas.compiled_kind(make("mach", b"\xcf\xfa\xed\xfe" + b"\x00" * 60)), "Mach-O binary")
+            self.assertEqual(sas.compiled_kind(make("module.wasm2", b"\x00asm\x01\x00\x00\x00")), "WebAssembly module")
+            pe = b"MZ" + b"\x00" * 58 + b"\x40\x00\x00\x00" + b"PE\x00\x00" + b"\x00" * 16
+            self.assertEqual(sas.compiled_kind(make("setup", pe)), "Windows PE binary")
+            # MZ without a PE header is text that happens to start with MZ, not a program
+            self.assertIsNone(sas.compiled_kind(make("notes.txt", b"MZ Corp quarterly notes\n" + b"x" * 64)))
+            self.assertIsNone(sas.compiled_kind(make("data.bin", b"\x00\x01\x02binary")))
+            self.assertIsNone(sas.compiled_kind(make("archive.zip", b"PK\x03\x04")))
+            self.assertIsNone(sas.compiled_kind(make("README.so.txt", b"text")))
+            self.assertIsNone(sas.compiled_kind(os.path.join(folder, "missing")))
+            cache = {}
+            path = make("cached", b"\x7fELF" + b"\x00" * 60)
+            self.assertEqual(sas.compiled_kind(path, cache), "ELF binary")
+            os.remove(path)
+            self.assertEqual(sas.compiled_kind(path, cache), "ELF binary")   # answered from the cache
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_strings_near_masks_every_reported_secret_and_stops_at_string_ends(self):
+        folder = tempfile.mkdtemp(prefix="sweep-near-")
+        try:
+            def make(name, data):
+                path = os.path.join(folder, name)
+                with io.open(path, "wb") as fh:
+                    fh.write(data)
+                return path
+            path = make("lib.so", ("\0\x01junk\0AWS_ACCESS_KEY_ID=%s\0AWS_SECRET_ACCESS_KEY=%s\0" % (AWS_ID, AWS_SECRET)).encode("utf-8"))
+            aws = sas.Finding(path, 0, "AWS", AWS_ID, AWS_ID + ":" + AWS_SECRET, False, "PLAIN", {})
+            secrets = [sas.to_bytes(c) for c in sas.candidate_secrets(aws)]
+            # cut at the NUL byte: the secret key in the next string is not shown
+            self.assertEqual(sas.strings_near(path, aws, secrets), "AWS_ACCESS_KEY_ID=AKIA...M2")
+            key = sas.Finding(path, 0, "AWS", AWS_SECRET, "", False, "PLAIN", {})
+            self.assertEqual(sas.strings_near(path, key, secrets), "AWS_SECRET_ACCESS_KEY=1tUm...IU")
+            # both on one line: the other reported secret is masked too
+            one_line = make("one.so", ("id=%s secret=%s\n" % (AWS_ID, AWS_SECRET)).encode("utf-8"))
+            self.assertEqual(sas.strings_near(one_line, aws, secrets), "id=AKIA...M2 secret=1tUm...IU")
+            # a long printable run is clipped either side
+            long_run = make("long.so", b"x" * 100 + AWS_ID.encode("utf-8") + b"y" * 100)
+            near = sas.strings_near(long_run, aws, secrets)
+            self.assertEqual(near, "..." + "x" * 40 + "AKIA...M2" + "y" * 40 + "...")
+            # a reported secret that starts inside the shown width but runs past it is masked, not cut
+            edge = make("edge.so", ("id=%s " % AWS_ID).encode("utf-8") + b"x" * 30 + AWS_SECRET.encode("utf-8") + b"\n")
+            near = sas.strings_near(edge, aws, secrets)
+            self.assertNotIn(AWS_SECRET[:8], near)
+            self.assertIn("1tUm...IU", near)
+            # a byte TruffleHog tacked on beyond the string (old releases) does not hide the match
+            extra = sas.Finding(path, 0, "AWS", AWS_ID + "Q", "", False, "PLAIN", {})
+            self.assertEqual(sas.strings_near(path, extra, secrets), "AWS_ACCESS_KEY_ID=AKIA...M2")
+            # not in the file as such, unreadable, empty
+            encoded = sas.Finding(path, 0, "X", "not-there-at-all-1234", "", False, "BASE64", {})
+            self.assertEqual(sas.strings_near(path, encoded, secrets), "")
+            self.assertEqual(sas.strings_near(os.path.join(folder, "missing"), aws, secrets), "")
+            self.assertEqual(sas.strings_near(make("empty.so", b""), aws, secrets), "")
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_inside_integrity_hash(self):
+        aws = sas.Finding("x", 1, "AWS", AWS_ID, "", False, "PLAIN", {})
+        inside = ('"integrity": "%s"\n' % integrity_hash("sha512", AWS_ID)).encode("utf-8")
+        self.assertTrue(sas.inside_integrity_hash(aws, inside))
+        gosum = ("mod v1 %s\n" % integrity_hash("h1", AWS_ID)).encode("utf-8")
+        self.assertTrue(sas.inside_integrity_hash(aws, gosum))
+        pip = ("--hash=sha256:%s\n" % ("ab" * 32)).encode("utf-8")
+        hexish = sas.Finding("x", 1, "Generic", "ab" * 32, "", False, "PLAIN", {})
+        self.assertTrue(sas.inside_integrity_hash(hexish, pip))
+        # only a digest of its algorithm's exact length counts: a longer or shorter random string
+        # with the same prefix may be anything, a credential included
+        for algo in ("sha1", "sha256", "sha384", "sha512", "h1"):
+            self.assertTrue(sas.inside_integrity_hash(aws, integrity_hash(algo, AWS_ID).encode("utf-8")), algo)
+            for extra in (1, -1, 7):
+                self.assertFalse(sas.inside_integrity_hash(aws, integrity_hash(algo, AWS_ID, extra).encode("utf-8")), algo)
+        self.assertFalse(sas.inside_integrity_hash(hexish, ("sha256:%sab\n" % ("ab" * 32)).encode("utf-8")))   # 66 digits
+        self.assertFalse(sas.inside_integrity_hash(hexish, ("sha256:%s\n" % ("ab" * 31)).encode("utf-8")))     # 62 digits
+        self.assertTrue(sas.inside_integrity_hash(hexish, ("image@sha512:%s\n" % ("ab" * 64)).encode("utf-8")))
+        sha1ish = sas.Finding("x", 1, "Generic", "ab" * 20, "", False, "PLAIN", {})
+        self.assertTrue(sas.inside_integrity_hash(sha1ish, ("sha1:%s\n" % ("ab" * 20)).encode("utf-8")))
+        self.assertFalse(sas.inside_integrity_hash(sha1ish, ("sha1:%sa\n" % ("ab" * 20)).encode("utf-8")))   # 41 digits
+        self.assertFalse(sas.inside_integrity_hash(aws, ("key = %s\n" % AWS_ID).encode("utf-8")))
+        self.assertFalse(sas.inside_integrity_hash(aws, inside + ("also %s\n" % AWS_ID).encode("utf-8")))  # once outside: a secret
+        self.assertFalse(sas.inside_integrity_hash(aws, b"nothing here\n"))
+        self.assertFalse(sas.inside_integrity_hash(aws, b""))
+
+    def test_default_log_dir_honours_the_environment(self):
+        saved = os.environ.get("SWEEP_AND_SECURE_LOG_DIR")
+        try:
+            os.environ["SWEEP_AND_SECURE_LOG_DIR"] = os.path.join("x", "logs")
+            self.assertEqual(sas.default_log_dir(), os.path.join("x", "logs"))
+            del os.environ["SWEEP_AND_SECURE_LOG_DIR"]
+            self.assertTrue(sas.default_log_dir().endswith(os.path.join("sweep-and-secure", "logs")) or sys.platform == "darwin")
+        finally:
+            if saved is None:
+                os.environ.pop("SWEEP_AND_SECURE_LOG_DIR", None)
+            else:
+                os.environ["SWEEP_AND_SECURE_LOG_DIR"] = saved
 
     def test_scan_progress_counts_and_draws(self):
         out = StringIO()
@@ -1469,11 +1853,11 @@ class RealToolsTests(unittest.TestCase):
         code, out, err = run_script(self.tree.root, ["--dry-run"], path=self.path)
         self.assertEqual(code, 0, out + err)
         # the toy GitHub token in blob.txt.gz is not something the real TruffleHog flags
-        self.assertTrue(re.search(r"Archives holding secrets: [23]", out), out)
-        self.assertIn("build/site.tar.gz (tar.gz)", out)
+        self.assertTrue(re.search(r"Files holding secrets that cannot be fixed in place: [23]", out), out)
+        self.assertIn("tar.gz: etc/hooks.yml", out)
         self.assertIn("etc/hooks.yml", out)
         self.assertIn("SlackWebhook http", out)
-        self.assertIn("build/keys.zip (zip)", out)
+        self.assertIn("zip: config/prod.env", out)
         self.assertIn("config/prod.env", out)
         self.assertIn("Stripe sk_l", out)
         self.assertIn("move to .secrets-quarantine/build/keys.zip", out)

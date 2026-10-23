@@ -37,10 +37,12 @@ import gzip
 import hashlib
 import io
 import json
+import mmap
 import os
 import platform
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
@@ -57,7 +59,7 @@ try:
 except ImportError:  # pragma: no cover - Python 2 without the backport
     lzma = None
 
-__version__ = "1.3.2"
+__version__ = "1.4.0"
 
 # --------------------------------------------------------------------------
 # Python 2 / 3 compatibility
@@ -99,9 +101,93 @@ def fs_text(path):
     return to_text(path, FS_ENCODING)
 
 
-def say(text=u"", stream=None):
+RUN_LOG = None   # this run's RunLog once main() has opened it; say() copies every line into it
+ANSI_RE = re.compile(u"\x1b\\[[0-9;]*m")
+
+
+class RunLog(object):
+    """One plain-text log per run, in a common folder, for debugging: everything printed
+    (without colour), the prompts and answers, the tool commands and their diagnostics, the
+    exit code. Secret values never go in: the run prints masked previews only, and the
+    output of `dotenvx get` is never logged."""
+
+    def __init__(self, path):
+        self.path = path
+        self.handle = io.open(path, "a", encoding="utf-8")
+        self.lock = threading.Lock()
+
+    def write(self, text, prefix=u""):
+        stamp = time.strftime("%H:%M:%S")
+        with self.lock:
+            try:
+                for line in to_text(text).split(u"\n"):
+                    self.handle.write(u"%s %s%s\n" % (stamp, prefix, ANSI_RE.sub(u"", line)))
+                self.handle.flush()
+            except (IOError, OSError, ValueError):
+                pass
+
+    def close(self):
+        try:
+            self.handle.close()
+        except (IOError, OSError, ValueError):
+            pass
+
+
+def log_only(text):
+    """A line for the run log alone (commands, diagnostics), not for the screen."""
+    if RUN_LOG is not None:
+        RUN_LOG.write(text, u"| ")
+
+
+def default_log_dir():
+    """Where run logs go unless --log-dir or SWEEP_AND_SECURE_LOG_DIR says otherwise: the
+    user's state folder, so that every run on this machine is found in one place."""
+    chosen = os.environ.get("SWEEP_AND_SECURE_LOG_DIR")
+    if chosen:
+        return fs_text(chosen)
+    home = fs_text(os.path.expanduser("~"))
+    if os.name == "nt":
+        base = fs_text(os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local"))
+        return os.path.join(base, "sweep-and-secure", "logs")
+    if sys.platform == "darwin":
+        return os.path.join(home, "Library", "Logs", "sweep-and-secure")
+    base = fs_text(os.environ.get("XDG_STATE_HOME") or os.path.join(home, ".local", "state"))
+    return os.path.join(base, "sweep-and-secure", "logs")
+
+
+def open_run_log(args, root):
+    """Create this run's log file and drop this tool's oldest logs beyond LOG_KEEP: (RunLog or
+    None, note). Only files named the way this tool names them are ever removed: a shared
+    --log-dir can hold other programs' logs."""
+    if args.no_log:
+        return None, u""
+    folder = fs_text(args.log_dir) if args.log_dir else default_log_dir()
+    try:
+        if not os.path.isdir(folder):
+            os.makedirs(folder)
+        stamp = time.strftime("%Y-%m-%dT%H-%M-%SZ", time.gmtime())
+        label = re.sub(u"[^A-Za-z0-9_.-]+", u"_", os.path.basename(root) or u"root")[:40]
+        log = RunLog(os.path.join(folder, u"%s-%s-%d.log" % (stamp, label, os.getpid())))
+        logs = sorted(name for name in os.listdir(folder)
+                      if RUN_LOG_NAME_RE.match(name) and name != os.path.basename(log.path))
+        excess = len(logs) - (LOG_KEEP - 1)   # the new log is one of the LOG_KEEP kept
+        for name in logs[:excess] if excess > 0 else []:
+            try:
+                os.remove(os.path.join(folder, name))
+            except OSError:
+                pass
+        return log, u""
+    except (IOError, OSError) as exc:
+        return None, u"no run log: cannot write to %s (%s)" % (folder, to_text(str(exc)))
+
+
+def say(text=u"", stream=None, log_text=None):
     """print() that never dies: odd terminal encodings, a closed pipe or a missing
-    stdout (pythonw) must not take the run down half way through a rewrite."""
+    stdout (pythonw) must not take the run down half way through a rewrite. Every line
+    also goes to the run log, when there is one (log_text in its place, when given)."""
+    if RUN_LOG is not None:
+        RUN_LOG.write(text if log_text is None else log_text,
+                      u"" if (stream is None or stream is sys.stdout) else u"! ")
     stream = stream or sys.stdout
     if stream is None:
         return
@@ -172,7 +258,23 @@ TOOLS = OrderedDict([
 # spells it (backslashes on Windows), so both separators are accepted.
 # Never scanned and never rewritten, whatever the options say:
 QUARANTINE_DEFAULT = ".secrets-quarantine"   # where --quarantine puts archives, unless told otherwise
-QUARANTINE_MANIFEST = "MANIFEST.txt"
+QUARANTINE_MANIFEST = "MANIFEST.txt"      # one line per moved file: when, where it is now, where it was
+QUARANTINE_INDEX = "index.json"           # the same mapping as JSON, one record per moved file
+LOG_KEEP = 100                            # run logs kept in the log folder (the newest)
+# A moved file never takes the name of the quarantine's own files (some file systems ignore case).
+QUARANTINE_OWN_FILES = (QUARANTINE_MANIFEST.lower(), QUARANTINE_INDEX.lower())
+# How this tool names its log files; nothing else in the log folder is ever removed.
+RUN_LOG_NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z-.+-\d+\.log$")
+# Package integrity hashes (npm "sha512-...", pip/Poetry "sha256:...", go.sum "h1:...") are long
+# random-looking strings that loose detector regexes match. A finding that sits entirely inside
+# one is a checksum, not a secret. A digest must have exactly its algorithm's length (base64:
+# 27, 43, 64 or 86 characters before the padding for sha1, sha256, sha384, sha512; hex: 40, 64,
+# 96 or 128) and end there, so that a longer random string is never taken for one.
+INTEGRITY_HASH_RE = re.compile(br"(?:\bsha1-[A-Za-z0-9+/]{27}=?|\bsha256-[A-Za-z0-9+/]{43}=?"
+                               br"|\bsha384-[A-Za-z0-9+/]{64}|\bsha512-[A-Za-z0-9+/]{86}={0,2}"
+                               br"|\bh1:[A-Za-z0-9+/]{43}=?"
+                               br"|\bsha1:[0-9a-fA-F]{40}|\bsha256:[0-9a-fA-F]{64}"
+                               br"|\bsha384:[0-9a-fA-F]{96}|\bsha512:[0-9a-fA-F]{128})(?![A-Za-z0-9+/=])")
 
 ALWAYS_EXCLUDES = [
     r"(^|[/\\])\.env\.keys(\.[^/\\]*)?$",   # dotenvx private keys: .env.keys, .env.keys.bak ... (files, not folders)
@@ -196,6 +298,20 @@ INSPECT_MAX_DEPTH = 3                        # archives inside archives inside a
 INSPECT_BUDGET_BYTES = 512 * 1024 * 1024     # uncompressed content read per archive, at most
 INSPECT_FULL_READ_BYTES = 64 * 1024 * 1024   # members up to this size are searched in memory
 INSPECT_CHUNK = 4 * 1024 * 1024              # bigger members are searched in chunks of this size
+# Compiled code: programs and libraries. A secret compiled into one cannot be fixed here, and moving
+# the file breaks whatever uses it, while what an old TruffleHog matches in them is mostly symbol
+# names and random bytes (TruffleHog 3.75 and later skip them itself). Recognised by name and by the
+# first bytes; not scanned unless --scan-compiled, and then only listed.
+COMPILED_EXTENSIONS = ("so", "dll", "dylib", "exe", "o", "a", "pyc", "pyo", "pyd", "class", "wasm", "node",
+                       "ko", "ocx", "dex", "elf")   # not .sys, .obj, .lib: text files carry those names too
+COMPILED_NAME_PATTERN = r"(?i)\.(%s)(?:\.\d+)*$" % "|".join(COMPILED_EXTENSIONS)   # libz.so.1.2 too
+COMPILED_NAME_RE = re.compile(COMPILED_NAME_PATTERN)
+COMPILED_MAGIC = [
+    (b"\x7fELF", u"ELF binary"), (b"\xfe\xed\xfa\xce", u"Mach-O binary"), (b"\xce\xfa\xed\xfe", u"Mach-O binary"),
+    (b"\xfe\xed\xfa\xcf", u"Mach-O binary"), (b"\xcf\xfa\xed\xfe", u"Mach-O binary"),
+    (b"\xca\xfe\xba\xbe", u"Mach-O or Java class"), (b"\x00asm", u"WebAssembly module"),
+]
+TRUFFLEHOG_SKIPS_COMPILED = (3, 75, 0)   # measured: 3.70 reads an ELF library, 3.75 and later do not
 # Skipped unless --no-default-excludes: version control, vendored and generated trees.
 DEFAULT_EXCLUDES = [
     r"(^|[/\\])\.git([/\\]|$)",
@@ -479,6 +595,103 @@ def archive_kind(path):
         if name.endswith(ext):
             return ext.lstrip(".")
     return None
+
+
+def read_head(path, size=4096):
+    """The first bytes of a file; b"" when it cannot be read."""
+    try:
+        with io.open(path, "rb") as fh:
+            return fh.read(size)
+    except (IOError, OSError):
+        return b""
+
+
+def compiled_kind(path, cache=None):
+    """'.so file', 'ELF binary', 'Windows PE binary' ... when the file is compiled code, a program
+    or a library, by its name or by its first bytes; else None."""
+    if cache is not None and path in cache:
+        return cache[path]
+    kind = None
+    match = COMPILED_NAME_RE.search(os.path.basename(path))
+    if match:
+        kind = u".%s file" % match.group(1).lower()
+    else:
+        head = read_head(path)
+        for magic, label in COMPILED_MAGIC:
+            if head.startswith(magic):
+                kind = label
+                break
+        if kind is None and head[:2] == b"MZ" and len(head) >= 64:
+            # a DOS stub followed by the PE header: an .exe or .dll without its extension
+            offset = struct.unpack("<I", head[60:64])[0]
+            if 64 <= offset <= len(head) - 4 and head[offset:offset + 4] == b"PE\x00\x00":
+                kind = u"Windows PE binary"
+    if cache is not None:
+        cache[path] = kind
+    return kind
+
+
+class CompiledFile(object):
+    """A program or library TruffleHog reported secrets in (--scan-compiled): listed, never changed."""
+
+    def __init__(self, path, kind):
+        self.path = path
+        self.kind = kind
+        self.findings = []
+
+
+def strings_near(path, finding, secrets, width=40):
+    """What surrounds the reported text in the file, the way `strings` shows it: the printable run
+    around its first occurrence, cut at NUL bytes and line ends and at most width characters either
+    side, with every secret reported for the file masked. u"" when the text is not in the file as
+    such (an encoded match) or the file cannot be read."""
+    needles = []
+    for candidate in candidate_secrets(finding):
+        needle = to_bytes(candidate)
+        # an old TruffleHog sometimes reports a byte or two beyond the string: try without them too
+        for trimmed in (needle, needle[:-1], needle[:-2]) if len(needle) > 16 else (needle,):
+            if trimmed and trimmed not in needles:
+                needles.append(trimmed)
+    if not needles:
+        return u""
+    pad = width + max([len(secret) for secret in secrets] + [0])   # room to mask a secret that starts in view
+    try:
+        with io.open(path, "rb") as fh:
+            try:
+                view = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+            except (ValueError, EnvironmentError):   # an empty file, or a file system without mmap
+                view = fh.read(INSPECT_FULL_READ_BYTES)
+            try:
+                total = len(view)
+                for needle in needles:
+                    start = view.find(needle)
+                    if start >= 0:
+                        break
+                else:
+                    return u""
+                lo, hi = max(0, start - pad), min(total, start + len(needle) + pad)
+                chunk = bytearray(view[lo:hi])
+            finally:
+                if hasattr(view, "close"):
+                    view.close()
+    except (IOError, OSError, ValueError):
+        return u""
+    pos = start - lo
+    begin, end = pos, pos + len(needle)
+    while begin > 0 and 0x20 <= chunk[begin - 1] <= 0x7e:
+        begin -= 1
+    while end < len(chunk) and 0x20 <= chunk[end] <= 0x7e:
+        end += 1
+    left, right = bytes(chunk[begin:pos]), bytes(chunk[pos + len(needle):end])
+    # Mask before clipping, so that a reported secret cut by the edge of the view cannot show in part.
+    # (A secret TruffleHog did not report cannot be masked; the width keeps what is shown short.)
+    for secret in sorted(set(secrets), key=len, reverse=True):
+        hidden = to_bytes(mask(to_text(secret)))
+        left, right = left.replace(secret, hidden), right.replace(secret, hidden)
+    clipped_left = len(left) > width or (begin == 0 and lo > 0)
+    clipped_right = len(right) > width or (end == len(chunk) and hi < total)
+    text = to_text(left[-width:] if width else b"") + mask(to_text(needle)) + to_text(right[:width])
+    return (u"..." if clipped_left else u"") + text + (u"..." if clipped_right else u"")
 
 
 def find_closing_quote(body, quote):
@@ -1127,6 +1340,7 @@ def run_trufflehog(binary, root, exclude_patterns, args, progress=None):
     try:
         for attempt in range(8):
             cmd = [binary, "filesystem"] + ([root] if positional else [u"--directory=" + root]) + flags
+            log_only(u"$ " + u" ".join(cmd))
             if args.verbose:
                 say(u"  $ " + u" ".join(cmd))
             try:
@@ -1148,6 +1362,8 @@ def run_trufflehog(binary, root, exclude_patterns, args, progress=None):
                     findings.append(finding)
             err = u"\n".join(to_text(line).rstrip(u"\r\n") for line in err_lines
                              if b'"scanning file"' not in line)
+            log_only(u"trufflehog exit status %d, %d result line(s); stderr tail:\n%s"
+                     % (code, len(findings), u"\n".join(err.strip().splitlines()[-12:])))
             if code == 0 or findings:
                 break
             # No results and a non-zero status: an option this TruffleHog does not know?
@@ -1193,11 +1409,12 @@ def style_dim_block(text):
 # What is already in the env files
 # --------------------------------------------------------------------------
 
-def inventory_env_files(root, exclude_res, protect=()):
+def inventory_env_files(root, exclude_res, protect=(), compiled=None):
     """Return (encrypted, plaintext, stale) over all dotenv files: lists of
     (path, key, line) / (path, key, line, value), and the staging files or folders
     an earlier interrupted run left behind. Paths in protect (the store) are never
-    reported as stale, whatever they are called."""
+    reported as stale, whatever they are called. When a list is passed as compiled,
+    every file whose name says compiled code (.so, .dll, .pyc, ...) is added to it."""
     protected = set(os.path.normpath(path) for path in protect)
     encrypted, plaintext, stale = [], [], []
     for dirpath, dirnames, filenames in os.walk(root):
@@ -1214,6 +1431,9 @@ def inventory_env_files(root, exclude_res, protect=()):
             if name.startswith(TEMP_PREFIX) and os.path.normpath(path) not in protected:
                 stale.append(path)
                 continue
+            if (compiled is not None and COMPILED_NAME_RE.search(name) and not os.path.islink(path)
+                    and not is_excluded(path, exclude_res)):
+                compiled.append(path)
             if not is_env_file(name) or is_example_env_file(name):
                 continue
             if is_excluded(path, exclude_res) or os.path.islink(path):
@@ -1282,12 +1502,15 @@ class Plan(object):
         self.quarantine = quarantine   # folder archives with secrets are moved to, or None
         self.quarantine_flagged = True # False when it is only offered because the run is interactive
         self.items = []
-        self.archives = OrderedDict()  # path -> Archive: archives TruffleHog found secrets inside
-        self.skipped = []            # (path, detector, reason)
+        self.unfixable = OrderedDict()  # path -> Unfixable: files whose secrets cannot be fixed in place
+        self.hashes = 0              # findings inside package integrity hashes: checksums, not secrets
         self.encrypted = []          # (path, key, line) already encrypted
         self.plain_env = []          # (path, key, line, value) unflagged plaintext env keys
         self.extra_env_keys = {}     # env path -> [keys] that must be encrypted as well
         self.ignored = 0             # findings inside excluded folders (TruffleHog on Windows)
+        self.compiled = OrderedDict()  # path -> CompiledFile: findings in programs and libraries (--scan-compiled)
+        self.compiled_skipped = OrderedDict()  # path -> kind: compiled files TruffleHog read anyway, set aside
+        self.compiled_by_name = []   # compiled files seen in the tree and left out of the scan
 
     def rel(self, path):
         try:
@@ -1389,48 +1612,93 @@ def load_for_edit(path, cache):
     result = (None, u"")
     name = os.path.basename(path)
     if os.path.islink(path):
-        result = (None, u"symbolic link - fix the target file instead")
+        result = (None, u"symbolic link")
     elif not os.path.isfile(path):
-        result = (None, u"file not found (moved or deleted during the scan)")
+        result = (None, u"file is gone (moved or deleted during the scan)")
     elif is_example_env_file(name):
-        result = (None, u"example/template env file - replace the value with a placeholder by hand")
+        result = (None, u"example env file")
     elif is_lockfile(name):
-        result = (None, u"generated lock file - regenerate it without the secret")
+        result = (None, u"generated lock file")
     elif name.lower().endswith(".pdf"):
-        result = (None, u"PDF - rewriting bytes would corrupt it; rebuild it without the secret")
+        result = (None, u"PDF")
     else:
         try:
             size = os.path.getsize(path)
             if size > MAX_FILE_BYTES:
-                result = (None, u"file is larger than %d MB" % (MAX_FILE_BYTES // (1024 * 1024)))
+                result = (None, u"larger than %d MB" % (MAX_FILE_BYTES // (1024 * 1024)))
             else:
                 data = read_bytes(path)
                 if b"\x00" in data and data[:2] not in UTF16_BOMS:
                     kind = archive_kind(path)
-                    if kind:
-                        result = (None, u"%s archive with a secret inside - pass --quarantine to move it out of"
-                                        u" the tree, or rebuild it without the secret" % kind)
-                    else:
-                        result = (None, u"binary file - delete it or rebuild it without the secret")
+                    result = (None, u"%s archive" % kind if kind else u"binary file")
                 else:
                     result = (data, u"")
         except (IOError, OSError) as exc:
-            result = (None, u"cannot read: %s" % to_text(str(exc)))
+            result = (None, u"cannot be read: %s" % to_text(str(exc)))
     cache[path] = result
     return result
 
 
-class Archive(object):
-    """An archive TruffleHog found secrets inside, and what we could see in it."""
+class Unfixable(object):
+    """A file holding secrets that cannot be fixed in place: an archive, a binary, a PDF, a
+    generated lock file, an example env file, a file too big or unreadable, or a text file
+    whose only secrets are encoded, too short or unstorable. The whole file can be moved to
+    quarantine instead (when movable), which is what its quarantine Item does."""
 
-    def __init__(self, path, kind):
+    def __init__(self, path, why, kind=None, movable=True):
         self.path = path
-        self.kind = kind
-        self.findings = []    # every TruffleHog result reported for this archive
-        self.item = None      # the quarantine Item when this run may move it, else None
-        self.inside = []      # (path inside the archive, [findings that file holds]) in archive order
-        self.unplaced = []    # findings no file inside holds verbatim
-        self.note = u""       # why the view inside is incomplete, when it is
+        self.why = why          # short reason, shown in the listing and recorded in quarantine
+        self.kind = kind        # the archive kind when it is one ('zip', 'tar.gz', ...), else None
+        self.movable = movable  # False for a symbolic link, a file that is gone, or a file whose
+        self.partial = False    #   other secrets are fixed in place (partial)
+        self.in_use = False     # True when this run stores other files' secrets in it: never moved
+        self.findings = []      # every TruffleHog result reported for this file
+        self.item = None        # the quarantine Item when this run may move it, else None
+        self.inside = []        # archives: (path inside, [findings that file holds]) in archive order
+        self.unplaced = []      # archives: findings no file inside holds verbatim
+        self.note = u""         # why the view inside is incomplete, when it is
+
+
+def detectors_of(findings):
+    names = []
+    for finding in findings:
+        if finding.detector not in names:
+            names.append(finding.detector)
+    return names
+
+
+def file_bytes(path, cache):
+    """The bytes of a file up to MAX_FILE_BYTES, cached; b"" when it cannot be read."""
+    if path not in cache:
+        try:
+            cache[path] = read_bytes(path) if os.path.getsize(path) <= MAX_FILE_BYTES else b""
+        except (IOError, OSError):
+            cache[path] = b""
+    return cache[path]
+
+
+def inside_integrity_hash(finding, data):
+    """True when every occurrence of the reported text sits inside a package integrity hash
+    (npm sha512-..., Go h1:..., pip sha256:...) in data: a checksum that happened to match
+    a detector's pattern, not a secret. False when the text is not found at all."""
+    if not data:
+        return False
+    found = False
+    for candidate in candidate_secrets(finding):
+        needle = to_bytes(candidate)
+        start = data.find(needle)
+        while start >= 0:
+            found = True
+            line_start = data.rfind(b"\n", 0, start) + 1
+            line_end = data.find(b"\n", start)
+            line = data[line_start:line_end if line_end >= 0 else len(data)]
+            offset = start - line_start
+            covered = any(match.start() <= offset and match.end() >= offset + len(needle)
+                          for match in INTEGRITY_HASH_RE.finditer(line))
+            if not covered:
+                return False
+            start = data.find(needle, start + 1)
+    return found
 
 
 def gzip_member_name(head, fallback):
@@ -1636,8 +1904,10 @@ def inspect_archive(archive):
         try:
             tarfile.open(archive.path, "r:*").close()
             archive.kind = u"tar." + {"gzip": u"gz", "bzip2": u"bz2", "xz": u"xz"}[archive.kind]
+            if archive.why.endswith(u" archive"):
+                archive.why = archive.kind + u" archive"
             if archive.item is not None:
-                archive.item.note = archive.kind
+                archive.item.note = archive.why
         except (tarfile.TarError, IOError, OSError, EOFError, zlib.error, ValueError):
             pass
     wanted = [(finding, [c for c in candidate_secrets(finding) if c]) for finding in archive.findings]
@@ -1696,35 +1966,42 @@ def inspect_archive(archive):
 def build_plan(findings, root, store, args, env_plaintext, exclude_res=(), decryptor=None, quarantine=None):
     plan = Plan(root, store, quarantine)
     cache = {}
+    raw_cache = {}
     seen = {}
+    leftovers = []   # (finding, why): secrets in text files that could not be handled
+    compiled_cache = {}
     ordered = sorted(findings, key=lambda f: (f.path, f.line, f.raw))
     for finding in ordered:
         if exclude_res and is_excluded(finding.path, exclude_res):
             plan.ignored += 1   # TruffleHog did not honour the exclude (Windows paths); we do
             continue
+        kind = compiled_kind(finding.path, compiled_cache)
+        if kind:
+            # a program or library: never rewritten or moved; listed with --scan-compiled, else set aside
+            if args.scan_compiled:
+                entry = plan.compiled.get(finding.path)
+                if entry is None:
+                    entry = plan.compiled[finding.path] = CompiledFile(finding.path, kind)
+                entry.findings.append(finding)
+            else:
+                plan.compiled_skipped[finding.path] = kind
+                log_only(u"set aside, compiled code: %s (%s) %s" % (plan.rel(finding.path), kind, finding.detector))
+            continue
         data, reason = load_for_edit(finding.path, cache)
         if data is None:
-            kind = archive_kind(finding.path) if u"archive" in reason else None
-            if kind:
-                # One Archive per file, whatever it holds; it is a quarantine item when this
-                # run may move archives, else it counts as needing manual attention.
-                archive = plan.archives.get(finding.path)
-                if archive is None:
-                    archive = Archive(finding.path, kind)
-                    plan.archives[finding.path] = archive
-                    if quarantine:
-                        item = Item(finding.path, 0, 0, finding.detector, finding.verified, finding.raw, b"",
-                                    "utf-8", finding.extra)
-                        item.kind, item.key, item.note = "quarantine", u"-", kind
-                        archive.item = item
-                        plan.items.append(item)
-                    else:
-                        plan.skipped.append((finding.path, finding.detector, reason))
-                archive.findings.append(finding)
-                if archive.item is not None and finding.detector not in archive.item.detector.split(u", "):
-                    archive.item.detector += u", " + finding.detector
+            if not reason.endswith(u" archive") and inside_integrity_hash(finding, file_bytes(finding.path, raw_cache)):
+                set_aside_hash(plan, finding)   # a package checksum that looks like a key (lock files, mostly)
                 continue
-            plan.skipped.append((finding.path, finding.detector, reason))
+            entry = plan.unfixable.get(finding.path)
+            if entry is None:
+                kind = archive_kind(finding.path) if reason.endswith(u" archive") else None
+                movable = not (reason.startswith(u"symbolic link") or reason.startswith(u"file is gone"))
+                entry = Unfixable(finding.path, reason, kind, movable)
+                plan.unfixable[finding.path] = entry
+            entry.findings.append(finding)
+            continue
+        if inside_integrity_hash(finding, data):
+            set_aside_hash(plan, finding)
             continue
         located = False
         too_short = False
@@ -1747,14 +2024,12 @@ def build_plan(findings, root, store, args, env_plaintext, exclude_res=(), decry
                 plan.items.append(item)
         if not located:
             if too_short:
-                reason = u"secret shorter than --min-length %d" % args.min_length
+                why = u"secret shorter than %d characters (--min-length)" % args.min_length
+            elif (finding.decoder or u"PLAIN").upper() != u"PLAIN":
+                why = u"secret is %s-encoded in the file" % finding.decoder
             else:
-                reason = (u"secret text not found verbatim in the file (TruffleHog decoder: %s)"
-                          % finding.decoder)
-            plan.skipped.append((finding.path, finding.detector, reason))
-
-    for archive in plan.archives.values():
-        inspect_archive(archive)   # which files inside hold the secrets: shown in the listing
+                why = u"secret text not found verbatim in the file"
+            leftovers.append((finding, why))
 
     # Secrets found inside env files: which KEY=... entries hold the secret? Every one of
     # them must be encrypted, so each becomes an item of its own.
@@ -1799,19 +2074,60 @@ def build_plan(findings, root, store, args, env_plaintext, exclude_res=(), decry
     assign_names(plan, decryptor)
 
     # A value dotenvx cannot store exactly must not be moved: the mangled copy would be
-    # the only one left. Hand those over for manual attention instead.
+    # the only one left. Every copy of it joins the secrets that cannot be fixed in place:
+    # the later copies share the first one's key, which is never written.
+    unstorable = set(item.secret for item in plan.items
+                     if item.kind == "source" and item.new_entry and not quote_env_value(item.secret)[1])
     keep = []
     for item in plan.items:
-        if item.kind == "source" and item.new_entry and not quote_env_value(item.secret)[1]:
-            plan.skipped.append((item.path, item.detector,
-                                 u"dotenvx cannot store this value exactly (%s) - move it into %s by hand"
-                                 % (inexact_reason(item.secret), plan.rel(plan.store))))
+        if item.kind == "source" and item.secret in unstorable:
+            stand_in = Finding(item.path, item.line, item.detector, item.secret, u"", item.verified, "PLAIN",
+                               item.extra)
+            leftovers.append((stand_in, u"value cannot be stored exactly by dotenvx (%s)"
+                              % inexact_reason(item.secret)))
             continue
         keep.append(item)
     plan.items = keep
+
+    # Files that cannot be fixed in place. A text file some of whose secrets are fixed above is
+    # listed for the rest but never moved: moving it would undo the fixes. Nor is the env file
+    # that receives other files' secrets: the placeholders written there point into it.
+    fixable = set(item.path for item in plan.items if item.kind in ("env", "source"))
+    stores = set(os.path.normpath(item.store) for item in plan.items if item.kind == "source")
+    for finding, why in leftovers:
+        entry = plan.unfixable.get(finding.path)
+        if entry is None:
+            entry = Unfixable(finding.path, why, None, movable=finding.path not in fixable)
+            entry.partial = finding.path in fixable
+            plan.unfixable[finding.path] = entry
+        elif why not in entry.why:
+            entry.why += u"; " + why
+        entry.findings.append(finding)
+    for entry in plan.unfixable.values():
+        if os.path.normpath(entry.path) in stores:
+            entry.movable, entry.in_use = False, True
+        if entry.kind:
+            inspect_archive(entry)   # which files inside hold the secrets: shown in the listing
+        if entry.movable and quarantine:
+            first = entry.findings[0]
+            item = Item(entry.path, 0, 0, u", ".join(detectors_of(entry.findings)),
+                        any(f.verified for f in entry.findings), first.raw, b"", "utf-8", first.extra)
+            item.kind, item.key, item.note = "quarantine", u"-", entry.why
+            entry.item = item
+            plan.items.append(item)
+
+    plan.items.sort(key=lambda it: (it.path, it.line, it.offset))
     for number, item in enumerate(plan.items, 1):
         item.number = number
     return plan
+
+
+def set_aside_hash(plan, finding):
+    """Count a finding that sits inside a package integrity hash, and name it in the run log
+    so that a set-aside can always be checked afterwards (the value itself is never logged)."""
+    plan.hashes += 1
+    log_only(u"set aside, inside a package integrity hash: %s line %s (%s)"
+             % (plan.rel(finding.path), finding.line, finding.detector))
 
 
 UNKNOWN = object()   # an encrypted store value we could not decrypt here
@@ -1923,21 +2239,32 @@ def action_text(item, plan, args):
 
 
 def quarantine_target(item, plan):
-    """Where --quarantine puts this archive: the same relative path under the quarantine folder."""
+    """Where --quarantine puts this file: the same relative path under the quarantine folder, with
+    a numeric suffix when that name is taken there or is one of the quarantine's own files
+    (MANIFEST.txt, index.json), which a moved file must never replace."""
     try:
         rel = os.path.relpath(item.path, plan.root)
     except ValueError:
         rel = os.path.basename(item.path)
     if rel.startswith(".."):
         rel = os.path.basename(item.path)
-    return os.path.join(plan.quarantine, rel)
+    target = os.path.join(plan.quarantine, rel)
+    reserved = rel.lower() in QUARANTINE_OWN_FILES
+    candidate, counter = target, 1
+    while reserved or os.path.exists(candidate):
+        reserved = False
+        candidate = u"%s.%d" % (target, counter)
+        counter += 1
+    return candidate
 
 
 def move_to_quarantine(item, plan, journal=None):
-    """Move one archive out of the tree. Rename when possible; copy then delete across
-    file systems. The move is journaled first, then a line goes into the quarantine's
-    MANIFEST.txt. Returns (new path, warning): the warning is set when the file moved but
-    the manifest could not be written."""
+    """Move one file out of the tree into the quarantine folder, under its relative path (a
+    numeric suffix when that name is taken or reserved). Rename when possible; copy then delete across
+    file systems. The move is journaled first; then a line goes into the quarantine's
+    MANIFEST.txt and a record into its index.json, both mapping the stored name to where
+    the file came from. Returns (new path, warning): the warning is set when the file moved
+    but the manifest or index could not be written."""
     target = quarantine_target(item, plan)
     folder = os.path.dirname(target)
     if not os.path.isdir(folder):
@@ -1967,18 +2294,43 @@ def move_to_quarantine(item, plan, journal=None):
     if journal is not None:
         journal.add("quarantine", item.path, candidate)   # before anything else can fail: the file has moved
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    archive = plan.archives.get(item.path)
-    inside = u""
-    if archive is not None and archive.inside:
-        inside = u"  inside: " + u", ".join(safe_text(member) for member, _ in archive.inside)
-    line = u"%s  %s  <- %s  (%s)%s\n" % (stamp, slash_path(os.path.relpath(candidate, plan.quarantine)),
-                                          plan.rel(item.path), item.detector, inside)
+    entry = plan.unfixable.get(item.path)
+    inside = [safe_text(member) for member, _ in entry.inside] if entry is not None else []
+    stored = slash_path(os.path.relpath(candidate, plan.quarantine))
+    record = OrderedDict([
+        ("quarantined", stored),                 # relative to the quarantine folder
+        ("original", plan.rel(item.path)),       # relative to the swept folder
+        ("original_absolute", slash_path(item.path)),
+        ("moved_at", stamp),
+        ("why", entry.why if entry is not None else u""),
+        ("detectors", item.detector.split(u", ")),
+        ("inside", inside),
+    ])
+    line = u"%s  %s  <- %s  (%s)  why: %s%s\n" % (stamp, stored, record["original"], item.detector,
+                                                   record["why"], (u"  inside: " + u", ".join(inside)) if inside else u"")
+    problems = []
     manifest = os.path.join(plan.quarantine, QUARANTINE_MANIFEST)
     try:
         with io.open(manifest, "ab") as fh:
             fh.write(line.encode("utf-8", "replace"))
     except (IOError, OSError, UnicodeError) as exc:
-        return candidate, u"moved, but %s could not be updated: %s" % (QUARANTINE_MANIFEST, to_text(str(exc)))
+        problems.append(u"%s could not be updated: %s" % (QUARANTINE_MANIFEST, to_text(str(exc))))
+    index = os.path.join(plan.quarantine, QUARANTINE_INDEX)
+    try:
+        records = []
+        if os.path.isfile(index):
+            try:
+                loaded = json.loads(read_text(index))
+                if isinstance(loaded, list):
+                    records = loaded
+            except ValueError:
+                problems.append(u"%s was not valid JSON and was rewritten" % QUARANTINE_INDEX)
+        records.append(record)
+        write_bytes(index, (json.dumps(records, indent=2, ensure_ascii=False) + u"\n").encode("utf-8", "replace"))
+    except (IOError, OSError, UnicodeError, ValueError, TypeError) as exc:
+        problems.append(u"%s could not be updated: %s" % (QUARANTINE_INDEX, to_text(str(exc))))
+    if problems:
+        return candidate, u"moved, but " + u"; ".join(problems)
     return candidate, u""
 
 
@@ -1996,48 +2348,98 @@ def secrets_text(findings):
     return u", ".join(text if count == 1 else u"%s (x%d)" % (text, count) for text, count in shown.items())
 
 
-def print_archives(plan, args, style):
-    """The archives TruffleHog found secrets inside, which files inside hold them, and
-    what this run would do with each: moved whole to quarantine, or left in place."""
+def print_unfixable(plan, args, style):
+    """The files whose secrets cannot be fixed in place: why, what is inside (archives), the
+    secrets, and what this run does with each: moved whole to quarantine, or left in place."""
     say(u"")
     if plan.quarantine:
-        tail = (u"  (a chosen archive is moved whole to %s; nothing inside it is rewritten)"
-                % plan.rel(plan.quarantine))
+        tail = (u"  (a chosen file is moved whole to %s; nothing in it is rewritten)" % plan.rel(plan.quarantine))
     else:
         tail = u"  (not rewritten; with --yes, pass --quarantine to move them out of the tree)"
-    say(style.bold(u"Archives holding secrets: %d" % len(plan.archives)) + style.dim(tail))
+    say(style.bold(u"Files holding secrets that cannot be fixed in place: %d" % len(plan.unfixable)) + style.dim(tail))
     rows = []
-    for archive in plan.archives.values():
-        number = u"%d" % archive.item.number if archive.item is not None else u"-"
-        name = u"%s (%s)" % (plan.rel(archive.path), archive.kind)
-        if archive.item is not None:
-            action = action_text(archive.item, plan, args)
+    for entry in plan.unfixable.values():
+        number = u"%d" % entry.item.number if entry.item is not None else u"-"
+        name = plan.rel(entry.path)
+        if entry.item is not None:
+            action = action_text(entry.item, plan, args)
+        elif entry.partial:
+            action = u"stays in place: its other secrets are fixed above; handle this one by hand"
+        elif entry.in_use:
+            action = u"stays in place: secrets from other files are stored in it; handle this one by hand"
+        elif entry.why.startswith(u"symbolic link"):
+            action = u"stays in place: fix the file it points to"
+        elif entry.why.startswith(u"file is gone"):
+            action = u"nothing to do: it is gone"
         else:
             action = u"stays in place (pass --quarantine to move it)"
-        lines = [(member, secrets_text(found)) for member, found in archive.inside]
-        if archive.unplaced:
-            where = u"(not seen inside)" if lines or archive.note else u"(could not look inside)"
-            lines.append((where, secrets_text(archive.unplaced)))
-        for index, (member, secrets) in enumerate(lines):
+        if entry.kind:
+            lines = [(u"%s: %s" % (entry.kind, member), secrets_text(found)) for member, found in entry.inside]
+            if entry.unplaced:
+                where = u"%s: (not seen inside)" % entry.kind if lines or entry.note else u"%s: (could not look inside)" % entry.kind
+                lines.append((where, secrets_text(entry.unplaced)))
+        else:
+            lines = [(entry.why, secrets_text(entry.findings))]
+        for index, (why, secrets) in enumerate(lines):
             first = index == 0
-            rows.append((number if first else u"", name if first else u"", member, secrets,
-                         action if first else u""))
-    for line in table(rows, (u"#", u"Archive", u"File inside", u"Secrets", u"Action")):
+            rows.append((number if first else u"", name if first else u"", why, secrets, action if first else u""))
+    for line in table(rows, (u"#", u"File", u"Why / inside", u"Secrets", u"Action")):
         say(line)
-    for archive in plan.archives.values():
-        if archive.note:
-            say(style.dim(u"  %s: %s" % (plan.rel(archive.path), archive.note)))
-    if plan.quarantine and not plan.quarantine_flagged:
+    for entry in plan.unfixable.values():
+        if entry.note:
+            say(style.dim(u"  %s: %s" % (plan.rel(entry.path), entry.note)))
+    if plan.quarantine and not plan.quarantine_flagged and any(e.item is not None for e in plan.unfixable.values()):
         say(style.dim(u"  Offered because this run asks first: y moves them too, s lets you leave them in place."
-                      u" A --yes run moves archives only with --quarantine."))
+                      u" A --yes run moves files only with --quarantine."))
+
+
+def compiled_skipped(plan):
+    """The compiled files this run left out of the scan, path -> kind: the ones recognised by name while
+    walking the tree, and the ones TruffleHog read anyway (no extension, or an old release that takes no
+    exclusions) whose findings were set aside."""
+    skipped = OrderedDict()
+    for path in plan.compiled_by_name:
+        skipped[os.path.normpath(path)] = u".%s file" % COMPILED_NAME_RE.search(os.path.basename(path)).group(1).lower()
+    for path, kind in plan.compiled_skipped.items():
+        skipped.setdefault(os.path.normpath(path), kind)
+    return skipped
+
+
+def print_compiled(plan, args, style):
+    """--scan-compiled: the findings TruffleHog reported in programs and libraries, listed and left
+    alone, with what surrounds each match as `strings` would show it (on the screen only: the run
+    log gets the rows without it)."""
+    rows, logged, seen = [], [], set()
+    for entry in plan.compiled.values():
+        secrets = [to_bytes(c) for finding in entry.findings for c in candidate_secrets(finding) if c]
+        for finding in entry.findings:
+            if (entry.path, finding.detector, finding.raw) in seen:
+                continue
+            seen.add((entry.path, finding.detector, finding.raw))
+            near = strings_near(entry.path, finding, secrets) or (
+                u"(decoded from %s: not in the file as such)" % finding.decoder
+                if (finding.decoder or u"PLAIN").upper() != u"PLAIN" else u"(not found in the file as such)")
+            row = (plan.rel(entry.path), entry.kind, finding.detector + (u" *" if finding.verified else u""),
+                   mask(finding.raw))
+            rows.append(row + (near,))
+            logged.append(row + (u"(shown on the screen only)",))
+    say(u"")
+    say(style.bold(u"Findings in compiled code: %d in %d file(s)" % (len(rows), len(plan.compiled)))
+        + style.dim(u"  (listed only: never rewritten or moved)"))
+    headers = (u"File", u"Kind", u"Type", u"Secret", u"Near")
+    for line, log_line in zip(table(rows, headers), table(logged, headers)):
+        say(line, log_text=log_line)
+    say(style.dim(u"  Matches in compiled code are usually symbol names or random bytes that happen to fit a detector's"))
+    say(style.dim(u"  pattern; --verify lets TruffleHog check each one against its service (* = verified live). A real"))
+    say(style.dim(u"  credential compiled into a program has to be rotated, and the program rebuilt without it."))
 
 
 def print_report(plan, args, style, verified_any):
     say(u"")
     secrets = [item for item in plan.items if item.kind != "quarantine"]
     if not secrets:
-        if plan.archives:
-            say(style.ok(u"No plaintext secrets to encrypt in text files; the archives below hold some."))
+        if plan.unfixable:
+            say(style.ok(u"No plaintext secrets to encrypt in place; the files below hold some."))
         else:
             say(style.ok(u"TruffleHog found no plaintext secrets to encrypt."))
     else:
@@ -2053,15 +2455,28 @@ def print_report(plan, args, style, verified_any):
             say(line)
         if verified_any:
             say(style.dim(u"  * = TruffleHog verified this credential is live"))
-    if plan.archives:
-        print_archives(plan, args, style)
-    skipped = [entry for entry in plan.skipped if entry[0] not in plan.archives]   # archives: shown above
+    if plan.unfixable:
+        print_unfixable(plan, args, style)
+    if plan.compiled:
+        print_compiled(plan, args, style)
+    skipped = compiled_skipped(plan)
     if skipped:
+        kinds = OrderedDict()
+        for kind in skipped.values():
+            kinds[kind] = kinds.get(kind, 0) + 1
+        shown = sorted(kinds.items(), key=lambda pair: -pair[1])
+        summary = u", ".join(u"%s %d" % (kind.replace(u" file", u""), count) for kind, count in shown[:4])
+        if len(shown) > 4:
+            summary += u", ..."
         say(u"")
-        say(style.warn(u"Found but cannot fix automatically: %d" % len(skipped)))
-        for path, detector, reason in skipped:
-            say(u"  %-18s %s" % (detector, plan.rel(path)))
-            say(u"  %-18s %s" % (u"", style.dim(reason)))
+        say(style.dim(u"Skipped %d compiled file(s) (%s): a secret compiled into a program cannot be fixed by this tool,"
+                      u" and moving such a file would break what uses it. --scan-compiled lists what TruffleHog finds in them."
+                      % (len(skipped), summary)))
+    if plan.hashes:
+        say(u"")
+        say(style.dim(u"Set aside %d finding(s) that sit inside package integrity hashes (sha512-..., h1:..., sha256:...):"
+                      u" those are public checksums that happen to match a detector's pattern, not secrets.%s"
+                      % (plan.hashes, u" Each is named in the run log." if RUN_LOG is not None else u"")))
     if plan.ignored:
         say(u"")
         say(style.dim(u"Ignored %d finding(s) inside excluded folders (.git, node_modules, ...)." % plan.ignored))
@@ -2102,7 +2517,9 @@ def ask(prompt):
         answer = read_line()
     except EOFError:
         say(u"")
+        log_only(prompt + u"<end of input>")
         return u""
+    log_only(prompt + to_text(answer).strip())
     return to_text(answer).strip()
 
 
@@ -2116,9 +2533,9 @@ def confirm(plan, args, style):
     secrets = len([item for item in plan.items if item.kind != "quarantine"])
     archives = len(plan.items) - secrets
     if archives and secrets:
-        question = u"Encrypt %d secret(s) and move %d archive(s) to quarantine now?" % (secrets, archives)
+        question = u"Encrypt %d secret(s) and move %d file(s) to quarantine now?" % (secrets, archives)
     elif archives:
-        question = u"Move %d archive(s) to quarantine now?" % archives
+        question = u"Move %d file(s) to quarantine now?" % archives
     else:
         question = u"Encrypt these %d secret(s) now?" % secrets
     while True:
@@ -2157,11 +2574,14 @@ def dotenvx_encrypt(dotenvx, env_path, keys, root, args):
     cmd = [dotenvx, "encrypt", "-f", env_path]
     for key in keys:
         cmd.extend(["-k", key])
+    log_only(u"$ " + u" ".join(cmd))
     if args.verbose:
         say(u"  $ " + u" ".join(cmd))
     # CI=1 and a non-tty stdin/stderr keep dotenvx 2.x from asking where to keep the
     # private key: it writes .env.keys (in the cwd, i.e. the swept folder) instead.
     code, out, err = run_command(cmd, cwd=root, extra_env={"CI": "1", "DOTENVX_NO_TELEMETRY": "1"})
+    if out.strip() or err.strip():
+        log_only((out + u"\n" + err).strip())
     if args.verbose and (out.strip() or err.strip()):
         say(style_dim_block(out + "\n" + err))
     if code != 0:
@@ -2180,6 +2600,7 @@ def decrypt_env_value(dotenvx, env_path, key, root, args):
     cmd = [dotenvx, "get", key, "-f", env_path, "--overload"]
     for keys_file in discover_keys_files([env_path], root):
         cmd.extend(["-fk", keys_file])
+    log_only(u"$ " + u" ".join(cmd) + u"   (output not logged: it is the value)")
     if args.verbose:
         say(u"  $ " + u" ".join(cmd))
     try:
@@ -2702,10 +3123,13 @@ def print_next_steps(plan, chosen, keys_files, args, style):
             say(u"     (dotenvx only looks for .env.keys next to the env file; -fk points it at the one it wrote)")
     quarantined = [item for item in chosen if item.kind == "quarantine" and item.status == "done"]
     if quarantined:
-        bullet(u"%d archive(s) holding secrets were moved to %s (see its %s for where each came from)."
-               % (len(quarantined), plan.rel(plan.quarantine), QUARANTINE_MANIFEST))
-        say(u"     Nothing reads them from there. Inspect them, rebuild them without the secrets, or delete")
-        say(u"     them; never commit that folder. If an archive was tracked by git, commit its removal.")
+        bullet(u"%d file(s) holding secrets were moved to %s; its %s and %s map each one to where it came from."
+               % (len(quarantined), plan.rel(plan.quarantine), QUARANTINE_MANIFEST, QUARANTINE_INDEX))
+        say(u"     Nothing reads them from there. Fix or rebuild them without the secrets and move them back, or")
+        say(u"     delete them; never commit that folder. If a file was tracked by git, commit its removal.")
+    if plan.compiled:
+        bullet(u"The findings in compiled code were listed and left alone. Check each with  strings <file> |"
+               u" grep -n <start of the value>;  a real credential there has to be rotated, and the program rebuilt without it.")
     if keys_files:
         bullet(u"The private decryption key lives in %s." % u", ".join(plan.rel(k) for k in keys_files))
         say(u"     NEVER commit it. Share it through a password manager or your CI's secret store")
@@ -2752,6 +3176,10 @@ def parse_args(argv):
             "exit codes: 0 done (or nothing to do), 1 missing tool / scan incomplete or failed / encryption failed,\n"
             "            2 you said no or gave no answer (stdin not a terminal, nothing piped, no --yes), 130 interrupted\n"
             "\n"
+            "A log of every run is kept in " + default_log_dir() + "\n"
+            "(--log-dir to change, --no-log to skip); it holds what was printed, the prompts and the tool\n"
+            "commands, never secret values.\n"
+            "\n"
             "TruffleHog: https://trufflesecurity.com/trufflehog     dotenvx: https://dotenvx.com"),
     )
     parser.add_argument("path", nargs="?", default=".", help="folder to sweep (default: current folder)")
@@ -2767,9 +3195,9 @@ def parse_args(argv):
     parser.add_argument("--no-rewrite", action="store_true",
                         help="store secrets encrypted but leave the source files untouched")
     parser.add_argument("--quarantine", action="store_true",
-                        help="with --yes, also move archives (zip, tar, gz ...) that hold secrets out of the tree "
-                             "into the quarantine folder, keeping their relative paths (interactive runs offer "
-                             "this anyway)")
+                        help="with --yes, also move every file that holds a secret and cannot be fixed in place "
+                             "(archives, binaries, PDFs, lock files, example env files, ...) out of the tree into "
+                             "the quarantine folder, keeping relative paths (interactive runs offer this anyway)")
     parser.add_argument("--quarantine-dir", metavar="DIR", default=None,
                         help="the quarantine folder (default: %s inside the swept folder); implies --quarantine"
                              % QUARANTINE_DEFAULT)
@@ -2783,12 +3211,21 @@ def parse_args(argv):
     parser.add_argument("--no-default-excludes", action="store_true",
                         help="also scan .git, node_modules, virtualenvs and friends "
                              "(.env.keys and staging files stay excluded)")
+    parser.add_argument("--scan-compiled", action="store_true",
+                        help="also scan compiled code (.so, .dll, .exe, .pyc, .class, ... and files whose first bytes say "
+                             "ELF, PE, Mach-O or WebAssembly) and list what TruffleHog finds there; such files are never "
+                             "rewritten or moved. Skipped by default: TruffleHog 3.75 and later skip them anyway, and "
+                             "older releases match symbol names in them")
     parser.add_argument("--min-length", type=int, default=8, metavar="N",
                         help="ignore secrets shorter than N characters (default: 8)")
     parser.add_argument("--trufflehog", metavar="PATH", help="trufflehog executable (default: search PATH)")
     parser.add_argument("--dotenvx", metavar="PATH", help="dotenvx executable (default: search PATH)")
     parser.add_argument("--no-version-check", action="store_true",
                         help="use a tool even if its --version could not be read")
+    parser.add_argument("--log-dir", metavar="DIR",
+                        help="where this run's log goes (default: the user's state folder, see --help's notes; "
+                             "SWEEP_AND_SECURE_LOG_DIR overrides it)")
+    parser.add_argument("--no-log", action="store_true", help="do not write a run log")
     parser.add_argument("-v", "--verbose", action="store_true", help="show the commands run and tool output")
     parser.add_argument("--no-color", action="store_true", help="plain output")
     parser.add_argument("--check-setup", action="store_true",
@@ -2823,7 +3260,7 @@ def protect_keys_files_early(git_root, root, chosen, style, plan=None):
             # ask git about a file inside the folder: a "dir/" pattern cannot match a folder that
             # does not exist yet, but it does match the paths beneath it
             inside = os.path.join(plan.quarantine, QUARANTINE_MANIFEST)
-            jobs.append(([inside], u"/%s/" % rel, "archives with secrets, moved by --quarantine - never commit"))
+            jobs.append(([inside], u"/%s/" % rel, "files with secrets moved to quarantine - never commit"))
     for paths, pattern, why in jobs:
         try:
             changed, message = ensure_gitignore(git_root, paths, pattern, why)
@@ -2871,8 +3308,9 @@ def wrap_up(plan, chosen, journal, root, git_root, args, style, failed, error, s
             say(u"  encrypted and saved:   %s" % plan.rel(path))
         for path in source_written:
             say(u"  placeholders written:  %s" % plan.rel(path))
-        for path in journal.paths("quarantine"):
-            say(u"  moved to quarantine:   %s" % plan.rel(path))
+        for kind, path, detail in journal.events:
+            if kind == "quarantine":
+                say(u"  moved to quarantine:   %s  ->  %s" % (plan.rel(path), plan.rel(detail) if detail else u"?"))
         pending = OrderedDict()
         for item in chosen:
             if item.kind == "source" and item.status == "planned" and item.store in env_written:
@@ -2895,13 +3333,15 @@ def wrap_up(plan, chosen, journal, root, git_root, args, style, failed, error, s
     if sources and not args.no_rewrite:
         parts.append(u"%d plaintext occurrence(s) removed from %d file(s)" % (removed, removed_files))
     if moved:
-        parts.append(u"%d archive(s) moved to %s" % (len(moved), plan.rel(plan.quarantine)))
+        parts.append(u"%d file(s) moved to %s" % (len(moved), plan.rel(plan.quarantine)))
     if failed:
         parts.append(u"%d failed" % len(failed))
     if skipped:
         parts.append(u"%d rewrite(s) skipped (text no longer present)" % len(skipped))
-    if plan.skipped:
-        parts.append(u"%d need manual attention (see above)" % len(plan.skipped))
+    attention = [entry for entry in plan.unfixable.values()
+                 if entry.item is None or entry.item.status != "done" or entry.item not in chosen]
+    if attention:
+        parts.append(u"%d file(s) need manual attention (see above)" % len(attention))
     summary = u"Done: " + u"; ".join(parts)
     if scan_incomplete:
         summary += u"; the TruffleHog scan was incomplete, run again"
@@ -2933,10 +3373,29 @@ def main(argv=None):
                       % store), sys.stderr)
         return 1
 
+    global RUN_LOG
+    RUN_LOG, log_note = open_run_log(args, root)
+    if RUN_LOG is not None:
+        RUN_LOG.write(u"sweep-and-secure %s | %s | python %s | %s | cwd %s | args %s"
+                      % (__version__, time.strftime("%Y-%m-%d %H:%M:%S %Z"), platform.python_version(),
+                         platform.platform(), fs_text(os.getcwd()), u" ".join(fs_text(a) for a in sys.argv[1:])), u"| ")
     say(style.bold(u"sweep-and-secure %s" % __version__) + style.dim(u"  (TruffleHog + dotenvx)"))
+    if RUN_LOG is not None:
+        say(style.dim(u"Log: %s" % RUN_LOG.path))
+    elif log_note:
+        say(style.dim(u"(%s)" % log_note))
     if args.check_setup:
         return check_setup(args, root, style)
     say(u"Folder: %s" % root)
+    if args.dry_run:
+        last = u"This is a dry run: nothing is changed."
+    elif args.yes:
+        last = u"--yes was given: it will not ask before changing them."
+    else:
+        last = u"Nothing is changed before you confirm."
+    say(style.warn(u"  Note: this is a security tool that changes files on purpose: it encrypts env files, rewrites"))
+    say(style.warn(u"  source files and moves files to quarantine. The changes are deliberate and it cannot undo them;"))
+    say(style.warn(u"  commit or back up first. %s" % last))
     tools = locate_tools(args, root, style)
 
     # Archives holding secrets are offered for quarantine whenever the run asks before
@@ -2969,15 +3428,23 @@ def main(argv=None):
             say(style.bad(u"[!!] bad --exclude pattern %r: %s" % (pattern, exc)), sys.stderr)
             return 1
 
+    scan_excludes = list(exclude_patterns)
+    if not args.scan_compiled:
+        scan_excludes.append(COMPILED_NAME_PATTERN)   # programs and libraries: by name here, by first bytes below
     say(u"Scanning with TruffleHog (this can take a while on big trees) ...")
     try:
-        findings, code, notes = run_trufflehog(tools["trufflehog"]["path"], root, exclude_patterns, args,
+        findings, code, notes = run_trufflehog(tools["trufflehog"]["path"], root, scan_excludes, args,
                                                ScanProgress(sys.stdout))
     except ToolError as exc:
         say(style.bad(u"[!!] %s" % to_text(str(exc))), sys.stderr)
         return 1
     for note in notes:
         say(style.dim(u"  %s" % note))
+    version = tools["trufflehog"].get("version")
+    if args.scan_compiled and version and version >= TRUFFLEHOG_SKIPS_COMPILED:
+        say(style.dim(u"  --scan-compiled: this TruffleHog (%s) skips compiled files itself, as every release from %s does;"
+                      u" only the ones it still reads can be listed"
+                      % (u".".join(str(v) for v in version), u".".join(str(v) for v in TRUFFLEHOG_SKIPS_COMPILED))))
     completed = complete_aws_pairs(findings)
     if completed:
         say(style.dim(u"  this TruffleHog reported %d AWS key id(s) without the secret access key beside them; the"
@@ -2988,7 +3455,9 @@ def main(argv=None):
                       u" probably INCOMPLETE. What it did report is handled below; the exit code will be 1."
                       % code))
 
-    encrypted, plaintext, stale = inventory_env_files(root, exclude_res, protect=(store,))
+    compiled_by_name = []
+    encrypted, plaintext, stale = inventory_env_files(root, exclude_res, protect=(store,),
+                                                      compiled=None if args.scan_compiled else compiled_by_name)
     if stale:
         names = u", ".join(slash_path(os.path.relpath(path, root)) for path in stale)
         if args.dry_run:
@@ -2998,6 +3467,7 @@ def main(argv=None):
             say(style.dim(u"Removed %d leftover staging file(s) from an interrupted run: %s" % (len(removed), names)))
     decryptor = make_decryptor(tools["dotenvx"]["path"], root, args)
     plan = build_plan(findings, root, store, args, plaintext, exclude_res, decryptor, quarantine)
+    plan.compiled_by_name = compiled_by_name
     plan.encrypted = encrypted
     plan.plain_env = plaintext
     plan.quarantine_flagged = quarantine_flagged
@@ -3041,11 +3511,20 @@ def main(argv=None):
 
 def cli(argv=None):
     """Entry point of the `sweep-and-secure` command: main()'s exit code, 130 on Ctrl-C."""
+    global RUN_LOG
+    code = 1
     try:
-        return main(argv)
+        code = main(argv)
+        return code
     except KeyboardInterrupt:
         say(u"\nInterrupted.", sys.stderr)
-        return 130
+        code = 130
+        return code
+    finally:
+        if RUN_LOG is not None:
+            RUN_LOG.write(u"exit code %s" % code, u"| ")
+            RUN_LOG.close()
+            RUN_LOG = None
 
 
 if __name__ == "__main__":
