@@ -42,6 +42,7 @@ import os
 import platform
 import re
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -2570,8 +2571,11 @@ def store_key_at_hand(plan, dotenvx):
 
 
 def quarantine_decryptor(plan, dotenvx):
-    """A decryptor for the quarantine's .env, which may share the store's key pair: that key file
-    sits elsewhere, and an old dotenvx needs the key from the environment."""
+    """A decryptor for the quarantine's .env. When it shares the store's key pair, that key file sits
+    elsewhere and an old dotenvx needs the key from the environment; when it has a key pair of its
+    own, the store's key must not get in the way (dotenvx tries the environment first)."""
+    if not quarantine_shares_store(plan):
+        return make_decryptor(dotenvx, plan.root, plan.args)
     return make_decryptor(dotenvx, plan.root, plan.args, extra_env=store_private_key_env(plan.store, plan.root),
                           extra_keys_files=discover_keys_files([plan.store], plan.root))
 
@@ -2640,6 +2644,10 @@ def move_to_quarantine(item, plan, journal=None):
     crypto = plan.quarantine_crypto
     extras = OrderedDict()
     warnings = []
+    try:
+        extras["mode"] = u"%04o" % stat.S_IMODE(os.stat(item.path).st_mode)   # openssl writes with the default mode
+    except (IOError, OSError):
+        pass
     if crypto:
         # encrypt into place, prove the copy decrypts back to the original, keep the passphrase with
         # dotenvx, and only then remove the original
@@ -2786,9 +2794,11 @@ def restore_from_quarantine(args, root, store, dotenvx, style):
                 record["quarantined"], u"was not found" if not openssl else u"could not encrypt a probe file")), sys.stderr)
             return 1
         env_path = os.path.join(quarantine, QUARANTINE_KEYS_ENV)
+        public = store_public_key(env_path)[1]
+        shared = public is not None and public == store_public_key(store)[1]   # else its own key, next to it
         passphrase, reason = decrypt_env_value(dotenvx, env_path, record.get("key") or u"", root, args,
-                                               extra_env=store_private_key_env(store, root),
-                                               extra_keys_files=discover_keys_files([store], root))
+                                               extra_env=store_private_key_env(store, root) if shared else None,
+                                               extra_keys_files=discover_keys_files([store], root) if shared else ())
         if passphrase is None:
             say(style.bad(u"[!!] the passphrase %s could not be read from %s: %s"
                           % (record.get("key"), env_path, reason)), sys.stderr)
@@ -2809,6 +2819,11 @@ def restore_from_quarantine(args, root, store, dotenvx, style):
         shutil.move(source, original)
     if source != stored:
         remove_quietly(stored)
+        if record.get("mode"):
+            try:
+                os.chmod(original, int(record["mode"], 8))   # a 0600 credential file comes back as one
+            except (IOError, OSError, ValueError):
+                pass
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     record["restored_at"] = stamp
     try:
@@ -3109,7 +3124,9 @@ def file_custody_reason(args, detail=u""):
     if store is None:
         return u"no OS secret store on this platform"
     version = dotenvx_version()
-    if version and version < DOTENVX_NATIVE_SINCE:
+    if not version:
+        return u"dotenvx's version is unknown (--no-version-check), so the %s was not tried" % store
+    if version < DOTENVX_NATIVE_SINCE:
         return u"dotenvx %s keeps keys in files; %s or later can keep them in the %s" % (
             version_text(version), version_text(DOTENVX_NATIVE_SINCE), store)
     detail = tidy_tool_line(detail) if detail else u""
@@ -3193,8 +3210,10 @@ def decrypt_env_value(dotenvx, env_path, key, root, args, extra_env=None, extra_
     if dotenvx_version() >= DOTENVX_KEYS_FILE_OPTION_SINCE:
         for keys_file in keys_files:
             cmd.extend(["-fk", keys_file])
-    else:   # an older dotenvx ignores -fk; it does read the private key from the environment
-        environment.update(private_keys_from(keys_files))
+    else:   # an older dotenvx ignores -fk; it does read the private key from the environment. Two files
+        # both called .env name their keys alike, so the keys file nearest the env file (its -fk hint,
+        # then its neighbour, then the root's) has to win: the list goes root first, so it is reversed
+        environment.update(private_keys_from(list(reversed(keys_files))))
     environment.update(extra_env or {})
     log_only(u"$ " + u" ".join(cmd) + u"   (output not logged: it is the value)")
     if args.verbose:
@@ -3372,7 +3391,8 @@ def encrypt_env_file(env_path, job, dotenvx, root, args, decryptor=None, journal
                 keys.append(key)
         fresh = not re.search(br"^[ \t]*DOTENV_PUBLIC_KEY\w*[ \t]*=", data, re.M)   # no key pair yet
         staged_keys = os.path.join(staging, ".env.keys")   # where a new private key lands, whatever the dotenvx
-        keys_file_arg = staged_keys if dotenvx_version() >= DOTENVX_KEYS_FILE_OPTION_SINCE else None
+        version = dotenvx_version()   # unknown (--no-version-check): taken for a current release, which needs -fk
+        keys_file_arg = staged_keys if not version or version >= DOTENVX_KEYS_FILE_OPTION_SINCE else None
         dotenvx_encrypt(dotenvx, copy, keys, root, args, keys_file=keys_file_arg, allow_empty=job.get("allow_empty", False))
         where = None
         if fresh and os.path.isfile(staged_keys) and native_store_wanted(args):
@@ -3386,6 +3406,12 @@ def encrypt_env_file(env_path, job, dotenvx, root, args, decryptor=None, journal
         adopted = adopt_keys_file(staging, env_path)
         if adopted:
             where = ("file", adopted, refused)
+        if fresh and where is None:
+            # dotenvx wrote no key file where this tool looks, so it kept the key itself (its store, or a
+            # provider it is set up with); say so rather than guess at a file
+            where = ("native", native_store_name() or u"dotenvx's own key store", u"")
+            warnings.append(u"dotenvx wrote no .env.keys for the new key pair; it keeps the private key itself"
+                            u" (dotenvx keypair -f %s shows where)" % env_path)
         if custody is not None and (fresh or env_path not in custody):   # a later call never forgets a fresh key
             custody[env_path] = where if fresh else ("existing", None, u"")
         result = read_bytes(copy)
@@ -3854,20 +3880,26 @@ def print_dotenvx_primer(plan, chosen, keys_files, args, style):
         say(u"  dotenvx itself, not this tool:")
     else:
         say(u"  decrypts them is in .env.keys next to each env file. Day to day you use dotenvx itself, not this tool:")
-    main_env = env_touched[0] if env_touched else plan.store
-    rel = plan.rel(main_env)
-    flag = u"" if rel == u".env" else u" -f %s" % rel
+    def file_flag(path):
+        rel = plan.rel(path)
+        return u"" if rel == u".env" else u" -f %s" % rel
+
+    app_flag = file_flag(env_touched[0]) if env_touched else u""   # the app's env file; .env when none was touched
+    key_env = fresh[0]            # the file whose key pair is new: the store, or the quarantine's own .env
+    key_flag = file_flag(key_env)
     rows = [
-        (u"dotenvx run%s -- <your command>" % flag, u"runs a program with the decrypted values in its environment"),
-        (u"dotenvx get%s KEY" % flag, u"prints one decrypted value; without KEY, all of them"),
-        (u"dotenvx set%s KEY \"value\"" % flag, u"adds or changes a value, encrypted on the way in: the file never holds plaintext"),
-        (u"dotenvx keypair%s%s" % (flag, u" DOTENV_PRIVATE_KEY" if rel == u".env" else u""),
+        (u"dotenvx run%s -- <your command>" % app_flag, u"runs a program with the decrypted values in its environment"),
+        (u"dotenvx get%s KEY" % app_flag, u"prints one decrypted value; without KEY, all of them"),
+        (u"dotenvx set%s KEY \"value\"" % app_flag,
+         u"adds or changes a value, encrypted on the way in: the file never holds plaintext"),
+        (u"dotenvx keypair%s%s" % (key_flag, u" DOTENV_PRIVATE_KEY" if not key_flag else u""),
          u"prints the %s, to give another machine or CI as the DOTENV_PRIVATE_KEY variable"
-         % (u"private key" if rel == u".env" else u"key pair")),
+         % (u"private key" if not key_flag else u"key pair")),
     ]
     store = native_store_name()
-    if keys_files and store and dotenvx_version() >= DOTENVX_NATIVE_SINCE and not getattr(args, "no_native", False):
-        rows.append((u"dotenvx native up%s" % flag,
+    key_in_file = plan.custody.get(key_env, (None,))[0] == "file"
+    if key_in_file and store and dotenvx_version() >= DOTENVX_NATIVE_SINCE and not getattr(args, "no_native", False):
+        rows.append((u"dotenvx native up%s" % key_flag,
                      u"moves the private key from .env.keys into the %s, so that nothing is left on disk" % store))
     if plan.quarantine and plan.quarantine_crypto and any(item.kind == "quarantine" and item.status == "done" for item in chosen):
         rows.append((u"%s --restore <stored name>" % prog_name(),

@@ -21,6 +21,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import atexit
@@ -160,7 +161,7 @@ class ProjectTree(object):
 
 FAKE_KNOBS = ("TRUFFLEHOG_BIN", "DOTENVX_BIN", "FAKE_DOTENVX_FAIL", "FAKE_DOTENVX_NOOP", "FAKE_DOTENVX_CORRUPT",
               "FAKE_TRUFFLEHOG_FAIL", "FAKE_TRUFFLEHOG_PARTIAL", "FAKE_DOTENVX_VERSION", "FAKE_TRUFFLEHOG_VINTAGE",
-              "FAKE_DOTENVX_STORE", "FAKE_OPENSSL_NO_PBKDF2")
+              "FAKE_DOTENVX_STORE", "FAKE_OPENSSL_NO_PBKDF2", "FAKE_DOTENVX_NO_KEYS_FILE")
 FAKE_OPENSSL = os.path.join(FAKEBIN, "openssl")
 
 
@@ -1325,13 +1326,22 @@ class EndToEndTests(unittest.TestCase):
 
     def test_restore_puts_a_quarantined_file_back(self):
         original = self.before[os.path.join("build", "keys.zip")]
+        posix = os.name != "nt"
+        if posix:   # a credential file's tight mode and an executable's bits must come back with it
+            os.chmod(self.tree.path("build/keys.zip"), 0o600)
+            os.chmod(self.tree.path("build/blob.txt.gz"), 0o755)
         code, out, err = run_script(self.tree.root, ["--yes", "--quarantine"])
         self.assertEqual(code, 0, out + err)
+        if posix:
+            self.assertEqual(quarantine_record(self.tree, "build/keys.zip")["mode"], "0600")
+            self.assertEqual(quarantine_record(self.tree, "build/blob.txt.gz")["mode"], "0755")
         code, out, err = run_script(self.tree.root, ["--restore", "build/keys.zip.enc"])
         self.assertEqual(code, 0, out + err)
         self.assertIn("[ok] restored build/keys.zip from build/keys.zip.enc (decrypted)", out)
         self.assertNotIn("Scanning with TruffleHog", out)
         self.assertEqual(self.tree.read_bytes("build/keys.zip"), original)
+        if posix:
+            self.assertEqual(stat.S_IMODE(os.stat(self.tree.path("build/keys.zip")).st_mode), 0o600)
         self.assertFalse(os.path.exists(self.tree.path(".secrets-quarantine/build/keys.zip.enc")))
         index = json.loads(self.tree.read(".secrets-quarantine/index.json"))
         self.assertEqual([bool(r.get("restored_at")) for r in index if r["original"] == "build/keys.zip"], [True])
@@ -1340,6 +1350,8 @@ class EndToEndTests(unittest.TestCase):
         code, out, err = run_script(self.tree.root, ["--restore", "build/blob.txt.gz"])
         self.assertEqual(code, 0, out + err)
         self.assertEqual(self.tree.read_bytes("build/blob.txt.gz"), self.before[os.path.join("build", "blob.txt.gz")])
+        if posix:
+            self.assertEqual(stat.S_IMODE(os.stat(self.tree.path("build/blob.txt.gz")).st_mode), 0o755)
         # a file already back is not offered again; a taken place is refused; so is a run without openssl
         code, out, err = run_script(self.tree.root, ["--restore", "build/keys.zip"])
         self.assertEqual(code, 1, out + err)
@@ -1375,6 +1387,21 @@ class EndToEndTests(unittest.TestCase):
             self.assertNotIn("holds the quarantine's passphrases, encrypted to the key pair of", out)
             self.assertIn(".env.keys*", tree.read(".gitignore"))
             self.assertEqual(quarantined_bytes(tree, "build/keys.zip"), before[os.path.join("build", "keys.zip")])
+            # the primer's key commands name the file whose key pair is new, not a .env that does not exist
+            self.assertRegex(out, r"dotenvx keypair -f \.secrets-quarantine/\.env\s+prints the key pair")
+            self.assertNotIn("keypair DOTENV_PRIVATE_KEY", out)
+            self.assertIn("dotenvx run -- <your command>", out)
+            # with a dotenvx that could use the store but found none, native up names that file too
+            code, out, err = run_script(tree.root, ["--yes", "--quarantine", "--restore", "build/keys.zip"],
+                                        extra_env={"FAKE_DOTENVX_VERSION": "2.38.0"})
+            self.assertEqual(code, 0, out + err)
+            more = ProjectTree({})
+            try:
+                code, out, err = run_script(more.root, ["--yes", "--quarantine"], extra_env={"FAKE_DOTENVX_VERSION": "2.38.0"})
+                self.assertEqual(code, 0, out + err)
+                self.assertRegex(out, r"dotenvx native up -f \.secrets-quarantine/\.env\s+moves the private key")
+            finally:
+                more.cleanup()
         finally:
             tree.cleanup()
         # with a dotenvx that can, that key pair's private key goes to the OS store like any other
@@ -1395,6 +1422,57 @@ class EndToEndTests(unittest.TestCase):
         finally:
             other.cleanup()
             shutil.rmtree(store_dir, ignore_errors=True)
+
+    def test_restore_uses_the_quarantines_own_key_when_the_project_got_another_later(self):
+        # the quarantine got a key pair of its own (nothing else to encrypt at the time); later the
+        # project's .env got one too. Restoring must use the quarantine's key, whatever dotenvx's rules
+        # for picking a key by name (1.x: the environment first, so the project's key must not be put there)
+        for version in ("1.6.0", "2.38.0"):
+            tree = ProjectTree({})
+            before = tree.snapshot()
+            env = {"FAKE_DOTENVX_VERSION": version}
+            try:
+                code, out, err = run_script(tree.root, ["--yes", "--quarantine"], extra_env=env)
+                self.assertEqual(code, 0, out + err)
+                self.assertTrue(os.path.isfile(tree.path(".secrets-quarantine/.env.keys")), version)
+                tree.write("app.py", ('TOKEN = "%s"\n' % GITHUB_TOKEN).encode("utf-8"))
+                code, out, err = run_script(tree.root, ["--yes"], extra_env=env)
+                self.assertEqual(code, 0, out + err)
+                self.assertTrue(os.path.isfile(tree.path(".env.keys")), version)     # a second, different key pair
+                code, out, err = run_script(tree.root, ["--restore", "build/keys.zip"], extra_env=env)
+                self.assertEqual(code, 0, version + "\n" + out + err)
+                self.assertEqual(tree.read_bytes("build/keys.zip"), before[os.path.join("build", "keys.zip")])
+                # and a file quarantined now still goes into the quarantine's own .env, decryptable
+                code, out, err = run_script(tree.root, ["--yes", "--quarantine"], extra_env=env)
+                self.assertEqual(code, 0, out + err)
+                self.assertEqual(quarantined_bytes(tree, "build/keys.zip", keys_file=".secrets-quarantine/.env.keys", extra_env=env),
+                                 before[os.path.join("build", "keys.zip")])
+            finally:
+                tree.cleanup()
+
+    def test_an_unknown_dotenvx_version_still_gets_a_sound_custody_record(self):
+        store = sas.native_store_name() or "Linux Secret Service"
+        # --no-version-check with a dotenvx whose version cannot be read: taken for a current one, so -fk is
+        # given and the key is adopted from the staging folder like any other
+        env = {"FAKE_DOTENVX_VERSION": "nonsense"}
+        code, out, err = run_script(self.tree.root, ["--yes", "--no-rewrite", "--no-version-check"], extra_env=env)
+        self.assertEqual(code, 0, out + err)
+        self.assertNotIn("Traceback", err)
+        self.assertTrue(os.path.isfile(self.tree.path(".env.keys")))
+        self.assertIn("private key file: .env.keys  (file custody: dotenvx's version is unknown (--no-version-check),"
+                      " so the %s was not tried)" % store, out)
+        self.assertEqual(dotenvx_get(self.tree.root, "STRIPE_SECRET_KEY", extra_env=env), STRIPE_KEY)
+        # a dotenvx that writes no key file at all kept the key itself: said so, not crashed over
+        other = ProjectTree({"app.py": 'TOKEN = "%s"\n' % GITHUB_TOKEN})
+        try:
+            code, out, err = run_script(other.root, ["--yes"], extra_env={"FAKE_DOTENVX_NO_KEYS_FILE": "1"})
+            self.assertEqual(code, 0, out + err)
+            self.assertNotIn("Traceback", err)
+            self.assertIn("[--] .env: dotenvx wrote no .env.keys for the new key pair; it keeps the private key itself", out)
+            self.assertIn("private key of .env: in the %s, kept by dotenvx (nothing on disk)" % store, out)
+            self.assertFalse(os.path.exists(other.path(".env.keys")))
+        finally:
+            other.cleanup()
 
     def test_without_openssl_quarantined_files_are_moved_as_they_are_and_the_run_says_so(self):
         missing = os.path.join(self.tree.root, "no-such-openssl")

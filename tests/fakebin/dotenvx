@@ -190,28 +190,14 @@ def header(text):
 
 
 def private_key(path, suffix, keys_files, key_id=None, where=None):
-    """The private key for path: from the environment, a keys file, or the store; where (a list)
-    receives the provider name."""
+    """The private key for path, looked for as dotenvx does: the environment, then the keys files
+    (-fk ones, then the one next to the file), then the store. dotenvx 2.x matches a key to the
+    file's public key whatever the key is named; 1.x goes by the name derived from the file's name
+    (DOTENV_PRIVATE_KEY for .env), environment first. where (a list) receives the provider name."""
     wanted = "DOTENV_PRIVATE_KEY" + suffix
-    if os.environ.get(wanted):
-        if where is not None:
-            where.append("environment")
-        return os.environ[wanted]
     candidates = list(keys_files) + [os.path.join(os.path.dirname(os.path.abspath(path)), ".env.keys")]
-    for keys_file in candidates:
-        if not os.path.isfile(keys_file):
-            continue
-        with io.open(keys_file, encoding="utf-8") as fh:
-            for line in fh:
-                match = re.match(r"^\s*%s\s*=\s*\"?(\S+?)\"?\s*$" % re.escape(wanted), line)
-                if match:
-                    if where is not None:
-                        where.append(".env.keys")
-                    return match.group(1)
-    if key_id:
-        # dotenvx 2.x matches a private key to the file's public key, whatever the key is named:
-        # one key pair can serve several env files
-        for name in [n for n in os.environ if n.startswith("DOTENV_PRIVATE_KEY")]:
+    if key_id and version() >= (2, 0, 0):
+        for name in sorted(n for n in os.environ if n.startswith("DOTENV_PRIVATE_KEY")):
             if os.environ[name] == "priv" + key_id:
                 if where is not None:
                     where.append("environment")
@@ -226,12 +212,27 @@ def private_key(path, suffix, keys_files, key_id=None, where=None):
                         if where is not None:
                             where.append(".env.keys")
                         return match.group(1)
-    if key_id and store_path():
-        found = store_load().get("02fake" + key_id)
-        if found:
-            if where is not None:
-                where.append(STORE_NAME)
-            return found
+        if store_path():
+            found = store_load().get("02fake" + key_id)
+            if found:
+                if where is not None:
+                    where.append(STORE_NAME)
+                return found
+        return None
+    if os.environ.get(wanted):
+        if where is not None:
+            where.append("environment")
+        return os.environ[wanted]
+    for keys_file in candidates:
+        if not os.path.isfile(keys_file):
+            continue
+        with io.open(keys_file, encoding="utf-8") as fh:
+            for line in fh:
+                match = re.match(r"^\s*%s\s*=\s*\"?(\S+?)\"?\s*$" % re.escape(wanted), line)
+                if match:
+                    if where is not None:
+                        where.append(".env.keys")
+                    return match.group(1)
     return None
 
 
@@ -332,8 +333,15 @@ def encrypt(argv):
         return 1
     if os.environ.get("FAKE_DOTENVX_NOOP"):
         return 0
-    keys_file = os.path.abspath(keys_files[0] if keys_files else os.path.join(os.getcwd(), ".env.keys"))
     for path in files:
+        # without -fk, dotenvx 1.x writes .env.keys next to the file it encrypts and 2.x into the
+        # current directory (measured against 1.0.0, 1.4.0, 1.38.0 and 2.38.2)
+        if keys_files:
+            keys_file = os.path.abspath(keys_files[0])
+        elif version() >= (2, 0, 0):
+            keys_file = os.path.join(os.getcwd(), ".env.keys")
+        else:
+            keys_file = os.path.join(os.path.dirname(os.path.abspath(path)), ".env.keys")
         with io.open(path, "rb") as fh:
             data = fh.read().decode("utf-8")
         newline = "\r\n" if "\r\n" in data else "\n"
@@ -370,6 +378,9 @@ def encrypt(argv):
             continue
         with io.open(path, "w", encoding="utf-8", newline="") as fh:
             fh.write(text)
+        if new_key and os.environ.get("FAKE_DOTENVX_NO_KEYS_FILE"):
+            out(u"◈ encrypted %s (fake); the private key is kept elsewhere ⛉" % path)
+            continue
         if new_key:
             existing = ""
             if os.path.isfile(keys_file):
