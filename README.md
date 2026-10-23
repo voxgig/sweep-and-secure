@@ -125,8 +125,8 @@ numeric suffix, and the listing says why.
   `MANIFEST.txt` starts with the restore recipe and has one line per file; its
   `index.json` has one record per file: the stored name, the original path
   (relative and absolute), when it was moved, why, the detectors, for archives
-  the files inside that held secrets, and the key, cipher, SHA-256 and size of
-  the original. The folder is git-ignored and never scanned.
+  the files inside that held secrets, and the key, cipher, SHA-256, size and
+  mode of the original. The folder is git-ignored and never scanned.
   `sweep-and-secure --restore build/keys.zip` puts a file back, decrypted and
   checked against the recorded digest, once it no longer has to hold the secret.
 - A log of the run is in the user's log folder (see below).
@@ -567,12 +567,12 @@ DOTENV_PUBLIC_KEY="02a1b2c3d4...e5f6"
 
 # .env
 PORT=3000
-STRIPE_SECRET_KEY=encrypted:BDnaHYloGudg...
+STRIPE_SECRET_KEY=encrypted:BB5MBc9JlobM...
 APP_NAME=shop
-SLACK_WEBHOOK='encrypted:BCElhRibjWyg...'
-AWS_ACCESS_KEY_ID='encrypted:BH5zxwrJwKtO...'
-AWS_SECRET_ACCESS_KEY='encrypted:BJmesLNpuSIL...'
-DATABASE_URL='encrypted:BCf6y/+XXKVt...'
+SLACK_WEBHOOK='encrypted:BN99IYszFQ81...'
+AWS_ACCESS_KEY_ID='encrypted:BE0SofVYmtdA...'
+AWS_SECRET_ACCESS_KEY='encrypted:BGvbsoyIrk2z...'
+DATABASE_URL='encrypted:BK1Pw6zWYZuv...'
 
 $ cat src/settings.py
 DEBUG = False
@@ -603,9 +603,9 @@ $ cat .secrets-quarantine/.env
 # The passphrase of each *.enc file in this quarantine, kept encrypted by dotenvx.
 # Restore a file:  sweep-and-secure --restore <stored name>   (MANIFEST.txt has the openssl recipe)
 DOTENV_PUBLIC_KEY="02a1b2c3d4...e5f6"
-QUARANTINE_KEY_1='encrypted:BOu/1W8USegH...'
-QUARANTINE_KEY_2='encrypted:BDaIrRpoBOYk...'
-QUARANTINE_KEY_3='encrypted:BC1Ptysm/EFC...'
+QUARANTINE_KEY_1='encrypted:BNcE76+n+jGe...'
+QUARANTINE_KEY_2='encrypted:BAiIQHhrJEh9...'
+QUARANTINE_KEY_3='encrypted:BJwq9UkVghIB...'
 
 $ cat .secrets-quarantine/MANIFEST.txt
 # Files moved here by sweep-and-secure, one line each: when, stored name <- original path, detectors, why.
@@ -614,9 +614,9 @@ $ cat .secrets-quarantine/MANIFEST.txt
 # or by hand, from inside this folder with the private key at hand (the OS store, or -fk <path to .env.keys>):
 #   dotenvx get QUARANTINE_KEY_N -f .env | openssl enc -d -aes-256-cbc -pbkdf2 -pass stdin -in NAME.enc -out NAME
 # (leave out -pbkdf2 for a line that says kdf legacy)
-2026-10-23T16:39:18Z  .env.example.enc  <- .env.example  (Stripe)  why: example env file  enc: QUARANTINE_KEY_1 (aes-256-cbc, kdf pbkdf2)
-2026-10-23T16:39:19Z  build/blob.txt.gz.enc  <- build/blob.txt.gz  (Stripe)  why: gzip archive  inside: blob.txt  enc: QUARANTINE_KEY_2 (aes-256-cbc, kdf pbkdf2)
-2026-10-23T16:39:20Z  build/keys.zip.enc  <- build/keys.zip  (Stripe)  why: zip archive  inside: conf/prod.env  enc: QUARANTINE_KEY_3 (aes-256-cbc, kdf pbkdf2)
+2026-10-23T17:07:30Z  .env.example.enc  <- .env.example  (Stripe)  why: example env file  enc: QUARANTINE_KEY_1 (aes-256-cbc, kdf pbkdf2)
+2026-10-23T17:07:30Z  build/blob.txt.gz.enc  <- build/blob.txt.gz  (Stripe)  why: gzip archive  inside: blob.txt  enc: QUARANTINE_KEY_2 (aes-256-cbc, kdf pbkdf2)
+2026-10-23T17:07:31Z  build/keys.zip.enc  <- build/keys.zip  (Stripe)  why: zip archive  inside: conf/prod.env  enc: QUARANTINE_KEY_3 (aes-256-cbc, kdf pbkdf2)
 
 $ cat .secrets-quarantine/index.json
 [
@@ -624,12 +624,13 @@ $ cat .secrets-quarantine/index.json
     "quarantined": ".env.example.enc",
     "original": ".env.example",
     "original_absolute": "/home/me/shop/.env.example",
-    "moved_at": "2026-10-23T16:39:18Z",
+    "moved_at": "2026-10-23T17:07:30Z",
     "why": "example env file",
     "detectors": [
       "Stripe"
     ],
     "inside": [],
+    "mode": "0644",
     "encrypted": true,
     "key": "QUARANTINE_KEY_1",
     "cipher": "aes-256-cbc",
@@ -641,7 +642,7 @@ $ cat .secrets-quarantine/index.json
     "quarantined": "build/blob.txt.gz.enc",
     "original": "build/blob.txt.gz",
     "original_absolute": "/home/me/shop/build/blob.txt.gz",
-    "moved_at": "2026-10-23T16:39:19Z",
+    "moved_at": "2026-10-23T17:07:30Z",
     "why": "gzip archive",
     "detectors": [
       "Stripe"
@@ -649,18 +650,19 @@ $ cat .secrets-quarantine/index.json
     "inside": [
       "blob.txt"
     ],
+    "mode": "0644",
     "encrypted": true,
     "key": "QUARANTINE_KEY_2",
     "cipher": "aes-256-cbc",
     "kdf": "pbkdf2",
-    "sha256": "14d769621fc4ed494a86089d6c2da8e945e370fbad5cd9a2cf104ecad25a5f0a",
+    "sha256": "7cd768fd985a8a7345d2334f1d7ae1f20fbcf1638f89e1399a3eb5c25d867c94",
     "size": 82
   },
   {
     "quarantined": "build/keys.zip.enc",
     "original": "build/keys.zip",
     "original_absolute": "/home/me/shop/build/keys.zip",
-    "moved_at": "2026-10-23T16:39:20Z",
+    "moved_at": "2026-10-23T17:07:31Z",
     "why": "zip archive",
     "detectors": [
       "Stripe"
@@ -668,11 +670,12 @@ $ cat .secrets-quarantine/index.json
     "inside": [
       "conf/prod.env"
     ],
+    "mode": "0644",
     "encrypted": true,
     "key": "QUARANTINE_KEY_3",
     "cipher": "aes-256-cbc",
     "kdf": "pbkdf2",
-    "sha256": "8f574c03909bfec2a88e733409b1dbae7e04d5cdf82647c9c7ac16d9bafddcfe",
+    "sha256": "40ca4526ccd640c5d032d30add3697897513a4b33836ff96b8aa961ed65a8b9b",
     "size": 287
   }
 ]
@@ -981,8 +984,9 @@ sweep-and-secure again or use `dotenvx set`.
   starts with the restore recipe and gets a line per file, its `index.json` a
   record per file: the time, the stored name, the original path, the reason, the
   detectors, for archives the files inside that held the secrets, and the key,
-  cipher, key derivation, SHA-256 and size of the original. The folder is added
-  to `.gitignore` before anything is moved and is never scanned afterwards. An
+  cipher, key derivation, SHA-256, size and mode of the original (`--restore`
+  gives a file its mode back). The folder is added to `.gitignore` before
+  anything is moved and is never scanned afterwards. An
   interactive run offers this without the flag: the files appear as numbered
   items ("move to ..."), `y` includes them and `s` lets you leave them out.
   Every run, with or without the flag, lists these files in their own section
