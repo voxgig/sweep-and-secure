@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""A stand-in for openssl used by the test-suite (no real cryptography!).
+
+    openssl version
+    openssl enc [-d] -aes-256-cbc [-pbkdf2] [-salt] -pass stdin -in SRC -out DST
+
+The passphrase is read from stdin, as sweep_and_secure.py passes it. The "cipher" XORs the
+bytes with a keystream derived from the passphrase, so the same operation decrypts; a header
+line names the key derivation so that a file encrypted one way is refused the other way, as
+openssl refuses ("bad decrypt"). FAKE_OPENSSL_NO_PBKDF2=1 rejects -pbkdf2 the way an OpenSSL
+before 1.1.1 does.
+"""
+from __future__ import print_function
+
+import hashlib
+import io
+import os
+import sys
+
+
+def main(argv):
+    if argv[:1] == ["version"]:
+        print("OpenSSL 3.0.13 30 Jan 2024 (fake)")
+        return 0
+    if argv[:1] != ["enc"]:
+        sys.stderr.write("fake openssl: unsupported arguments %r\n" % (argv,))
+        return 2
+    if "-pbkdf2" in argv and os.environ.get("FAKE_OPENSSL_NO_PBKDF2"):
+        sys.stderr.write("enc: Unknown option: -pbkdf2\n")
+        return 1
+    try:
+        src, dst = argv[argv.index("-in") + 1], argv[argv.index("-out") + 1]
+    except (ValueError, IndexError):
+        sys.stderr.write("fake openssl: -in and -out are required\n")
+        return 1
+    if "-pass" not in argv or argv[argv.index("-pass") + 1] != "stdin":
+        sys.stderr.write("fake openssl: only -pass stdin is supported\n")
+        return 1
+    decrypt = "-d" in argv
+    kdf = "pbkdf2" if "-pbkdf2" in argv else "legacy"
+    passphrase = sys.stdin.readline().rstrip("\r\n").encode("utf-8")
+    with io.open(src, "rb") as fh:
+        data = fh.read()
+    header = ("FAKEENC %s\n" % kdf).encode("ascii")
+    if decrypt:
+        if not data.startswith(header):
+            sys.stderr.write("bad decrypt\n")
+            return 1
+        data = data[len(header):]
+    out = bytearray(len(data))
+    block = 0
+    for start in range(0, len(data), 32):
+        stream = hashlib.sha256(passphrase + (b":%d" % block)).digest()
+        chunk = data[start:start + 32]
+        out[start:start + len(chunk)] = bytes(bytearray(a ^ b for a, b in zip(bytearray(chunk), bytearray(stream))))
+        block += 1
+    with io.open(dst, "wb") as fh:
+        fh.write((b"" if decrypt else header) + bytes(out))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

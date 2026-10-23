@@ -199,6 +199,24 @@ def private_key(path, suffix, keys_files, key_id=None, where=None):
                     if where is not None:
                         where.append(".env.keys")
                     return match.group(1)
+    if key_id:
+        # dotenvx 2.x matches a private key to the file's public key, whatever the key is named:
+        # one key pair can serve several env files
+        for name in [n for n in os.environ if n.startswith("DOTENV_PRIVATE_KEY")]:
+            if os.environ[name] == "priv" + key_id:
+                if where is not None:
+                    where.append("environment")
+                return os.environ[name]
+        for keys_file in candidates:
+            if not os.path.isfile(keys_file):
+                continue
+            with io.open(keys_file, encoding="utf-8") as fh:
+                for line in fh:
+                    match = re.match(r"^\s*DOTENV_PRIVATE_KEY\w*\s*=\s*\"?(priv%s)\"?\s*$" % re.escape(key_id), line)
+                    if match:
+                        if where is not None:
+                            where.append(".env.keys")
+                        return match.group(1)
     if key_id and store_path():
         found = store_load().get("02fake" + key_id)
         if found:
