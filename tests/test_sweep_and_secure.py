@@ -1033,6 +1033,8 @@ class EndToEndTests(unittest.TestCase):
             self.assertIn("private key of .env: in the %s, kept by dotenvx (nothing on disk)" % store, out)
             self.assertIn("is in the %s, kept by dotenvx: there is no key file to back up." % store, out)
             self.assertIn("dotenvx keypair DOTENV_PRIVATE_KEY -f .env  prints it", out)
+            self.assertIn("decrypts them is in the %s, kept by dotenvx. Day to day you use dotenvx itself, not this tool:" % store, out)
+            self.assertNotIn("dotenvx native up", out)   # the key is there already
             self.assertNotIn("private key file:", out)
             self.assertNotIn("-fk", self.tree.read(".env"))                           # no hint at a file that is not there
             self.assertEqual(dotenvx_get(self.tree.root, "STRIPE_SECRET_KEY", extra_env=env), STRIPE_KEY)
@@ -1064,7 +1066,12 @@ class EndToEndTests(unittest.TestCase):
         self.assertTrue(os.path.isfile(self.tree.path(".env.keys")))
         self.assertNotIn("[--]", out)   # a server without a store is the normal case, not a warning
         self.assertIn("private key file: .env.keys  (file custody: failed to save private key to %s)" % store, out)
-        self.assertIn("dotenvx can keep it in the %s instead, with nothing on disk:  dotenvx native up -f .env" % store, out)
+        self.assertIn("dotenvx from here on", out)
+        self.assertIn("decrypts them is in .env.keys next to each env file. Day to day you use dotenvx itself, not this tool:", out)
+        self.assertRegex(out, r"dotenvx native up\s+moves the private key from \.env\.keys into the %s, so that nothing is"
+                              r" left on disk" % re.escape(store))
+        self.assertIn("then in .env.keys\n  next to the env file, then in the %s." % store, out)
+        self.assertIn("Docs: https://dotenvx.com/docs", out)
         self.assertIn("# -fk .env.keys", self.tree.read(".env"))
         # a key that exists already is left alone, even with a store at hand
         store_dir = tempfile.mkdtemp(prefix="sweep-store-")

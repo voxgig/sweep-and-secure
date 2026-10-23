@@ -3797,18 +3797,13 @@ def print_next_steps(plan, chosen, keys_files, args, style):
         store = native[0][1]
         files = u", ".join(plan.rel(path) for path, _ in native)
         bullet(u"The private key of %s is in the %s, kept by dotenvx: there is no key file to back up." % (files, store))
-        say(u"     For another machine or CI,  dotenvx keypair DOTENV_PRIVATE_KEY -f %s  prints it; set it there as"
+        say(u"     The encrypted env files themselves are safe to commit. Another machine or CI gets the key as the")
+        say(u"     DOTENV_PRIVATE_KEY variable (a CI secret);  dotenvx keypair DOTENV_PRIVATE_KEY -f %s  prints it."
             % plan.rel(native[0][0]))
-        say(u"     the DOTENV_PRIVATE_KEY variable (a CI secret). The encrypted .env files themselves are safe to commit.")
     if keys_files:
         bullet(u"The private decryption key lives in %s." % u", ".join(plan.rel(k) for k in keys_files))
         say(u"     NEVER commit it. Share it through a password manager or your CI's secret store")
-        say(u"     (the DOTENV_PRIVATE_KEY* variables). The encrypted .env files themselves are safe to commit.")
-        store = native_store_name()
-        if store and dotenvx_version() >= DOTENVX_NATIVE_SINCE and not getattr(args, "no_native", False):
-            env_for = next((plan.rel(p) for p in env_paths_with_keys(plan, chosen, keys_files)), u".env")
-            say(u"     dotenvx can keep it in the %s instead, with nothing on disk:  dotenvx native up -f %s"
-                % (store, env_for))
+        say(u"     (the DOTENV_PRIVATE_KEY* variables). The encrypted env files themselves are safe to commit.")
     bullet(u"These secrets sat in plaintext, so treat them as exposed and rotate them.")
     guides = OrderedDict()
     for item in chosen:
@@ -3829,6 +3824,62 @@ def print_next_steps(plan, chosen, keys_files, args, style):
     if git_root:
         bullet(u"Git history still holds the old plaintext. Check it with:  trufflehog git file://%s"
                % plan.rel(git_root))
+    print_dotenvx_primer(plan, chosen, keys_files, args, style)
+
+
+def print_dotenvx_primer(plan, chosen, keys_files, args, style):
+    """From here on dotenvx is the tool in use, so a run that set up a key pair for the first time
+    ends with the few commands and rules a first-time user needs; a run that only added to files
+    dotenvx already managed gets one line."""
+    fresh = [path for path, (kind, _, _) in plan.custody.items() if kind in ("native", "file")]
+    env_touched = []
+    for item in chosen:
+        if item.status in ("done", "stored") and item.store and item.store not in env_touched:
+            env_touched.append(item.store)
+        if item.kind == "env" and item.status == "done" and item.path not in env_touched:
+            env_touched.append(item.path)
+    say(u"")
+    if not fresh:
+        say(style.dim(u"dotenvx is the tool in use from here on (dotenvx run, get, set):  https://dotenvx.com/docs"))
+        return
+    say(style.bold(u"dotenvx from here on"))
+    say(u"  This tool has done its part: the secrets are encrypted in your env files, and the private key that")
+    native = [(path, where) for path, (kind, where, _) in plan.custody.items() if kind == "native"]
+    if native and not keys_files:
+        say(u"  decrypts them is in the %s, kept by dotenvx. Day to day you use dotenvx itself, not this tool:"
+            % native[0][1])
+    elif native:
+        say(u"  decrypts them is in the %s, or in .env.keys next to the env file (see above). Day to day you use"
+            % native[0][1])
+        say(u"  dotenvx itself, not this tool:")
+    else:
+        say(u"  decrypts them is in .env.keys next to each env file. Day to day you use dotenvx itself, not this tool:")
+    main_env = env_touched[0] if env_touched else plan.store
+    rel = plan.rel(main_env)
+    flag = u"" if rel == u".env" else u" -f %s" % rel
+    rows = [
+        (u"dotenvx run%s -- <your command>" % flag, u"runs a program with the decrypted values in its environment"),
+        (u"dotenvx get%s KEY" % flag, u"prints one decrypted value; without KEY, all of them"),
+        (u"dotenvx set%s KEY \"value\"" % flag, u"adds or changes a value, encrypted on the way in: the file never holds plaintext"),
+        (u"dotenvx keypair%s%s" % (flag, u" DOTENV_PRIVATE_KEY" if rel == u".env" else u""),
+         u"prints the %s, to give another machine or CI as the DOTENV_PRIVATE_KEY variable"
+         % (u"private key" if rel == u".env" else u"key pair")),
+    ]
+    store = native_store_name()
+    if keys_files and store and dotenvx_version() >= DOTENVX_NATIVE_SINCE and not getattr(args, "no_native", False):
+        rows.append((u"dotenvx native up%s" % flag,
+                     u"moves the private key from .env.keys into the %s, so that nothing is left on disk" % store))
+    if plan.quarantine and plan.quarantine_crypto and any(item.kind == "quarantine" and item.status == "done" for item in chosen):
+        rows.append((u"%s --restore <stored name>" % prog_name(),
+                     u"puts a quarantined file back, decrypted (its passphrase is in %s/%s)"
+                     % (plan.rel(plan.quarantine), QUARANTINE_KEYS_ENV)))
+    width = max(len(command) for command, _ in rows)
+    for command, what in rows:
+        say(u"    %-*s   %s" % (width, command, what))
+    say(u"  dotenvx looks for the private key in the DOTENV_PRIVATE_KEY* variables of the environment, then in .env.keys")
+    say(u"  next to the env file%s. To add a secret found later, run this tool again or use dotenvx set."
+        % (u", then in the %s" % store if store else u""))
+    say(u"  Docs: https://dotenvx.com/docs")
 
 
 # --------------------------------------------------------------------------
@@ -4192,6 +4243,11 @@ def main(argv=None):
     if args.dry_run:
         say(u"")
         say(style.dim(u"Dry run: nothing was changed."))
+        if not plan.encrypted:
+            say(style.dim(u"A real run sets dotenvx up for this folder (encrypted env files, the private key in the %s or"
+                          u" in .env.keys)" % (native_store_name() or u"OS secret store")))
+            say(style.dim(u"and ends with a short dotenvx primer; from then on dotenvx, not this tool, is what you use day"
+                          u" to day."))
         return 1 if scan_incomplete else 0
 
     say(u"")
