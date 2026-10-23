@@ -85,6 +85,17 @@ FILES = {
 }
 ENCRYPTED_LINE = r'^%s=[\'"`]?encrypted:'   # dotenvx keeps the quote style of the line it rewrites
 
+B64_FILL = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ+/" * 2
+DIGEST_SHAPES = {"sha1": (27, "="), "sha256": (43, "="), "sha384": (64, ""), "sha512": (86, "=="), "h1": (43, "=")}
+
+
+def integrity_hash(algo, token, extra=0):
+    """A package integrity hash as package-lock.json, yarn.lock and go.sum hold them, of the
+    algorithm's exact base64 length (extra lengthens or shortens it) with token inside it."""
+    length, padding = DIGEST_SHAPES[algo]
+    body = (token + "/" + B64_FILL)[:length + extra]
+    return "%s%s%s%s" % (algo, ":" if algo == "h1" else "-", body, padding)
+
 
 def encrypted(key, text):
     return re.search(ENCRYPTED_LINE % re.escape(key), text, re.M) is not None
@@ -186,6 +197,11 @@ def dotenvx_get(root, key, env_file=".env", keys_file=None, binary=None):
     out, _ = proc.communicate()
     out = out.decode("utf-8")
     return out[:-1] if out.endswith("\n") else out
+
+
+def read_file(path):
+    with io.open(path, encoding="utf-8") as fh:
+        return fh.read()
 
 
 def item_number(listing, detector, key, where=None):
@@ -766,21 +782,94 @@ class EndToEndTests(unittest.TestCase):
         self.assertNotIn(".secrets-quarantine/", out)
         self.assertNoLeftovers()
 
+    def test_quarantine_never_overwrites_its_own_manifest_or_index(self):
+        # files in the swept folder named like the quarantine's own records get a suffix
+        for name in ("index.json", "MANIFEST.txt"):
+            self.tree.write(name, b"\x00binary " + SLACK.encode("utf-8") + b"\x00")
+        self.before = self.tree.snapshot()
+        code, out, err = run_script(self.tree.root, ["--dry-run"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("move to .secrets-quarantine/index.json.1", out)
+        self.assertIn("move to .secrets-quarantine/MANIFEST.txt.1", out)
+        code, out, err = run_script(self.tree.root, ["--yes", "--quarantine"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("index.json: moved to .secrets-quarantine/index.json.1", out)
+        self.assertIn("MANIFEST.txt: moved to .secrets-quarantine/MANIFEST.txt.1", out)
+        self.assertEqual(self.tree.read_bytes(".secrets-quarantine/index.json.1"), self.before["index.json"])
+        self.assertEqual(self.tree.read_bytes(".secrets-quarantine/MANIFEST.txt.1"), self.before["MANIFEST.txt"])
+        index = json.loads(self.tree.read(".secrets-quarantine/index.json"))
+        by_original = dict((r["original"], r) for r in index)
+        self.assertEqual(by_original["index.json"]["quarantined"], "index.json.1")
+        self.assertEqual(by_original["MANIFEST.txt"]["quarantined"], "MANIFEST.txt.1")
+        manifest = self.tree.read(".secrets-quarantine/MANIFEST.txt")
+        self.assertIn("index.json.1  <- index.json  (SlackWebhook)  why: binary file", manifest)
+        self.assertIn("MANIFEST.txt.1  <- MANIFEST.txt  (SlackWebhook)  why: binary file", manifest)
+        self.assertEqual(len(index), 4)   # both, and the two archives of the tree
+        self.assertNoLeftovers()
+
+    def test_an_unstorable_value_in_several_files_leaves_every_copy_for_quarantine(self):
+        for rel in ("docs/a.md", "docs/b.md"):
+            self.tree.write(rel, ("admin: %s\n" % PWD_APOS_BACKSLASH).encode("utf-8"))
+        code, out, err = run_script(self.tree.root, ["--dry-run"])
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(out.count("value cannot be stored exactly by dotenvx"), 2)
+        self.assertNotIn("replace with ${ADMIN}", out)   # the second copy must not point at a key never written
+        self.assertIn("move to .secrets-quarantine/docs/a.md", out)
+        self.assertIn("move to .secrets-quarantine/docs/b.md", out)
+        code, out, err = run_script(self.tree.root, ["--yes", "--quarantine"])
+        self.assertEqual(code, 0, out + err)
+        self.assertNotIn("[!!]", out)
+        for rel in ("docs/a.md", "docs/b.md"):
+            self.assertFalse(os.path.exists(self.tree.path(rel)), rel)
+            self.assertIn(PWD_APOS_BACKSLASH, self.tree.read(".secrets-quarantine/" + rel))
+        self.assertNoLeftovers()
+
+    def test_the_env_file_receiving_secrets_is_never_quarantined(self):
+        # .env holds only a secret that cannot be fixed (too short), yet it is where the secrets
+        # moved out of src/app.py go: moving it would leave their placeholders pointing at nothing
+        tree = ProjectTree({".env": "PORT=3000\nSHORT=PWD-abcdefgh\n",
+                            "src/app.py": 'STRIPE = "%s"\n' % STRIPE_KEY})
+        try:
+            code, out, err = run_script(tree.root, ["--dry-run", "--yes", "--quarantine", "--min-length", "16"])
+            self.assertEqual(code, 0, out + err)
+            self.assertIn("secret shorter than 16 characters (--min-length)", out)
+            self.assertIn("stays in place: secrets from other files are stored in it; handle this one by hand", out)
+            self.assertNotIn("move to .secrets-quarantine/.env", out)
+            code, out, err = run_script(tree.root, ["--yes", "--quarantine", "--min-length", "16"])
+            self.assertEqual(code, 0, out + err)
+            self.assertTrue(os.path.isfile(tree.path(".env")))
+            env = tree.read(".env")
+            self.assertIn("SHORT=PWD-abcdefgh", env)                    # left for the hand
+            self.assertTrue(encrypted("STRIPE", env), env)              # the moved secret landed here
+            self.assertIn("${STRIPE}", tree.read("src/app.py"))
+            self.assertIn("1 file(s) need manual attention", out)
+            self.assertFalse(os.path.exists(tree.path(".secrets-quarantine/.env")))
+        finally:
+            tree.cleanup()
+
     def test_integrity_hashes_in_lock_files_are_not_secrets(self):
         # an AWS-looking string inside an npm sha512 integrity hash: a checksum, not a key
-        hash_line = ('"integrity": "sha512-%s/abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789ab=="'
-                     % AWS_ID)
+        hash_line = '"integrity": "%s"' % integrity_hash("sha512", AWS_ID)
         self.tree.write("package-lock.json", ('{"pkg": {%s}}\n' % hash_line).encode("utf-8"))
-        self.tree.write("go.sum", ("example.com/mod v1.0.0 h1:%s/xyzxyzxyzxyzxyzxyzxyzxyzxyzxyzxyzxyzxyz=\n" % AWS_ID).encode("utf-8"))
+        self.tree.write("go.sum", ("example.com/mod v1.0.0 %s\n" % integrity_hash("h1", AWS_ID)).encode("utf-8"))
+        # a string of the wrong length for its algorithm is not a checksum, whatever its prefix
+        self.tree.write("yarn.lock", ("  integrity %s\n" % integrity_hash("sha512", AWS_ID, 5)).encode("utf-8"))
         code, out, err = run_script(self.tree.root, ["--dry-run"])
         self.assertEqual(code, 0, out + err)
         self.assertIn("Set aside 2 finding(s) that sit inside package integrity hashes", out)
+        self.assertIn("Each is named in the run log.", out)
         self.assertNotIn("package-lock.json", out)
         self.assertNotIn("go.sum", out)
+        self.assertIn("move to .secrets-quarantine/yarn.lock", out)
+        log = read_file(re.search(r"^Log: (.*)$", out, re.M).group(1).strip())
+        self.assertIn("set aside, inside a package integrity hash: package-lock.json line 1 (AWS)", log)
+        self.assertIn("set aside, inside a package integrity hash: go.sum line 1 (AWS)", log)
+        self.assertNotIn(AWS_ID, log)
         code, out, err = run_script(self.tree.root, ["--yes", "--quarantine"])
         self.assertEqual(code, 0, out + err)
         self.assertTrue(os.path.isfile(self.tree.path("package-lock.json")))   # never moved over a checksum
         self.assertTrue(os.path.isfile(self.tree.path("go.sum")))
+        self.assertFalse(os.path.exists(self.tree.path("yarn.lock")))
 
     def test_a_text_file_with_fixable_and_unfixable_secrets_stays_in_place(self):
         self.tree.write("conf/app.yml", ("stripe: %s\ntoken: PWD-abcdefgh\n" % STRIPE_KEY).encode("utf-8"))
@@ -811,13 +900,19 @@ class EndToEndTests(unittest.TestCase):
             for n in range(101):   # old logs beyond LOG_KEEP are dropped
                 with io.open(os.path.join(logs, "2020-01-01T00-00-%02dZ-old-%d.log" % (n % 60, n)), "w") as fh:
                     fh.write(u"old\n")
+            foreign = ("1999-app.log", "server.log", "2020-01-01.log", "notes.txt")   # a shared folder: not ours
+            for name in foreign:
+                with io.open(os.path.join(logs, name), "w") as fh:
+                    fh.write(u"someone else's\n")
             code, out, err = run_script(self.tree.root, ["--dry-run"], extra_env={"SWEEP_AND_SECURE_LOG_DIR": logs})
             self.assertEqual(code, 0, out + err)
-            names = sorted(name for name in os.listdir(logs) if name.endswith(".log"))
+            for name in foreign:
+                self.assertTrue(os.path.isfile(os.path.join(logs, name)), name)
+            names = sorted(name for name in os.listdir(logs) if sas.RUN_LOG_NAME_RE.match(name))
             self.assertEqual(len(names), sas.LOG_KEEP)
             newest = os.path.join(logs, names[-1])
             self.assertIn("Log: " + newest, out)
-            text = io.open(newest, encoding="utf-8").read()
+            text = read_file(newest)
             for needle in ("sweep-and-secure %s" % sas.__version__, "| $ ", "trufflehog", "Plaintext secrets found",
                            "Dry run: nothing was changed.", "| exit code 0"):
                 self.assertIn(needle, text)
@@ -835,8 +930,8 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual(set(os.listdir(logs)), before)
             # the prompts and answers are logged too
             code, out, err = run_script(self.tree.root, [], stdin_text="n\n", extra_env={"SWEEP_AND_SECURE_LOG_DIR": logs})
-            newest = sorted(name for name in os.listdir(logs) if name.endswith(".log"))[-1]
-            text = io.open(os.path.join(logs, newest), encoding="utf-8").read()
+            newest = sorted(name for name in os.listdir(logs) if sas.RUN_LOG_NAME_RE.match(name))[-1]
+            text = read_file(os.path.join(logs, newest))
             self.assertIn("(s = choose which): n", text)
             self.assertIn("| exit code 2", text)
         finally:
@@ -1461,13 +1556,25 @@ class UnitTests(unittest.TestCase):
 
     def test_inside_integrity_hash(self):
         aws = sas.Finding("x", 1, "AWS", AWS_ID, "", False, "PLAIN", {})
-        inside = ('"integrity": "sha512-%s/abcdefghijklmnopqrstuvwxyz0123456789abcdefghij=="\n' % AWS_ID).encode("utf-8")
+        inside = ('"integrity": "%s"\n' % integrity_hash("sha512", AWS_ID)).encode("utf-8")
         self.assertTrue(sas.inside_integrity_hash(aws, inside))
-        gosum = ("mod v1 h1:%s/abcdefghijklmnopqrstuvwxyz=\n" % AWS_ID).encode("utf-8")
+        gosum = ("mod v1 %s\n" % integrity_hash("h1", AWS_ID)).encode("utf-8")
         self.assertTrue(sas.inside_integrity_hash(aws, gosum))
         pip = ("--hash=sha256:%s\n" % ("ab" * 32)).encode("utf-8")
         hexish = sas.Finding("x", 1, "Generic", "ab" * 32, "", False, "PLAIN", {})
         self.assertTrue(sas.inside_integrity_hash(hexish, pip))
+        # only a digest of its algorithm's exact length counts: a longer or shorter random string
+        # with the same prefix may be anything, a credential included
+        for algo in ("sha1", "sha256", "sha384", "sha512", "h1"):
+            self.assertTrue(sas.inside_integrity_hash(aws, integrity_hash(algo, AWS_ID).encode("utf-8")), algo)
+            for extra in (1, -1, 7):
+                self.assertFalse(sas.inside_integrity_hash(aws, integrity_hash(algo, AWS_ID, extra).encode("utf-8")), algo)
+        self.assertFalse(sas.inside_integrity_hash(hexish, ("sha256:%sab\n" % ("ab" * 32)).encode("utf-8")))   # 66 digits
+        self.assertFalse(sas.inside_integrity_hash(hexish, ("sha256:%s\n" % ("ab" * 31)).encode("utf-8")))     # 62 digits
+        self.assertTrue(sas.inside_integrity_hash(hexish, ("image@sha512:%s\n" % ("ab" * 64)).encode("utf-8")))
+        sha1ish = sas.Finding("x", 1, "Generic", "ab" * 20, "", False, "PLAIN", {})
+        self.assertTrue(sas.inside_integrity_hash(sha1ish, ("sha1:%s\n" % ("ab" * 20)).encode("utf-8")))
+        self.assertFalse(sas.inside_integrity_hash(sha1ish, ("sha1:%sa\n" % ("ab" * 20)).encode("utf-8")))   # 41 digits
         self.assertFalse(sas.inside_integrity_hash(aws, ("key = %s\n" % AWS_ID).encode("utf-8")))
         self.assertFalse(sas.inside_integrity_hash(aws, inside + ("also %s\n" % AWS_ID).encode("utf-8")))  # once outside: a secret
         self.assertFalse(sas.inside_integrity_hash(aws, b"nothing here\n"))

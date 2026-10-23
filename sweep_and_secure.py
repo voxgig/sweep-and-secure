@@ -154,7 +154,9 @@ def default_log_dir():
 
 
 def open_run_log(args, root):
-    """Create this run's log file and drop the oldest beyond LOG_KEEP: (RunLog or None, note)."""
+    """Create this run's log file and drop this tool's oldest logs beyond LOG_KEEP: (RunLog or
+    None, note). Only files named the way this tool names them are ever removed: a shared
+    --log-dir can hold other programs' logs."""
     if args.no_log:
         return None, u""
     folder = fs_text(args.log_dir) if args.log_dir else default_log_dir()
@@ -164,8 +166,10 @@ def open_run_log(args, root):
         stamp = time.strftime("%Y-%m-%dT%H-%M-%SZ", time.gmtime())
         label = re.sub(u"[^A-Za-z0-9_.-]+", u"_", os.path.basename(root) or u"root")[:40]
         log = RunLog(os.path.join(folder, u"%s-%s-%d.log" % (stamp, label, os.getpid())))
-        logs = sorted(name for name in os.listdir(folder) if name.endswith(".log"))
-        for name in logs[:-LOG_KEEP] if len(logs) > LOG_KEEP else []:
+        logs = sorted(name for name in os.listdir(folder)
+                      if RUN_LOG_NAME_RE.match(name) and name != os.path.basename(log.path))
+        excess = len(logs) - (LOG_KEEP - 1)   # the new log is one of the LOG_KEEP kept
+        for name in logs[:excess] if excess > 0 else []:
             try:
                 os.remove(os.path.join(folder, name))
             except OSError:
@@ -254,12 +258,20 @@ QUARANTINE_DEFAULT = ".secrets-quarantine"   # where --quarantine puts archives,
 QUARANTINE_MANIFEST = "MANIFEST.txt"      # one line per moved file: when, where it is now, where it was
 QUARANTINE_INDEX = "index.json"           # the same mapping as JSON, one record per moved file
 LOG_KEEP = 100                            # run logs kept in the log folder (the newest)
+# A moved file never takes the name of the quarantine's own files (some file systems ignore case).
+QUARANTINE_OWN_FILES = (QUARANTINE_MANIFEST.lower(), QUARANTINE_INDEX.lower())
+# How this tool names its log files; nothing else in the log folder is ever removed.
+RUN_LOG_NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z-.+-\d+\.log$")
 # Package integrity hashes (npm "sha512-...", pip/Poetry "sha256:...", go.sum "h1:...") are long
 # random-looking strings that loose detector regexes match. A finding that sits entirely inside
-# one is a checksum, not a secret.
-INTEGRITY_HASH_RE = re.compile(br"(?:\bsha(?:1|256|384|512)-[A-Za-z0-9+/]{20,}={0,2}"
-                               br"|\bh1:[A-Za-z0-9+/]{20,}={0,2}"
-                               br"|\bsha(?:1|256|384|512):[0-9a-fA-F]{32,})")
+# one is a checksum, not a secret. A digest must have exactly its algorithm's length (base64:
+# 27, 43, 64 or 86 characters before the padding for sha1, sha256, sha384, sha512; hex: 40, 64,
+# 96 or 128) and end there, so that a longer random string is never taken for one.
+INTEGRITY_HASH_RE = re.compile(br"(?:\bsha1-[A-Za-z0-9+/]{27}=?|\bsha256-[A-Za-z0-9+/]{43}=?"
+                               br"|\bsha384-[A-Za-z0-9+/]{64}|\bsha512-[A-Za-z0-9+/]{86}={0,2}"
+                               br"|\bh1:[A-Za-z0-9+/]{43}=?"
+                               br"|\bsha1:[0-9a-fA-F]{40}|\bsha256:[0-9a-fA-F]{64}"
+                               br"|\bsha384:[0-9a-fA-F]{96}|\bsha512:[0-9a-fA-F]{128})(?![A-Za-z0-9+/=])")
 
 ALWAYS_EXCLUDES = [
     r"(^|[/\\])\.env\.keys(\.[^/\\]*)?$",   # dotenvx private keys: .env.keys, .env.keys.bak ... (files, not folders)
@@ -1518,6 +1530,7 @@ class Unfixable(object):
         self.kind = kind        # the archive kind when it is one ('zip', 'tar.gz', ...), else None
         self.movable = movable  # False for a symbolic link, a file that is gone, or a file whose
         self.partial = False    #   other secrets are fixed in place (partial)
+        self.in_use = False     # True when this run stores other files' secrets in it: never moved
         self.findings = []      # every TruffleHog result reported for this file
         self.item = None        # the quarantine Item when this run may move it, else None
         self.inside = []        # archives: (path inside, [findings that file holds]) in archive order
@@ -1843,7 +1856,7 @@ def build_plan(findings, root, store, args, env_plaintext, exclude_res=(), decry
         data, reason = load_for_edit(finding.path, cache)
         if data is None:
             if not reason.endswith(u" archive") and inside_integrity_hash(finding, file_bytes(finding.path, raw_cache)):
-                plan.hashes += 1   # a package checksum that looks like a key (lock files, mostly)
+                set_aside_hash(plan, finding)   # a package checksum that looks like a key (lock files, mostly)
                 continue
             entry = plan.unfixable.get(finding.path)
             if entry is None:
@@ -1854,7 +1867,7 @@ def build_plan(findings, root, store, args, env_plaintext, exclude_res=(), decry
             entry.findings.append(finding)
             continue
         if inside_integrity_hash(finding, data):
-            plan.hashes += 1
+            set_aside_hash(plan, finding)
             continue
         located = False
         too_short = False
@@ -1927,10 +1940,13 @@ def build_plan(findings, root, store, args, env_plaintext, exclude_res=(), decry
     assign_names(plan, decryptor)
 
     # A value dotenvx cannot store exactly must not be moved: the mangled copy would be
-    # the only one left. It joins the secrets that cannot be fixed in place.
+    # the only one left. Every copy of it joins the secrets that cannot be fixed in place:
+    # the later copies share the first one's key, which is never written.
+    unstorable = set(item.secret for item in plan.items
+                     if item.kind == "source" and item.new_entry and not quote_env_value(item.secret)[1])
     keep = []
     for item in plan.items:
-        if item.kind == "source" and item.new_entry and not quote_env_value(item.secret)[1]:
+        if item.kind == "source" and item.secret in unstorable:
             stand_in = Finding(item.path, item.line, item.detector, item.secret, u"", item.verified, "PLAIN",
                                item.extra)
             leftovers.append((stand_in, u"value cannot be stored exactly by dotenvx (%s)"
@@ -1940,8 +1956,10 @@ def build_plan(findings, root, store, args, env_plaintext, exclude_res=(), decry
     plan.items = keep
 
     # Files that cannot be fixed in place. A text file some of whose secrets are fixed above is
-    # listed for the rest but never moved: moving it would undo the fixes.
+    # listed for the rest but never moved: moving it would undo the fixes. Nor is the env file
+    # that receives other files' secrets: the placeholders written there point into it.
     fixable = set(item.path for item in plan.items if item.kind in ("env", "source"))
+    stores = set(os.path.normpath(item.store) for item in plan.items if item.kind == "source")
     for finding, why in leftovers:
         entry = plan.unfixable.get(finding.path)
         if entry is None:
@@ -1952,6 +1970,8 @@ def build_plan(findings, root, store, args, env_plaintext, exclude_res=(), decry
             entry.why += u"; " + why
         entry.findings.append(finding)
     for entry in plan.unfixable.values():
+        if os.path.normpath(entry.path) in stores:
+            entry.movable, entry.in_use = False, True
         if entry.kind:
             inspect_archive(entry)   # which files inside hold the secrets: shown in the listing
         if entry.movable and quarantine:
@@ -1966,6 +1986,14 @@ def build_plan(findings, root, store, args, env_plaintext, exclude_res=(), decry
     for number, item in enumerate(plan.items, 1):
         item.number = number
     return plan
+
+
+def set_aside_hash(plan, finding):
+    """Count a finding that sits inside a package integrity hash, and name it in the run log
+    so that a set-aside can always be checked afterwards (the value itself is never logged)."""
+    plan.hashes += 1
+    log_only(u"set aside, inside a package integrity hash: %s line %s (%s)"
+             % (plan.rel(finding.path), finding.line, finding.detector))
 
 
 UNKNOWN = object()   # an encrypted store value we could not decrypt here
@@ -2077,19 +2105,28 @@ def action_text(item, plan, args):
 
 
 def quarantine_target(item, plan):
-    """Where --quarantine puts this archive: the same relative path under the quarantine folder."""
+    """Where --quarantine puts this file: the same relative path under the quarantine folder, with
+    a numeric suffix when that name is taken there or is one of the quarantine's own files
+    (MANIFEST.txt, index.json), which a moved file must never replace."""
     try:
         rel = os.path.relpath(item.path, plan.root)
     except ValueError:
         rel = os.path.basename(item.path)
     if rel.startswith(".."):
         rel = os.path.basename(item.path)
-    return os.path.join(plan.quarantine, rel)
+    target = os.path.join(plan.quarantine, rel)
+    reserved = rel.lower() in QUARANTINE_OWN_FILES
+    candidate, counter = target, 1
+    while reserved or os.path.exists(candidate):
+        reserved = False
+        candidate = u"%s.%d" % (target, counter)
+        counter += 1
+    return candidate
 
 
 def move_to_quarantine(item, plan, journal=None):
     """Move one file out of the tree into the quarantine folder, under its relative path (a
-    numeric suffix when that name is taken). Rename when possible; copy then delete across
+    numeric suffix when that name is taken or reserved). Rename when possible; copy then delete across
     file systems. The move is journaled first; then a line goes into the quarantine's
     MANIFEST.txt and a record into its index.json, both mapping the stored name to where
     the file came from. Returns (new path, warning): the warning is set when the file moved
@@ -2194,6 +2231,8 @@ def print_unfixable(plan, args, style):
             action = action_text(entry.item, plan, args)
         elif entry.partial:
             action = u"stays in place: its other secrets are fixed above; handle this one by hand"
+        elif entry.in_use:
+            action = u"stays in place: secrets from other files are stored in it; handle this one by hand"
         elif entry.why.startswith(u"symbolic link"):
             action = u"stays in place: fix the file it points to"
         elif entry.why.startswith(u"file is gone"):
@@ -2246,7 +2285,8 @@ def print_report(plan, args, style, verified_any):
     if plan.hashes:
         say(u"")
         say(style.dim(u"Set aside %d finding(s) that sit inside package integrity hashes (sha512-..., h1:..., sha256:...):"
-                      u" those are public checksums that happen to match a detector's pattern, not secrets." % plan.hashes))
+                      u" those are public checksums that happen to match a detector's pattern, not secrets.%s"
+                      % (plan.hashes, u" Each is named in the run log." if RUN_LOG is not None else u"")))
     if plan.ignored:
         say(u"")
         say(style.dim(u"Ignored %d finding(s) inside excluded folders (.git, node_modules, ...)." % plan.ignored))

@@ -73,7 +73,7 @@ between:
 | a file that cannot be fixed in place: an archive TruffleHog looked inside (`.zip`, `.jar`, `.tar.gz`, ...), a binary, a PDF, a generated lock file (`package-lock.json`, `poetry.lock`, ...), an example env file (`.env.example`, `.env.sample`, ...), a file too large or unreadable, or a text file whose only secrets are encoded, shorter than `--min-length` or impossible for dotenvx to store exactly | listed in the "Files holding secrets that cannot be fixed in place" section with the reason, and for archives the files inside that hold each secret (zip, tar with any compression, gzip, bzip2 and xz are opened, nested ones too). The whole file is moved out of the tree into the quarantine folder (`.secrets-quarantine` in the swept folder, `--quarantine-dir` to change), keeping its relative path; the folder's `MANIFEST.txt` and `index.json` record where it came from, why, and which files inside held secrets. An interactive run offers this as a numbered item, so `s` can leave a file in place; a `--yes` run moves files only when `--quarantine` is given |
 | a text file some of whose secrets are fixed in place and one of which cannot be (encoded, too short, unstorable) | the fixable ones are handled; the file is listed with the other one for you to handle by hand, and is never moved, because moving it would undo the fixes |
 | a symbolic link | listed; fix the file it points to |
-| a match that sits inside a package integrity hash (`sha512-...` in `package-lock.json` or `yarn.lock`, `h1:...` in `go.sum`, `sha256:...` in a Python lock file) | set aside and counted, not treated as a secret: those are public checksums that happen to match a detector's pattern, a known weakness of several TruffleHog detectors |
+| a match that sits inside a package integrity hash (`sha512-...` in `package-lock.json` or `yarn.lock`, `h1:...` in `go.sum`, `sha256:...` in a Python lock file) | set aside and counted, not treated as a secret: those are public checksums that happen to match a detector's pattern, a known weakness of several TruffleHog detectors. Only a digest of its algorithm's exact length counts, and each set-aside is named in the run log |
 
 Variable names come from the code around the secret (`AWS_SECRET_ACCESS_KEY =
 "..."`, `"apiKey": "..."`, `password: ...`), made specific with the detector name
@@ -98,7 +98,8 @@ numeric suffix, and the listing says why.
   the placeholder removes the secret and marks the spot.
 - `.secrets-quarantine/` holds the files that were moved, under their original
   relative paths (a numeric suffix such as `keys.zip.1` when that name is already
-  taken there). Its `MANIFEST.txt` has one line per file and its `index.json`
+  taken there, or would be `MANIFEST.txt` or `index.json`). Its `MANIFEST.txt`
+  has one line per file and its `index.json`
   one record per file: the stored name, the original path (relative and
   absolute), when it was moved, why, the detectors, and for archives the files
   inside that held secrets. The folder is git-ignored and never scanned. To
@@ -128,8 +129,9 @@ masked previews only, and the output of `dotenvx get` is never logged. The folde
 is `~/.local/state/sweep-and-secure/logs` on Linux (`$XDG_STATE_HOME` when set),
 `~/Library/Logs/sweep-and-secure` on macOS and
 `%LOCALAPPDATA%\sweep-and-secure\logs` on Windows; `SWEEP_AND_SECURE_LOG_DIR` or
-`--log-dir DIR` choose another, `--no-log` writes none. The newest 100 logs are
-kept. Each run prints `Log: <path>` as its second line.
+`--log-dir DIR` choose another, `--no-log` writes none. The newest 100 of its
+logs are kept; other files in the folder are never touched. Each run prints
+`Log: <path>` as its second line.
 
 ### Built never to leave a file half-written
 
@@ -784,7 +786,8 @@ directly: `dotenvx set NEW_KEY "value"` encrypts it straight into `.env`.
   quarantine folder, `.secrets-quarantine` inside the swept folder by default,
   keeping its relative path (`build/keys.zip` becomes
   `.secrets-quarantine/build/keys.zip`, with a numeric suffix if that name is
-  taken). The folder's `MANIFEST.txt` gets a line per file and its `index.json`
+  taken or is the folder's own `MANIFEST.txt` or `index.json`). The folder's
+  `MANIFEST.txt` gets a line per file and its `index.json`
   a record per file: the time, the stored name, the original path, the reason,
   the detectors and, for archives, the files inside that held the secrets. The
   folder is added to `.gitignore` before anything is moved and is never scanned
@@ -828,7 +831,8 @@ directly: `dotenvx set NEW_KEY "value"` encrypts it straight into `.env`.
 - `--log-dir DIR`: write this run's log into DIR instead of the user's log folder
   (`~/.local/state/sweep-and-secure/logs`, `~/Library/Logs/sweep-and-secure`,
   `%LOCALAPPDATA%\sweep-and-secure\logs`; `SWEEP_AND_SECURE_LOG_DIR` also
-  overrides it). `--no-log`: write no log. The newest 100 logs are kept.
+  overrides it). `--no-log`: write no log. The newest 100 of this tool's logs
+  are kept; other files in the folder are never removed.
 - `--no-color`: plain output. Colour is only used on a terminal, and the
   `NO_COLOR` environment variable has the same effect.
 - `-h`, `--help`: the short reference. `--version`: print
@@ -874,7 +878,10 @@ On macOS use `shasum -a 256 -c -` in place of `sha256sum -c -`.
 * Several TruffleHog detectors match long random-looking strings, so package
   integrity hashes in `package-lock.json`, `yarn.lock`, `go.sum` and Python lock
   files show up as findings. Matches that sit inside such a hash are set aside
-  and counted rather than treated as secrets. A lock file that still appears in
+  and counted rather than treated as secrets, and the run log names each one. A
+  string counts as a hash only at its algorithm's exact length (88 characters
+  for `sha512-`, 44 for `h1:`, 64 hex digits for `sha256:`), so a longer or
+  shorter random string is never taken for one. A lock file that still appears in
   the listing holds something outside a hash, such as a token in a registry URL,
   and `--verify` lets TruffleHog confirm a credential against its service.
 * Secrets inside binaries, PDFs, lock files or base64-encoded text are never
