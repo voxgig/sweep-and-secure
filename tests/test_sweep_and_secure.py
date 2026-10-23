@@ -2393,6 +2393,7 @@ class UnitTests(unittest.TestCase):
     def test_custody_decisions(self):
         folder = tempfile.mkdtemp(prefix="sweep-custody-")
         saved = dict(sas.DOTENVX_INFO)
+        saved_ci = os.environ.pop("CI", None)   # the suite runs on CI too; this test wants a developer's machine first
         try:
             keys = os.path.join(folder, ".env.keys")
             with io.open(keys, "w", encoding="utf-8") as fh:
@@ -2409,6 +2410,10 @@ class UnitTests(unittest.TestCase):
                 self.assertEqual(sas.file_custody_reason(args, "no secret-tool"), "no secret-tool")
             self.assertFalse(sas.native_store_wanted(sas.parse_args(["--yes", "--no-native"])))
             self.assertEqual(sas.file_custody_reason(sas.parse_args(["--no-native"])), "--no-native")
+            os.environ["CI"] = "true"   # an ephemeral runner: keys stay in files, as dotenvx itself keeps them there
+            self.assertFalse(sas.native_store_wanted(args))
+            self.assertEqual(sas.file_custody_reason(args), "CI is set: keys stay in files there, as dotenvx itself does")
+            del os.environ["CI"]
             sas.DOTENVX_INFO.update({"version": (2, 0, 0)})
             self.assertFalse(sas.native_store_wanted(args))
             if store:
@@ -2422,6 +2427,8 @@ class UnitTests(unittest.TestCase):
             finally:
                 del os.environ["DOTENVX_NO_NATIVE"]
         finally:
+            if saved_ci is not None:
+                os.environ["CI"] = saved_ci
             sas.DOTENVX_INFO.clear()
             sas.DOTENVX_INFO.update(saved)
             shutil.rmtree(folder, ignore_errors=True)
