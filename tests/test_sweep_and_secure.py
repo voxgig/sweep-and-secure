@@ -146,7 +146,7 @@ class ProjectTree(object):
 
 
 FAKE_KNOBS = ("TRUFFLEHOG_BIN", "DOTENVX_BIN", "FAKE_DOTENVX_FAIL", "FAKE_DOTENVX_NOOP", "FAKE_DOTENVX_CORRUPT",
-              "FAKE_TRUFFLEHOG_FAIL", "FAKE_TRUFFLEHOG_PARTIAL", "FAKE_DOTENVX_VERSION")
+              "FAKE_TRUFFLEHOG_FAIL", "FAKE_TRUFFLEHOG_PARTIAL", "FAKE_DOTENVX_VERSION", "FAKE_TRUFFLEHOG_VINTAGE")
 
 
 def clean_env(extra_env=None, path=None):
@@ -299,11 +299,66 @@ class EndToEndTests(unittest.TestCase):
         self.assertUnchanged()
         self.assertNoLeftovers()
 
+    def test_old_trufflehog_releases_are_used_as_they_are(self):
+        # 3.20: no --log-level, no --exclude-paths, and the folder must come as --directory
+        old = {"FAKE_TRUFFLEHOG_VINTAGE": "3.20"}
+        code, out, err = run_script(self.tree.root, ["--dry-run"], extra_env=old)
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("[ok] trufflehog  3.20.0", out)
+        self.assertIn("Scan took ", out)
+        self.assertNotIn("Scanned ", out)
+        self.assertIn("no --log-level", out)
+        self.assertIn("no --exclude-paths", out)
+        self.assertIn("Ignored 1 finding(s) inside excluded folders", out)   # node_modules was scanned; dropped here
+        self.assertNotIn("node_modules/pkg/.env", out)
+        for needle in ("STRIPE_SECRET_KEY", "AWS_SECRET_ACCESS_KEY", "move to .secrets-quarantine/build/keys.zip"):
+            self.assertIn(needle, out)
+        # 3.40: only --log-level is missing
+        code, out, err = run_script(self.tree.root, ["--dry-run"], extra_env={"FAKE_TRUFFLEHOG_VINTAGE": "3.40"})
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("no --log-level", out)
+        self.assertNotIn("no --exclude-paths", out)
+        self.assertNotIn("Ignored", out)
+        # a real run works the same, quarantine included, and the quarantine folder stays out of later listings
+        code, out, err = run_script(self.tree.root, ["--yes", "--quarantine"], extra_env=old)
+        self.assertEqual(code, 0, out + err)
+        self.assertTrue(encrypted("STRIPE_SECRET_KEY", self.tree.read(".env")))
+        self.assertTrue(os.path.isfile(self.tree.path(".secrets-quarantine/build/keys.zip")))
+        code, out, err = run_script(self.tree.root, ["--dry-run"], extra_env=old)
+        self.assertEqual(code, 0, out + err)
+        self.assertNotIn(".secrets-quarantine/build", out)
+        self.assertNoLeftovers()
+
+    def test_oldest_trufflehog_json_is_decoded_and_aws_pairs_completed(self):
+        # 3.6 to 3.12: Raw is base64 of the bytes, and an AWS key pair is reported as its id alone
+        code, out, err = run_script(self.tree.root, ["--dry-run"], extra_env={"FAKE_TRUFFLEHOG_VINTAGE": "3.12"})
+        self.assertEqual(code, 0, out + err)
+        for needle in ("STRIPE_SECRET_KEY", "SLACK_WEBHOOK", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
+            self.assertIn(needle, out)
+        self.assertIn("1 AWS key id(s) without the secret access key", out)
+        self.assertNotIn("not found verbatim", out)
+        code, out, err = run_script(self.tree.root, ["--yes"], extra_env={"FAKE_TRUFFLEHOG_VINTAGE": "3.12"})
+        self.assertEqual(code, 0, out + err)
+        self.assertNotIn(AWS_SECRET, self.tree.read("src/settings.py"))
+        self.assertEqual(dotenvx_get(self.tree.root, "AWS_SECRET_ACCESS_KEY"), AWS_SECRET)
+
+    def test_check_setup_with_an_old_trufflehog(self):
+        code, out, err = run_script(self.tree.root, ["--check-setup"], extra_env={"FAKE_TRUFFLEHOG_VINTAGE": "3.20"})
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("an older TruffleHog, used as it is", out)
+        self.assertIn("no --log-level", out)
+        self.assertIn("Setup looks good", out)
+
     def test_too_old_dotenvx_is_rejected(self):
-        code, out, err = run_script(self.tree.root, ["--dry-run"], extra_env={"FAKE_DOTENVX_VERSION": "0.44.1"})
+        code, out, err = run_script(self.tree.root, ["--dry-run"], extra_env={"FAKE_DOTENVX_VERSION": "1.0.0"})
         self.assertEqual(code, 1)
         self.assertIn("too old", err)
+        self.assertIn("1.4 or newer", err)
         self.assertIn("https://dotenvx.com", err)
+        code, out, err = run_script(self.tree.root, ["--dry-run"], extra_env={"FAKE_TRUFFLEHOG_VINTAGE": "3.4"})
+        self.assertEqual(code, 1)
+        self.assertIn("too old", err)
+        self.assertIn("3.6 or newer", err)
 
     def test_tool_that_cannot_report_a_version_is_refused_unless_asked(self):
         code, out, err = run_script(self.tree.root, ["--dry-run"], extra_env={"FAKE_DOTENVX_VERSION": "nonsense"})
@@ -421,7 +476,8 @@ class EndToEndTests(unittest.TestCase):
                       " 2 need manual attention", out)
         self.assertIn("Next steps", out)
         self.assertIn("dotenvx run -- <your command>", out)
-        self.assertNotIn("-fk", out)                     # .env and .env.keys share a folder
+        self.assertNotIn(" -fk ", out)                   # .env and .env.keys share a folder
+        self.assertEqual(out.count("private key file:"), 1)   # one keys file, however its path is spelled
         self.assertIn("howtorotate.com/docs/tutorials/stripe/", out)
         self.assertNoLeftovers()
 
