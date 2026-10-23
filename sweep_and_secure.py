@@ -59,7 +59,7 @@ try:
 except ImportError:  # pragma: no cover - Python 2 without the backport
     lzma = None
 
-__version__ = "1.4.1"
+__version__ = "1.5.0"
 
 # --------------------------------------------------------------------------
 # Python 2 / 3 compatibility
@@ -388,6 +388,15 @@ GENERIC_NAMES = set("""
 SECRETISH_WORDS = set("KEY TOKEN SECRET PASSWORD WEBHOOK URI URL DSN CREDENTIALS".split())
 
 ENCRYPTED_PREFIX = "encrypted:"
+# Private key custody is dotenvx's: from 2.3 `dotenvx native up` keeps a key in the OS secret
+# store (macOS Keychain, Windows Credential Manager, Linux Secret Service) and dotenvx looks there
+# itself when it runs; before that, and where no store is reachable, the key lives in .env.keys.
+DOTENVX_NATIVE_SINCE = (2, 3, 0)
+DOTENVX_KEYS_FILE_OPTION_SINCE = (1, 38, 0)   # -fk on encrypt and get: before it, keys sit next to the file
+DOTENVX_PROVIDER_SINCE = (2, 25, 0)            # `dotenvx keypair provider`: where an existing key is held
+DOTENVX_INFO = {}                              # path and version of the dotenvx this run uses, once located
+NATIVE_STORE_NAMES = (("darwin", u"macOS Keychain"), ("win", u"Windows Credential Manager"),
+                      ("linux", u"Linux Secret Service"))
 MIN_FRAGMENT_LENGTH = 16   # a RawV2 remainder must be at least this long to be trusted
 PAIR_DELIMITERS = (":", ";", ",", "|", "&")   # what TruffleHog puts between RawV2 parts
 URL_TAIL_PUNCTUATION = b".,;:!?"
@@ -947,6 +956,9 @@ def locate_tools(args, root, style, keep_going=False):
             problems += 1
             continue
         found[name] = {"path": path, "version": version, "text": text}
+        if name == "dotenvx":
+            DOTENVX_INFO.clear()
+            DOTENVX_INFO.update(found[name])
         say(u"  %s %-11s %-10s %s" % (style.ok("[ok]"), name,
                                       ".".join(str(v) for v in version) if version else "?",
                                       style.dim(path)))
@@ -1056,26 +1068,42 @@ def check_dotenvx(dotenvx, scratch, args, style):
     job = {"new": [(u"SWEEP_AND_SECURE_CHECK", u"setup check value")], "keys": [u"SWEEP_AND_SECURE_CHECK"],
            "items": []}
     decryptor = make_decryptor(dotenvx, scratch, args)
-    ok, note, warnings = encrypt_env_file(env_path, job, dotenvx, scratch, args, decryptor)
+    custody = {}
+    ok, note, warnings = encrypt_env_file(env_path, job, dotenvx, scratch, args, decryptor, custody=custody)
     if not ok:
         say(style.bad(u"[!!] dotenvx could not encrypt a value in a scratch folder: %s" % note), sys.stderr)
+        return False
+    kind, where, note = custody.get(env_path) or (None, None, u"")
+    keys_file = os.path.join(scratch, ".env.keys")
+    if kind == "native":
+        # take the scratch key out of the user's secret store again
+        ok_down, detail = dotenvx_native(dotenvx, "down", env_path, keys_file, scratch, args)
+        if not ok_down:
+            warnings.append(u"the scratch key could not be removed from the %s (%s); `dotenvx native down -f %s`"
+                            u" removes it" % (where, detail, env_path))
+    elif kind == "file":
+        if not os.path.isfile(keys_file):
+            say(style.bad(u"[!!] dotenvx encrypted a value but wrote no .env.keys next to the file (looked for %s)"
+                          % keys_file), sys.stderr)
+            return False
+    else:
+        say(style.bad(u"[!!] dotenvx encrypted a value but where its private key went is unclear"), sys.stderr)
         return False
     if warnings:
         say(style.bad(u"[!!] dotenvx encrypted a value in a scratch folder but it could not be checked: %s"
                       % u"; ".join(warnings)), sys.stderr)
-        return False
-    keys_file = os.path.join(scratch, ".env.keys")
-    if not os.path.isfile(keys_file):
-        say(style.bad(u"[!!] dotenvx encrypted a value but wrote no .env.keys next to the file (looked for %s)"
-                      % keys_file), sys.stderr)
         return False
     value, reason = decrypt_env_value(dotenvx, env_path, u"SWEEP_AND_SECURE_CHECK", scratch, args)
     if value != u"setup check value":
         say(style.bad(u"[!!] dotenvx get did not return the value that was encrypted: %s"
                       % (reason or u"got something else")), sys.stderr)
         return False
-    say(u"  %s dotenvx     ran in a scratch folder: encrypted a value, decrypted it back, wrote .env.keys"
-        % style.ok("[ok]"))
+    if kind == "native":
+        say(u"  %s dotenvx     ran in a scratch folder: encrypted a value, decrypted it back; the private key went"
+            u" to the %s and was removed again" % (style.ok("[ok]"), where))
+    else:
+        say(u"  %s dotenvx     ran in a scratch folder: encrypted a value, decrypted it back; the private key went"
+            u" to .env.keys (%s)" % (style.ok("[ok]"), file_custody_reason(args, note)))
     return True
 
 
@@ -1537,6 +1565,7 @@ class Plan(object):
         self.compiled = OrderedDict()  # path -> CompiledFile: findings in programs and libraries (--scan-compiled)
         self.compiled_skipped = OrderedDict()  # path -> kind: compiled files TruffleHog read anyway, set aside
         self.compiled_by_name = []   # compiled files seen in the tree and left out of the scan
+        self.custody = OrderedDict()  # env path -> ("native", store) | ("file", keys path) | ("existing", None)
 
     def rel(self, path):
         try:
@@ -2656,13 +2685,102 @@ def confirm(plan, args, style):
 # Doing it
 # --------------------------------------------------------------------------
 
-def dotenvx_encrypt(dotenvx, env_path, keys, root, args):
-    """Run `dotenvx encrypt -f env_path -k KEY ...` with the swept folder as cwd."""
-    if not keys:  # without -k dotenvx would encrypt every key in the file
+def dotenvx_version():
+    return tuple(DOTENVX_INFO.get("version") or ())
+
+
+def version_text(version):
+    return u".".join(str(part) for part in version)
+
+
+def native_store_name():
+    """The OS secret store dotenvx uses on this platform, or None."""
+    for prefix, name in NATIVE_STORE_NAMES:
+        if sys.platform.startswith(prefix):
+            return name
+    return None
+
+
+def native_disabled():
+    return os.environ.get("DOTENVX_NO_NATIVE", "").lower() == "true"
+
+
+def native_store_wanted(args):
+    """Should a fresh private key go to the OS secret store? Not with --no-native or
+    DOTENVX_NO_NATIVE=true, not with a dotenvx before 2.3, not on a platform without a store."""
+    if getattr(args, "no_native", False) or native_disabled():
+        return False
+    return native_store_name() is not None and dotenvx_version() >= DOTENVX_NATIVE_SINCE
+
+
+def tidy_tool_line(text):
+    """A dotenvx output line without its leading glyph."""
+    return to_text(text).strip().lstrip(u"\u2620\u25cb\u2325\u2714\u25c8\u26c9 \t")
+
+
+def file_custody_reason(args, detail=u""):
+    """Why a private key stays in a .env.keys file rather than the OS store (detail: what
+    dotenvx said when the store refused it)."""
+    if getattr(args, "no_native", False):
+        return u"--no-native"
+    if native_disabled():
+        return u"DOTENVX_NO_NATIVE is set"
+    store = native_store_name()
+    if store is None:
+        return u"no OS secret store on this platform"
+    version = dotenvx_version()
+    if version and version < DOTENVX_NATIVE_SINCE:
+        return u"dotenvx %s keeps keys in files; %s or later can keep them in the %s" % (
+            version_text(version), version_text(DOTENVX_NATIVE_SINCE), store)
+    detail = tidy_tool_line(detail) if detail else u""
+    return detail or u"the %s is not reachable here" % store
+
+
+def private_keys_from(keys_files):
+    """DOTENV_PRIVATE_KEY* entries of the given keys files, for a dotenvx too old for -fk, which
+    reads the private key from the environment instead."""
+    found = {}
+    for keys_file in keys_files:
+        try:
+            for key, value, _ in parse_env_entries(read_text(keys_file)):
+                if key.startswith("DOTENV_PRIVATE_KEY") and value and key not in found:
+                    found[key] = value
+        except (IOError, OSError):
+            continue
+    return found
+
+
+def dotenvx_native(dotenvx, action, env_path, keys_file, root, args):
+    """`dotenvx native up|down -f env -fk keys`: move the private key of env into the OS secret
+    store (up) or back into the keys file (down). Returns (ok, last line of dotenvx's output)."""
+    cmd = [dotenvx, "native", action, "-f", env_path, "-fk", keys_file]
+    log_only(u"$ " + u" ".join(cmd))
+    if args.verbose:
+        say(u"  $ " + u" ".join(cmd))
+    try:
+        code, out, err = run_command(cmd, cwd=root, extra_env={"DOTENVX_NO_TELEMETRY": "1"})
+    except (OSError, IOError) as exc:
+        return False, u"could not run dotenvx: %s" % to_text(str(exc))
+    text = (out + u"\n" + err).strip()
+    if text:
+        log_only(text)
+    if args.verbose and text:
+        say(style_dim_block(text))
+    lines = text.splitlines()
+    return code == 0, (lines[-1].strip() if lines else u"status %d" % code)
+
+
+def dotenvx_encrypt(dotenvx, env_path, keys, root, args, keys_file=None, allow_empty=False):
+    """Run `dotenvx encrypt -f env_path -k KEY ...` with the swept folder as cwd; -fk keys_file
+    says where a new private key goes (a dotenvx from 1.38). allow_empty lets a file with no
+    keys to encrypt be run through dotenvx just for its key pair."""
+    if not keys and not allow_empty:  # without -k dotenvx would encrypt every key in the file
         raise ToolError(u"refusing to run dotenvx encrypt without an explicit key list")
     cmd = [dotenvx, "encrypt", "-f", env_path]
     for key in keys:
         cmd.extend(["-k", key])
+    if keys_file:
+        cmd.extend(["-fk", keys_file])
     log_only(u"$ " + u" ".join(cmd))
     if args.verbose:
         say(u"  $ " + u" ".join(cmd))
@@ -2687,13 +2805,18 @@ def decrypt_env_value(dotenvx, env_path, key, root, args):
     its own dotenvx only looks next to the env file. An undecryptable value comes
     back as the ciphertext with exit status 0, so the text is checked, not the code."""
     cmd = [dotenvx, "get", key, "-f", env_path, "--overload"]
-    for keys_file in discover_keys_files([env_path], root):
-        cmd.extend(["-fk", keys_file])
+    extra_env = {"DOTENVX_NO_TELEMETRY": "1"}
+    keys_files = discover_keys_files([env_path], root)
+    if dotenvx_version() >= DOTENVX_KEYS_FILE_OPTION_SINCE:
+        for keys_file in keys_files:
+            cmd.extend(["-fk", keys_file])
+    else:   # an older dotenvx ignores -fk; it does read the private key from the environment
+        extra_env.update(private_keys_from(keys_files))
     log_only(u"$ " + u" ".join(cmd) + u"   (output not logged: it is the value)")
     if args.verbose:
         say(u"  $ " + u" ".join(cmd))
     try:
-        code, out, err = run_command(cmd, cwd=root, extra_env={"DOTENVX_NO_TELEMETRY": "1"})
+        code, out, err = run_command(cmd, cwd=root, extra_env=extra_env)
     except (OSError, IOError) as exc:
         return None, u"could not run dotenvx get: %s" % to_text(str(exc))
     if code != 0:
@@ -2732,10 +2855,11 @@ def make_staging_dir(root):
 
 
 def adopt_keys_file(staging, env_path):
-    """dotenvx 1.x writes .env.keys next to the file it encrypts, i.e. into the
-    staging folder; move those keys next to the real env file, merging them into
-    a keys file that is already there. Returns that file, or None if nothing was
-    written into the staging folder (dotenvx 2.x writes to the cwd instead)."""
+    """A new private key lands in the staging folder (dotenvx 1.x writes next to the file it
+    encrypts, later ones where -fk says); copy it next to the real env file, merging into a
+    keys file already there. Returns that file, or None when nothing is in the staging
+    folder (the key went to the OS secret store, or the file already had its key pair). The
+    staged copy is left for the verification step and goes with the staging folder."""
     staged = os.path.join(staging, ".env.keys")
     if not os.path.isfile(staged):
         return None
@@ -2757,23 +2881,18 @@ def adopt_keys_file(staging, env_path):
 
 
 KEYS_HINT_LINE_RE = re.compile(br"^([ \t]*DOTENV_PUBLIC_KEY\w*[ \t]*=.*#[ \t]*-fk[ \t]+)(\S+)", re.M)
+PUBLIC_KEY_LINE_RE = re.compile(br"^([ \t]*DOTENV_PUBLIC_KEY\w*[ \t]*=[^\r\n#]*?)(?:[ \t]*#[ \t]*-fk[ \t]+[^\r\n]*)?[ \t]*(\r?)$",
+                                re.M)
 
 
-def fix_keys_hint(data, staged_dir, env_dir):
-    """dotenvx writes '# -fk <path to .env.keys>' relative to the file it encrypted,
-    i.e. to the staging folder; re-point it at the same keys file from the real
-    location of the env file."""
+def set_keys_hint(data, hint):
+    """dotenvx 2.x writes '# -fk <path>' on the DOTENV_PUBLIC_KEY line, the keys file relative
+    to the file it encrypted (the staging copy). Point it at the keys file's real place (hint,
+    relative to the env file), or drop it when the key is not in a file at all (None)."""
     def fix(match):
-        hint = to_text(match.group(2))
-        if os.path.isabs(hint):
-            return match.group(0)
-        target = os.path.normpath(os.path.join(staged_dir, hint))
-        try:
-            new_hint = slash_path(os.path.relpath(target, env_dir))
-        except ValueError:  # different drive on Windows
-            new_hint = slash_path(target)
-        return match.group(1) + to_bytes(new_hint)
-    return KEYS_HINT_LINE_RE.sub(fix, data)
+        tail = (u" # -fk %s" % hint).encode("utf-8") if hint else b""
+        return match.group(1).rstrip() + tail + match.group(2)
+    return PUBLIC_KEY_LINE_RE.sub(fix, data, count=1)
 
 
 def verify_decrypts(decryptor, env_path, job, keys, before):
@@ -2805,7 +2924,7 @@ def verify_decrypts(decryptor, env_path, job, keys, before):
     return problems, unverifiable
 
 
-def encrypt_env_file(env_path, job, dotenvx, root, args, decryptor=None, journal=None):
+def encrypt_env_file(env_path, job, dotenvx, root, args, decryptor=None, journal=None, custody=None):
     """Store and encrypt the keys of one env file without ever writing plaintext to it.
 
     The file (or a fresh header for a new one) is copied into a staging folder
@@ -2816,6 +2935,12 @@ def encrypt_env_file(env_path, job, dotenvx, root, args, decryptor=None, journal
     stored where a private key is at hand); only then is the copy installed over the
     real file in one atomic rename. If anything fails, the real file has not been
     touched. Returns (ok, note, warnings).
+
+    A fresh key pair's private key is dotenvx's to keep: `dotenvx native up` puts it in the
+    OS secret store where this dotenvx and platform allow (nothing is left on disk), else it
+    is adopted into .env.keys next to the env file. A file that already had a key pair keeps
+    its custody. custody, when a dict, records ("native", store, u""), ("file", keys path, why
+    not the store) or ("existing", None, u"") under env_path.
     """
     warnings = []
     try:
@@ -2852,8 +2977,24 @@ def encrypt_env_file(env_path, job, dotenvx, root, args, decryptor=None, journal
         for key in job["keys"]:
             if key not in keys:
                 keys.append(key)
-        dotenvx_encrypt(dotenvx, copy, keys, root, args)
-        adopt_keys_file(staging, env_path)
+        fresh = not re.search(br"^[ \t]*DOTENV_PUBLIC_KEY\w*[ \t]*=", data, re.M)   # no key pair yet
+        staged_keys = os.path.join(staging, ".env.keys")   # where a new private key lands, whatever the dotenvx
+        keys_file_arg = staged_keys if dotenvx_version() >= DOTENVX_KEYS_FILE_OPTION_SINCE else None
+        dotenvx_encrypt(dotenvx, copy, keys, root, args, keys_file=keys_file_arg, allow_empty=job.get("allow_empty", False))
+        where = None
+        if fresh and os.path.isfile(staged_keys) and native_store_wanted(args):
+            ok, detail = dotenvx_native(dotenvx, "up", copy, staged_keys, root, args)
+            if ok and not os.path.isfile(staged_keys):
+                where = ("native", native_store_name(), u"")
+            else:   # no store reachable here: the file it is, and the report says why
+                refused = detail or u"dotenvx native up failed"
+        else:
+            refused = u""
+        adopted = adopt_keys_file(staging, env_path)
+        if adopted:
+            where = ("file", adopted, refused)
+        if custody is not None:
+            custody[env_path] = where if fresh else ("existing", None, u"")
         result = read_bytes(copy)
         entries = {}
         for key, value, _ in parse_env_entries(to_text(result)):
@@ -2875,7 +3016,15 @@ def encrypt_env_file(env_path, job, dotenvx, root, args, decryptor=None, journal
             if unverifiable:
                 warnings.append(u"could not verify %s: no private key for this file is available here;"
                                 u" check the values where it is" % u", ".join(unverifiable))
-        result = fix_keys_hint(result, staging, os.path.dirname(os.path.abspath(env_path)))
+        if fresh and KEYS_HINT_LINE_RE.search(result):
+            # the hint dotenvx wrote points into the staging folder: name the adopted file, or nothing
+            hint = None
+            if where and where[0] == "file":
+                try:
+                    hint = slash_path(os.path.relpath(where[1], os.path.dirname(os.path.abspath(env_path))))
+                except ValueError:   # another drive on Windows
+                    hint = slash_path(where[1])
+            result = set_keys_hint(result, hint)
         folder = os.path.dirname(env_path)
         if folder and not os.path.isdir(folder):
             os.makedirs(folder)
@@ -2981,7 +3130,8 @@ def execute(plan, chosen, dotenvx, args, style, decryptor=None, journal=None):
                 keys.append(key)
         if not keys:
             continue
-        ok, note, warnings = encrypt_env_file(env_path, job, dotenvx, plan.root, args, decryptor, journal)
+        ok, note, warnings = encrypt_env_file(env_path, job, dotenvx, plan.root, args, decryptor, journal,
+                                              custody=plan.custody)
         if ok:
             say(u"  %s %s: encrypted %d key(s): %s" % (style.ok("[ok]"), plan.rel(env_path), len(keys),
                                                       u", ".join(keys)))
@@ -3078,6 +3228,16 @@ def discover_keys_files(env_paths, root):
         seen.add(identity)
         found.append(candidate)
     return found
+
+
+def env_paths_with_keys(plan, chosen, keys_files):
+    """The env files this run wrote whose private key sits in one of keys_files, in plan order."""
+    paths = []
+    for item in chosen:
+        for path in ((item.path if item.kind == "env" else None), item.store):
+            if path and path not in paths and (plan.custody.get(path) or ("file",))[0] == "file":
+                paths.append(path)
+    return paths
 
 
 def keys_file_for(env_path, keys_files):
@@ -3219,10 +3379,23 @@ def print_next_steps(plan, chosen, keys_files, args, style):
     if plan.compiled:
         bullet(u"The findings in compiled code were listed and left alone. Check each with  strings <file> |"
                u" grep -n <start of the value>;  a real credential there has to be rotated, and the program rebuilt without it.")
+    native = [(path, where) for path, (kind, where, _) in plan.custody.items() if kind == "native"]
+    if native:
+        store = native[0][1]
+        files = u", ".join(plan.rel(path) for path, _ in native)
+        bullet(u"The private key of %s is in the %s, kept by dotenvx: there is no key file to back up." % (files, store))
+        say(u"     For another machine or CI,  dotenvx keypair DOTENV_PRIVATE_KEY -f %s  prints it; set it there as"
+            % plan.rel(native[0][0]))
+        say(u"     the DOTENV_PRIVATE_KEY variable (a CI secret). The encrypted .env files themselves are safe to commit.")
     if keys_files:
         bullet(u"The private decryption key lives in %s." % u", ".join(plan.rel(k) for k in keys_files))
         say(u"     NEVER commit it. Share it through a password manager or your CI's secret store")
         say(u"     (the DOTENV_PRIVATE_KEY* variables). The encrypted .env files themselves are safe to commit.")
+        store = native_store_name()
+        if store and dotenvx_version() >= DOTENVX_NATIVE_SINCE and not getattr(args, "no_native", False):
+            env_for = next((plan.rel(p) for p in env_paths_with_keys(plan, chosen, keys_files)), u".env")
+            say(u"     dotenvx can keep it in the %s instead, with nothing on disk:  dotenvx native up -f %s"
+                % (store, env_for))
     bullet(u"These secrets sat in plaintext, so treat them as exposed and rotate them.")
     guides = OrderedDict()
     for item in chosen:
@@ -3290,6 +3463,9 @@ def parse_args(argv):
     parser.add_argument("--quarantine-dir", metavar="DIR", default=None,
                         help="the quarantine folder (default: %s inside the swept folder); implies --quarantine"
                              % QUARANTINE_DEFAULT)
+    parser.add_argument("--no-native", action="store_true",
+                        help="keep new private keys in .env.keys files instead of letting dotenvx put them in the "
+                             "OS secret store (macOS Keychain, Windows Credential Manager, Linux Secret Service)")
     parser.add_argument("--placeholder", default="${NAME}", metavar="TEMPLATE",
                         help="text that replaces a secret in source files; NAME becomes the key "
                              "(default: ${NAME})")
@@ -3368,10 +3544,24 @@ def wrap_up(plan, chosen, journal, root, git_root, args, style, failed, error, s
         if item.store and item.status in ("done", "stored") and item.store not in env_paths:
             env_paths.append(item.store)
     keys_files = discover_keys_files(env_paths, root)
-    if keys_files:
+    native = [(path, where) for path, (kind, where, _) in plan.custody.items() if kind == "native"]
+    existing = [path for path, (kind, where, _) in plan.custody.items() if kind == "existing"]
+    if native or existing or keys_files:
         say(u"")
+    for env_path, store in native:
+        say(u"  %s private key of %s: in the %s, kept by dotenvx (nothing on disk)"
+            % (style.ok("[ok]"), plan.rel(env_path), store))
+    for env_path in existing:
+        say(u"  %s %s already had its dotenvx key pair; its private key stays where it was"
+            % (style.ok("[ok]"), plan.rel(env_path)))
+    if keys_files:
+        fresh_files = dict((os.path.realpath(where), note) for path, (kind, where, note) in plan.custody.items()
+                           if kind == "file")
         for keys_file in keys_files:
-            say(u"  %s private key file: %s" % (style.ok("[ok]"), plan.rel(keys_file)))
+            identity = os.path.realpath(keys_file)
+            why = (u"  (file custody: %s)" % file_custody_reason(args, fresh_files[identity])
+                   if identity in fresh_files else u"")
+            say(u"  %s private key file: %s%s" % (style.ok("[ok]"), plan.rel(keys_file), style.dim(why)))
             if git_root and git_tracked(git_root, keys_file):
                 say(u"  %s %s is TRACKED BY GIT. Remove it from the index now:  git rm --cached %s"
                     % (style.bad("[!!]"), plan.rel(keys_file), plan.rel(keys_file)))

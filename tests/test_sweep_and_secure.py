@@ -186,14 +186,16 @@ def run_script(root, args, stdin_text="", extra_env=None, path=None):
     return proc.returncode, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
 
 
-def dotenvx_get(root, key, env_file=".env", keys_file=None, binary=None):
+def dotenvx_get(root, key, env_file=".env", keys_file=None, binary=None, extra_env=None):
     """What dotenvx (the stand-in by default) decrypts for key; --overload makes the
     file win over our own environment, as the script does when it verifies."""
     cmd = [sys.executable, FAKE_DOTENVX] if binary is None else [binary]
     cmd += ["get", key, "-f", env_file, "--overload"]
     if keys_file:
         cmd += ["-fk", keys_file]
-    proc = subprocess.Popen(cmd, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    env = dict(os.environ)
+    env.update(extra_env or {})
+    proc = subprocess.Popen(cmd, cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     out, _ = proc.communicate()
     out = out.decode("utf-8")
     return out[:-1] if out.endswith("\n") else out
@@ -285,7 +287,7 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(code, 0, out + err)
         for needle in ("Python %d.%d" % sys.version_info[:2], "[ok] trufflehog  3.99.0", "[ok] dotenvx     2.0.0",
                        "trufflehog  ran in a scratch folder: exit status 0, 1 file(s) scanned, no findings",
-                       "dotenvx     ran in a scratch folder: encrypted a value, decrypted it back, wrote .env.keys",
+                       "dotenvx     ran in a scratch folder: encrypted a value, decrypted it back; the private key went to .env.keys",
                        "Setup looks good. Nothing was changed."):
             self.assertIn(needle, out)
         self.assertNotIn("Scanning with TruffleHog", out)   # the tree itself is never scanned
@@ -657,12 +659,15 @@ class EndToEndTests(unittest.TestCase):
         env = self.tree.read(".env")
         self.assertTrue(encrypted("STRIPE_SECRET_KEY", env), env)   # in place, as before
         self.assertNotIn("AWS_ACCESS_KEY_ID", env)
-        # dotenvx keeps the private key in the swept folder and only looks next to the env
-        # file on its own, so the advice must say where the key is
-        self.assertIn("dotenvx run -f config/secrets.env -fk .env.keys -- <your command>", out)
-        self.assertIn("-fk points it at the one it wrote", out)
-        self.assertEqual(dotenvx_get(self.tree.root, "AWS_ACCESS_KEY_ID", "config/secrets.env", ".env.keys"), AWS_ID)
-        self.assertTrue(dotenvx_get(self.tree.root, "AWS_ACCESS_KEY_ID", "config/secrets.env").startswith("encrypted:"))
+        # the private key of an env file is written next to it, where dotenvx looks on its own
+        self.assertIn("dotenvx run -f config/secrets.env -- <your command>", out)
+        self.assertNotIn(" -fk ", out)
+        self.assertTrue(os.path.isfile(self.tree.path("config/.env.keys")))
+        self.assertTrue(os.path.isfile(self.tree.path(".env.keys")))
+        self.assertIn("# -fk .env.keys", self.tree.read("config/secrets.env"))   # the hint names the adopted file
+        self.assertNotIn(sas.TEMP_PREFIX, self.tree.read("config/secrets.env"))   # not the staging folder
+        self.assertEqual(dotenvx_get(self.tree.root, "AWS_ACCESS_KEY_ID", "config/secrets.env"), AWS_ID)
+        self.assertIn("private key file: config/.env.keys  (file custody: dotenvx 2.0.0 keeps keys in files", out)
 
     def test_same_secret_under_two_env_keys_encrypts_both(self):
         self.tree.write(".env", ("PORT=3000\nDB_PASSWORD=%s\nPOSTGRES_PASSWORD=%s\nALSO=\"x-%s-y\"\n"
@@ -950,6 +955,82 @@ class EndToEndTests(unittest.TestCase):
             self.assertFalse(os.path.exists(self.tree.path(rel)), rel)
             self.assertTrue(os.path.isfile(self.tree.path(".secrets-quarantine/" + rel)), rel)
         self.assertNoLeftovers()
+
+    def test_a_fresh_private_key_goes_to_the_os_store_when_dotenvx_can(self):
+        store_dir = tempfile.mkdtemp(prefix="sweep-store-")
+        store_file = os.path.join(store_dir, "store.json")
+        store = sas.native_store_name() or "Linux Secret Service"
+        env = {"FAKE_DOTENVX_VERSION": "2.38.0", "FAKE_DOTENVX_STORE": store_file}
+        try:
+            code, out, err = run_script(self.tree.root, ["--yes"], extra_env=env)
+            self.assertEqual(code, 0, out + err)
+            self.assertFalse(os.path.exists(self.tree.path(".env.keys")))            # nothing on disk
+            self.assertFalse(os.path.exists(self.tree.path("config/.env.keys")))
+            self.assertEqual(self.tree.leftovers(), [])
+            with io.open(store_file, encoding="utf-8") as fh:
+                stored = json.load(fh)
+            self.assertEqual(len(stored), 1)                                           # the .env key pair
+            self.assertIn("private key of .env: in the %s, kept by dotenvx (nothing on disk)" % store, out)
+            self.assertIn("is in the %s, kept by dotenvx: there is no key file to back up." % store, out)
+            self.assertIn("dotenvx keypair DOTENV_PRIVATE_KEY -f .env  prints it", out)
+            self.assertNotIn("private key file:", out)
+            self.assertNotIn("-fk", self.tree.read(".env"))                           # no hint at a file that is not there
+            self.assertEqual(dotenvx_get(self.tree.root, "STRIPE_SECRET_KEY", extra_env=env), STRIPE_KEY)
+            self.assertEqual(dotenvx_get(self.tree.root, "AWS_SECRET_ACCESS_KEY", extra_env=env), AWS_SECRET)
+            # a later run respects the custody .env already has, and adds nothing to the store for it
+            self.tree.write("src/more.py", ("KEY = '%s'\n" % STRIPE_KEY_2).encode("utf-8"))
+            code, out, err = run_script(self.tree.root, ["--yes"], extra_env=env)
+            self.assertEqual(code, 0, out + err)
+            self.assertIn(".env already had its dotenvx key pair; its private key stays where it was", out)
+            self.assertFalse(os.path.exists(self.tree.path(".env.keys")))
+            with io.open(store_file, encoding="utf-8") as fh:
+                self.assertEqual(len(json.load(fh)), 1)
+            name = re.search(r"src/more\.py:1\s+move to \.env, replace with \$\{(\w+)\}", out).group(1)
+            self.assertEqual(dotenvx_get(self.tree.root, name, extra_env=env), STRIPE_KEY_2)
+            # the setup check puts its scratch key in the store and takes it out again
+            code, out, err = run_script(self.tree.root, ["--check-setup"], extra_env=env)
+            self.assertEqual(code, 0, out + err)
+            self.assertIn("the private key went to the %s and was removed again" % store, out)
+            with io.open(store_file, encoding="utf-8") as fh:
+                self.assertEqual(len(json.load(fh)), 1)
+        finally:
+            shutil.rmtree(store_dir, ignore_errors=True)
+
+    def test_without_a_reachable_store_the_key_stays_in_a_file_and_the_run_says_why(self):
+        store = sas.native_store_name() or "Linux Secret Service"
+        # dotenvx 2.38 but no store reachable (a bare Linux server): the key stays in .env.keys
+        code, out, err = run_script(self.tree.root, ["--yes", "--no-rewrite"], extra_env={"FAKE_DOTENVX_VERSION": "2.38.0"})
+        self.assertEqual(code, 0, out + err)
+        self.assertTrue(os.path.isfile(self.tree.path(".env.keys")))
+        self.assertNotIn("[--]", out)   # a server without a store is the normal case, not a warning
+        self.assertIn("private key file: .env.keys  (file custody: failed to save private key to %s)" % store, out)
+        self.assertIn("dotenvx can keep it in the %s instead, with nothing on disk:  dotenvx native up -f .env" % store, out)
+        self.assertIn("# -fk .env.keys", self.tree.read(".env"))
+        # a key that exists already is left alone, even with a store at hand
+        store_dir = tempfile.mkdtemp(prefix="sweep-store-")
+        store_file = os.path.join(store_dir, "store.json")
+        try:
+            self.tree.write("src/more.py", ("KEY = '%s'\n" % STRIPE_KEY_2).encode("utf-8"))
+            code, out, err = run_script(self.tree.root, ["--yes"], extra_env={"FAKE_DOTENVX_VERSION": "2.38.0",
+                                                                                 "FAKE_DOTENVX_STORE": store_file})
+            self.assertEqual(code, 0, out + err)
+            self.assertIn(".env already had its dotenvx key pair; its private key stays where it was", out)
+            self.assertTrue(os.path.isfile(self.tree.path(".env.keys")))
+            self.assertFalse(os.path.exists(store_file))
+            # --no-native keeps a fresh key in a file too, and says so
+            other = ProjectTree({"app.py": 'TOKEN = "%s"\n' % GITHUB_TOKEN})
+            try:
+                code, out, err = run_script(other.root, ["--yes", "--no-native"],
+                                            extra_env={"FAKE_DOTENVX_VERSION": "2.38.0", "FAKE_DOTENVX_STORE": store_file})
+                self.assertEqual(code, 0, out + err)
+                self.assertTrue(os.path.isfile(other.path(".env.keys")))
+                self.assertIn("(file custody: --no-native)", out)
+                self.assertNotIn("dotenvx native up", out)
+                self.assertFalse(os.path.exists(store_file))
+            finally:
+                other.cleanup()
+        finally:
+            shutil.rmtree(store_dir, ignore_errors=True)
 
     def test_integrity_hashes_in_lock_files_are_not_secrets(self):
         # an AWS-looking string inside an npm sha512 integrity hash: a checksum, not a key
@@ -1835,14 +1916,50 @@ class UnitTests(unittest.TestCase):
         self.assertEqual([l.strip() for l in err], [b"log"])
         self.assertEqual(sorted(k for k, _ in seen), ["err", "out"])
 
-    def test_fix_keys_hint_repoints_at_the_same_keys_file(self):
-        staged = os.path.join(os.sep, "proj", ".sweep-and-secure-x")
-        data = b'DOTENV_PUBLIC_KEY_PRODUCTION="02ab" # -fk ../.env.keys\nK=encrypted:x\n'
-        fixed = sas.fix_keys_hint(data, staged, os.path.join(os.sep, "proj", "config"))
-        self.assertEqual(fixed, b'DOTENV_PUBLIC_KEY_PRODUCTION="02ab" # -fk ../.env.keys\nK=encrypted:x\n')
-        fixed = sas.fix_keys_hint(data, staged, os.path.join(os.sep, "proj"))
-        self.assertEqual(fixed, b'DOTENV_PUBLIC_KEY_PRODUCTION="02ab" # -fk .env.keys\nK=encrypted:x\n')
-        self.assertEqual(sas.fix_keys_hint(b"no hint here\n", staged, os.sep), b"no hint here\n")
+    def test_set_keys_hint_names_the_keys_file_or_drops_the_hint(self):
+        data = b'DOTENV_PUBLIC_KEY_PRODUCTION="02ab" # -fk ../.sweep-and-secure-x/.env.keys\nK=encrypted:x\n'
+        self.assertEqual(sas.set_keys_hint(data, ".env.keys"), b'DOTENV_PUBLIC_KEY_PRODUCTION="02ab" # -fk .env.keys\nK=encrypted:x\n')
+        self.assertEqual(sas.set_keys_hint(data, None), b'DOTENV_PUBLIC_KEY_PRODUCTION="02ab"\nK=encrypted:x\n')
+        crlf = b'DOTENV_PUBLIC_KEY="02ab" # -fk x\r\nK=1\r\n'
+        self.assertEqual(sas.set_keys_hint(crlf, None), b'DOTENV_PUBLIC_KEY="02ab"\r\nK=1\r\n')
+        self.assertEqual(sas.set_keys_hint(b"no header\n", None), b"no header\n")
+        self.assertEqual(sas.set_keys_hint(b'DOTENV_PUBLIC_KEY="02ab"\nK=1\n', ".env.keys"), b'DOTENV_PUBLIC_KEY="02ab" # -fk .env.keys\nK=1\n')
+
+    def test_custody_decisions(self):
+        folder = tempfile.mkdtemp(prefix="sweep-custody-")
+        saved = dict(sas.DOTENVX_INFO)
+        try:
+            keys = os.path.join(folder, ".env.keys")
+            with io.open(keys, "w", encoding="utf-8") as fh:
+                fh.write(u'# keys\nDOTENV_PRIVATE_KEY="aa11"\nDOTENV_PRIVATE_KEY_PRODUCTION=bb22\nOTHER=x\n')
+            self.assertEqual(sas.private_keys_from([keys, os.path.join(folder, "missing")]),
+                             {"DOTENV_PRIVATE_KEY": "aa11", "DOTENV_PRIVATE_KEY_PRODUCTION": "bb22"})
+            args = sas.parse_args(["--yes"])
+            sas.DOTENVX_INFO.clear()
+            sas.DOTENVX_INFO.update({"version": (2, 38, 0)})
+            store = sas.native_store_name()
+            if store:
+                self.assertTrue(sas.native_store_wanted(args))
+                self.assertEqual(sas.file_custody_reason(args), "the %s is not reachable here" % store)
+                self.assertEqual(sas.file_custody_reason(args, "no secret-tool"), "no secret-tool")
+            self.assertFalse(sas.native_store_wanted(sas.parse_args(["--yes", "--no-native"])))
+            self.assertEqual(sas.file_custody_reason(sas.parse_args(["--no-native"])), "--no-native")
+            sas.DOTENVX_INFO.update({"version": (2, 0, 0)})
+            self.assertFalse(sas.native_store_wanted(args))
+            if store:
+                self.assertEqual(sas.file_custody_reason(args),
+                                 "dotenvx 2.0.0 keeps keys in files; 2.3.0 or later can keep them in the %s" % store)
+            os.environ["DOTENVX_NO_NATIVE"] = "true"
+            try:
+                sas.DOTENVX_INFO.update({"version": (2, 38, 0)})
+                self.assertFalse(sas.native_store_wanted(args))
+                self.assertEqual(sas.file_custody_reason(args), "DOTENVX_NO_NATIVE is set")
+            finally:
+                del os.environ["DOTENVX_NO_NATIVE"]
+        finally:
+            sas.DOTENVX_INFO.clear()
+            sas.DOTENVX_INFO.update(saved)
+            shutil.rmtree(folder, ignore_errors=True)
 
     def test_cli_entry_point_returns_exit_codes(self):
         real_main = sas.main
@@ -1913,7 +2030,7 @@ class RealToolsTests(unittest.TestCase):
         code, first, err = run_script(self.tree.root, ["--yes", "--no-rewrite"], path=self.path)
         self.assertEqual(code, 0, first + err)
         # the nested env file was encrypted by this first run, so its advice is printed here
-        self.assertIn("dotenvx run -f config/.env.staging -fk .env.keys -- <your command>", first)
+        self.assertIn("dotenvx run -f config/.env.staging -- <your command>", first)
         code, out, err = run_script(self.tree.root, ["--yes"], path=self.path)
         self.assertEqual(code, 0, out + err)
         env = self.tree.read(".env")
@@ -1925,7 +2042,7 @@ class RealToolsTests(unittest.TestCase):
                           ("POSTGRES_PASSWORD", STRIPE_KEY_2), ("AWS_ACCESS_KEY_ID", AWS_ID),
                           ("AWS_SECRET_ACCESS_KEY", AWS_SECRET), ("DATABASE_URL", PG_URL), ("SLACK_WEBHOOK", SLACK)):
             self.assertEqual(self.get(key), want, key)
-        self.assertEqual(self.get("STRIPE_KEY", "config/.env.staging", ".env.keys"), STRIPE_KEY_2)
+        self.assertEqual(self.get("STRIPE_KEY", "config/.env.staging", "config/.env.keys"), STRIPE_KEY_2)
         self.assertIn("(value already in .env)", out)   # the re-run recognised the stored values
         self.assertIn('AWS_ACCESS_KEY_ID = "${AWS_ACCESS_KEY_ID}"', self.tree.read("src/settings.py"))
         self.assertTrue(os.path.isfile(self.tree.path(".env.keys")))
@@ -1958,7 +2075,7 @@ class RealToolsTests(unittest.TestCase):
         self.assertIn("[ok] trufflehog  3.", out)
         self.assertIn("[ok] dotenvx ", out)
         self.assertIn("trufflehog  ran in a scratch folder: exit status 0, 1 file(s) scanned, no findings", out)
-        self.assertIn("dotenvx     ran in a scratch folder: encrypted a value, decrypted it back, wrote .env.keys", out)
+        self.assertIn("dotenvx     ran in a scratch folder: encrypted a value, decrypted it back; the private key went to", out)
         self.assertIn("Setup looks good", out)
         self.assertEqual(self.tree.leftovers(), [])
 
