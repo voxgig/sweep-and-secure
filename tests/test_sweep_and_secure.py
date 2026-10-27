@@ -25,6 +25,8 @@ import stat
 import subprocess
 import sys
 import atexit
+import base64
+import struct
 import tempfile
 import unittest
 import tarfile
@@ -88,6 +90,26 @@ ENCRYPTED_LINE = r'^%s=[\'"`]?encrypted:'   # dotenvx keeps the quote style of t
 
 B64_FILL = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ+/" * 2
 DIGEST_SHAPES = {"sha1": (27, "="), "sha256": (43, "="), "sha384": (64, ""), "sha512": (86, "=="), "h1": (43, "=")}
+
+
+def openssh_key_text(cipher, kdf):
+    """A private key file in the OpenSSH format whose header names cipher and kdf (none/none without a
+    passphrase, aes256-ctr/bcrypt with one); the rest of the blob is filler, which is all the script
+    reads. The fake TruffleHog flags any BEGIN ... PRIVATE KEY block."""
+    blob = (b"openssh-key-v1\x00" + struct.pack(">I", len(cipher)) + cipher + struct.pack(">I", len(kdf)) + kdf
+            + struct.pack(">I", 0) + struct.pack(">I", 1) + b"\x00" * 64)
+    body = base64.b64encode(blob).decode("ascii")
+    lines = [body[i:i + 70] for i in range(0, len(body), 70)]
+    return "-----BEGIN OPENSSH PRIVATE KEY-----\n%s\n-----END OPENSSH PRIVATE KEY-----\n" % "\n".join(lines)
+
+
+LEGACY_PEM_BARE = ("-----BEGIN RSA PRIVATE KEY-----\n" + B64_FILL[:64] + "\n" + B64_FILL[:64] + "\n" + B64_FILL[:32] + "\n"
+                   "-----END RSA PRIVATE KEY-----\n")
+LEGACY_PEM_PROTECTED = ("-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,0A1B2C3D4E5F60718293A4B5C6D7E8F9\n\n"
+                        + B64_FILL[:64] + "\n" + B64_FILL[:64] + "\n-----END RSA PRIVATE KEY-----\n")
+PKCS8_PROTECTED = ("-----BEGIN ENCRYPTED PRIVATE KEY-----\n" + B64_FILL[:64] + "\n" + B64_FILL[:40] + "\n"
+                   "-----END ENCRYPTED PRIVATE KEY-----\n")
+CERT_BLOCK = "-----BEGIN CERTIFICATE-----\n" + B64_FILL[:64] + "\n" + B64_FILL[:48] + "\n-----END CERTIFICATE-----\n"
 
 
 def integrity_hash(algo, token, extra=0):
@@ -471,8 +493,10 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("config/.env.production", out)
         # archives get their own section: which files inside hold which secrets, and the action.
         # An interactive run offers to quarantine them, and a dry run previews that.
-        self.assertIn("Plaintext secrets found: 11 in 8 file(s)", out)   # archives are not counted here
+        self.assertIn("Plaintext secrets found: 10 in 7 file(s)", out)   # archives and the key file are not counted here
         self.assertIn("Files holding secrets that cannot be fixed in place: 2", out)
+        self.assertIn("Private key files: 1", out)
+        self.assertRegex(out, r"\d+\s+docs[/\\]deploy_key\.pem\s+none \(PKCS#8\)\s+move to \.secrets-quarantine[/\\]docs[/\\]deploy_key\.pem\.enc")
         self.assertIn("Why / inside", out)
         self.assertIn("zip: config/prod.env", out)
         self.assertIn("config/prod.env", out)        # the member that holds the Stripe key
@@ -486,8 +510,10 @@ class EndToEndTests(unittest.TestCase):
         # a --yes run leaves them alone unless --quarantine is given, and the preview says so
         code, out, err = run_script(self.tree.root, ["--dry-run", "--yes"])
         self.assertEqual(code, 0, out + err)
-        self.assertIn("Plaintext secrets found: 11 in 8 file(s)", out)
+        self.assertIn("Plaintext secrets found: 10 in 7 file(s)", out)
         self.assertIn("Files holding secrets that cannot be fixed in place: 2", out)
+        self.assertRegex(out, r"-\s+docs[/\\]deploy_key\.pem\s+none \(PKCS#8\)\s+stays in place \(pass --quarantine to move it\)")
+        self.assertRegex(out, r"ssh-keygen -p -o -a 100 -f docs[/\\]deploy_key\.pem")
         self.assertIn("config/prod.env", out)
         self.assertIn("stays in place (pass --quarantine to move it)", out)
         self.assertNotIn("move to .secrets-quarantine", out)
@@ -504,18 +530,18 @@ class EndToEndTests(unittest.TestCase):
     def test_answering_no_changes_nothing(self):
         code, out, err = run_script(self.tree.root, [], stdin_text="n\n")
         self.assertEqual(code, 2, out + err)
-        self.assertIn("Encrypt 11 secret(s) and move 2 file(s) to quarantine now?", out)
+        self.assertIn("Encrypt 10 secret(s) and move 3 file(s) to quarantine now?", out)
         self.assertIn("Nothing encrypted", out)
         self.assertUnchanged()
 
     def test_interactive_yes_also_quarantines_archives_without_the_flag(self):
         code, out, err = run_script(self.tree.root, [], stdin_text="y\n")
         self.assertEqual(code, 0, out + err)
-        for rel in ("build/keys.zip", "build/blob.txt.gz"):
+        for rel in ("build/keys.zip", "build/blob.txt.gz", "docs/deploy_key.pem"):
             self.assertFalse(os.path.exists(self.tree.path(rel)), rel)
             self.assertTrue(os.path.isfile(self.tree.path(".secrets-quarantine/" + rel + ".enc")), rel)
             self.assertEqual(quarantined_bytes(self.tree, rel), self.before[rel.replace("/", os.sep)], rel)
-        self.assertIn("2 file(s) moved to .secrets-quarantine (encrypted)", out)
+        self.assertIn("3 file(s) moved to .secrets-quarantine (encrypted)", out)
         self.assertIn("/.secrets-quarantine/", self.tree.read(".gitignore"))
         self.assertTrue(encrypted("STRIPE_SECRET_KEY", self.tree.read(".env")))
 
@@ -548,7 +574,7 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("('${STRIPE_SECRET_KEY}')", client)
         self.assertIn("${SLACK_WEBHOOK}", self.tree.read("docs/notes.md"))
         self.assertIn('"${SLACK_WEBHOOK}"', self.tree.read("config/app.json"))
-        self.assertEqual(self.tree.read("docs/deploy_key.pem"), "${%s}\n" % PEM_KEY)
+        self.assertEqual(self.tree.read("docs/deploy_key.pem"), PEM + "\n")   # a key file: never rewritten, --yes alone leaves it
         # the escaped copy of the key is replaced too, and the punctuation around URLs survives
         self.assertIn('"private_key": "${%s}"' % PEM_KEY, self.tree.read("config/service_account.json"))
         self.assertEqual(self.tree.read("docs/db.md"), "Connect with ${DATABASE_URL}. Read replica: [${DATABASE_URL}]\n")
@@ -560,8 +586,8 @@ class EndToEndTests(unittest.TestCase):
         self.assertTrue(os.path.isfile(self.tree.path(".env.keys")))
         self.assertIn(".env.keys*", self.tree.read(".gitignore"))
         self.assertUnchanged("node_modules/pkg/.env", "build/blob.txt.gz", "build/keys.zip", "config/.env.production")
-        self.assertIn("Done: 7 secret(s) stored encrypted; 11 plaintext occurrence(s) removed from 7 file(s);"
-                      " 2 file(s) need manual attention", out)
+        self.assertIn("Done: 7 secret(s) stored encrypted; 10 plaintext occurrence(s) removed from 6 file(s);"
+                      " 3 file(s) need manual attention", out)
         self.assertIn("Next steps", out)
         self.assertIn("dotenvx run -- <your command>", out)
         self.assertNotIn(" -fk ", out)                   # .env and .env.keys share a folder
@@ -822,11 +848,11 @@ class EndToEndTests(unittest.TestCase):
         # --yes alone leaves them; --yes --quarantine moves them, a taken name gets a suffix
         code, out, err = run_script(self.tree.root, ["--dry-run", "--yes"])
         self.assertEqual(code, 0, out + err)
-        self.assertEqual(out.count("stays in place (pass --quarantine to move it)"), 5)
+        self.assertEqual(out.count("stays in place (pass --quarantine to move it)"), 6)   # and the key file
         self.assertNotIn("move to .secrets-quarantine", out)
         code, out, err = run_script(self.tree.root, ["--yes", "--quarantine"])
         self.assertEqual(code, 0, out + err)
-        self.assertIn("5 file(s) moved to .secrets-quarantine", out)
+        self.assertIn("6 file(s) moved to .secrets-quarantine", out)
         self.assertIn("build/keys.zip: moved to .secrets-quarantine/build/keys.zip.1.enc (encrypted)", out)
         for rel in ("package-lock.json", "docs/report.pdf", "vendor/thing.bin", "build/blob.txt.gz", "build/keys.zip"):
             self.assertFalse(os.path.exists(self.tree.path(rel)), rel)
@@ -844,7 +870,7 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(by_original["vendor/thing.bin"]["why"], "binary file")
         self.assertEqual(by_original["vendor/thing.bin"]["detectors"], ["SlackWebhook"])
         self.assertTrue(by_original["docs/report.pdf"]["original_absolute"].endswith("docs/report.pdf"))
-        self.assertEqual(sorted(r["key"] for r in index), ["QUARANTINE_KEY_%d" % n for n in range(1, 6)])
+        self.assertEqual(sorted(r["key"] for r in index), ["QUARANTINE_KEY_%d" % n for n in range(1, 7)])   # and the key file's
         # afterwards nothing is left to offer, and the quarantine folder itself is never listed
         code, out, err = run_script(self.tree.root, ["--dry-run"])
         self.assertEqual(code, 0, out + err)
@@ -874,7 +900,7 @@ class EndToEndTests(unittest.TestCase):
         manifest = self.tree.read(".secrets-quarantine/MANIFEST.txt")
         self.assertIn("index.json.1.enc  <- index.json  (SlackWebhook)  why: binary file  enc: QUARANTINE_KEY_", manifest)
         self.assertIn("MANIFEST.txt.1.enc  <- MANIFEST.txt  (SlackWebhook)  why: binary file  enc: QUARANTINE_KEY_", manifest)
-        self.assertEqual(len(index), 4)   # both, and the two archives of the tree
+        self.assertEqual(len(index), 5)   # both, the two archives of the tree and its key file
         self.assertNoLeftovers()
 
     def test_an_unstorable_value_in_several_files_leaves_every_copy_for_quarantine(self):
@@ -989,7 +1015,7 @@ class EndToEndTests(unittest.TestCase):
         code, out, err = run_script(self.tree.root, ["--dry-run"])
         self.assertEqual(code, 0, out + err)
         self.assertIn("Set aside 3 finding(s) that are package integrity hashes (sha512-..., h1:..., sha256:...) or"
-                      " checksums and commit ids in lock files", out)
+                      " commit ids and checksums that a lock file or manifest vouches for", out)
         for rel in ("yarn.lock", "mix.lock", "package-lock.json"):
             self.assertNotIn(rel, out)
         log = read_file(re.search(r"^Log: (.*)$", out, re.M).group(1).strip())
@@ -1016,6 +1042,116 @@ class EndToEndTests(unittest.TestCase):
         for rel in ("sub/yarn.lock", "sub/pnpm-lock.yaml"):
             self.assertFalse(os.path.exists(self.tree.path(rel)), rel)
             self.assertTrue(os.path.isfile(self.tree.path(".secrets-quarantine/" + rel + ".enc")), rel)
+        self.assertNoLeftovers()
+
+    def test_commit_ids_in_manifests_are_not_secrets(self):
+        # measured: every TruffleHog from 3.6 to 3.99 reports the commit id of a dependency pinned to one as a
+        # token of the vendor named just before it ("cloudflare": "github:cloudflare/node-cloudflare#<id>" in
+        # package.json), and the same for a gitHead field, an action pin, a rev or ref field, a commit link.
+        # Those are public identifiers the file vouches for; a token next to the same word is still a token.
+        shas = [hashlib.sha1(("pin %d" % i).encode("utf-8")).hexdigest() for i in range(9)]
+        token = "cfT0ken_" + "Qm7xPz2vLw9nRt4yUe6iOa1sZb8kHn3cVf5mJq2w"[:32]
+        self.tree.write("package.json", json.dumps({
+            "name": "@cloudflare/demo", "gitHead": shas[0], "version": "1.0.0",
+            "dependencies": {"cloudflare": "github:cloudflare/node-cloudflare#%s" % shas[1],
+                             "wrangler": "git+https://github.com/cloudflare/workers-sdk.git#%s" % shas[2]},
+            "config": {"cloudflare_token": token}}, indent=2).encode("utf-8"))
+        self.tree.write(".github/workflows/deploy.yml", ("name: deploy\non: [push]\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n"
+                                                        "    steps:\n      - uses: actions/checkout@v4\n"
+                                                        "      - uses: cloudflare/wrangler-action@%s # v3\n"
+                                                        "        with:\n          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}\n"
+                                                        % shas[3]).encode("utf-8"))
+        self.tree.write(".pre-commit-config.yaml", ("repos:\n  - repo: https://github.com/cloudflare/pre-commit-hooks\n    rev: %s\n"
+                                                   "    hooks: [{ id: trailing-whitespace }]\n" % shas[4]).encode("utf-8"))
+        self.tree.write("requirements.txt", ("requests==2.31.0\ngit+https://github.com/cloudflare/python-cloudflare.git@%s#egg=cloudflare\n"
+                                             % shas[5]).encode("utf-8"))
+        self.tree.write("Cargo.toml", ('[dependencies]\ncloudflare = { git = "https://github.com/cloudflare/cloudflare-rs", rev = "%s" }\n'
+                                       % shas[6]).encode("utf-8"))
+        self.tree.write("infra/main.tf", ('module "dns" {\n  source = "git::https://github.com/cloudflare/terraform-modules.git?ref=%s"\n}\n'
+                                          % shas[7]).encode("utf-8"))
+        self.tree.write("CHANGELOG.md", ("# 1.0.1\n\n* cloudflare fix ([abc1234](https://github.com/cloudflare/x/commit/%s))\n"
+                                         % shas[8]).encode("utf-8"))
+        code, out, err = run_script(self.tree.root, ["--dry-run"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("Set aside 9 finding(s) that are package integrity hashes (sha512-..., h1:..., sha256:...) or"
+                      " commit ids and checksums that a lock file or manifest vouches for", out)
+        for name in ("deploy.yml", ".pre-commit-config.yaml", "requirements.txt", "Cargo.toml", "main.tf", "CHANGELOG.md"):
+            self.assertNotIn(name, out)
+        # the token in the same file is still listed, and is the only row for it
+        self.assertRegex(out, r"CloudflareApiToken\s+\S+\s+cfT0\.\.\.\S\S\s+package\.json:\d+\s+move to \.env")
+        self.assertEqual(len(re.findall(r"package\.json:\d+", out)), 1)
+        log = read_file(re.search(r"^Log: (.*)$", out, re.M).group(1).strip())
+        self.assertIn("set aside, a commit id or checksum the file vouches for: package.json line 3 (CloudflareApiToken)", log)
+        self.assertIn("set aside, a commit id or checksum the file vouches for: Cargo.toml line 2 (CloudflareApiToken)", log)
+        for sha in shas:
+            self.assertNotIn(sha, log)
+        # a real run moves the token and leaves every pin as it was
+        code, out, err = run_script(self.tree.root, ["--yes"])
+        self.assertEqual(code, 0, out + err)
+        package = self.tree.read("package.json")
+        self.assertNotIn(token, package)
+        self.assertIn('"cloudflare_token": "${', package)
+        for rel, sha in (("package.json", shas[0]), ("package.json", shas[1]), ("package.json", shas[2]),
+                         (".github/workflows/deploy.yml", shas[3]), (".pre-commit-config.yaml", shas[4]),
+                         ("requirements.txt", shas[5]), ("Cargo.toml", shas[6]), ("infra/main.tf", shas[7]),
+                         ("CHANGELOG.md", shas[8])):
+            self.assertIn(sha, self.tree.read(rel), rel)
+        self.assertNoLeftovers()
+
+    def test_private_key_files_are_never_rewritten_and_get_ssh_keygen_lines(self):
+        # a key file (nothing but PEM blocks) is read by ssh or a server from its file: a placeholder would break it.
+        # Without a passphrase it is offered to the quarantine like any file that cannot be fixed in place, unless it
+        # lies in .ssh where ssh needs it; with one it is left alone; and the run prints the ssh-keygen line for each.
+        bare, protected = openssh_key_text(b"none", b"none"), openssh_key_text(b"aes256-ctr", b"bcrypt")
+        pub = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA deploy@demo\n"
+        self.tree.write("deploy/id_ed25519", bare.encode("utf-8"))
+        self.tree.write("deploy/id_ed25519.pub", pub.encode("utf-8"))
+        self.tree.write(".ssh/id_ed25519_protected", protected.encode("utf-8"))
+        self.tree.write(".ssh/id_rsa_legacy", LEGACY_PEM_PROTECTED.encode("utf-8"))
+        self.tree.write(".ssh/id_rsa_bare", LEGACY_PEM_BARE.encode("utf-8"))
+        self.tree.write("certs/server.pem", (CERT_BLOCK + LEGACY_PEM_BARE).encode("utf-8"))
+        sep = r"[/\\]"
+        code, out, err = run_script(self.tree.root, ["--dry-run"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("Private key files: 6", out)   # these five and the fixture's docs/deploy_key.pem
+        self.assertRegex(out, r"\d+\s+deploy%sid_ed25519\s+none \(OpenSSH format\)\s+move to \.secrets-quarantine%sdeploy%sid_ed25519\.enc \(encrypted\)"
+                         % (sep, sep, sep))
+        self.assertRegex(out, r"\d+\s+certs%sserver\.pem\s+none \(PEM\)\s+move to \.secrets-quarantine%scerts%sserver\.pem\.enc" % (sep, sep, sep))
+        self.assertRegex(out, r"(?m)-\s+\.ssh%sid_ed25519_protected\s+yes \(OpenSSH format, aes256-ctr, bcrypt\)\s+left as it is\s*$" % sep)
+        self.assertRegex(out, r"-\s+\.ssh%sid_rsa_legacy\s+yes, legacy PEM cipher \(AES-128-CBC\)\s+left as it is; upgrade its passphrase" % sep)
+        self.assertRegex(out, r"-\s+\.ssh%sid_rsa_bare\s+none \(PEM\)\s+left as it is \(ssh needs it there\): add a passphrase" % sep)
+        self.assertIn("Add a passphrase (ssh asks for it when the key is used, or ssh-agent remembers it):", out)
+        self.assertRegex(out, r"(?m)^    ssh-keygen -p -a 100 -f deploy%sid_ed25519\s*$" % sep)
+        self.assertRegex(out, r"ssh-keygen -p -o -a 100 -f certs%sserver\.pem\s+\(rewrites the key in the OpenSSH format: only for a key ssh uses\)" % sep)
+        self.assertRegex(out, r"ssh-keygen -p -o -a 100 -f \.ssh%sid_rsa_bare\s+\(rewrites the key in the OpenSSH format\)" % sep)
+        self.assertIn("A key that a server or program reads at start-up cannot take a passphrase", out)
+        self.assertIn("Upgrade a passphrase set with the legacy PEM cipher (a single round of MD5 derives its key):", out)
+        self.assertRegex(out, r"(?m)^    ssh-keygen -p -o -a 100 -f \.ssh%sid_rsa_legacy\s*$" % sep)
+        head = out.split("Private key files:")[0]   # no key file is listed for a placeholder or shown as an archive
+        for name in ("id_ed25519", "id_rsa_legacy", "id_rsa_bare", "server.pem", "deploy_key.pem"):
+            self.assertNotIn(name, head)
+        # --yes alone leaves every key file as it is and says what stays bare
+        code, out, err = run_script(self.tree.root, ["--yes"])
+        self.assertEqual(code, 0, out + err)
+        kept = (("deploy/id_ed25519", bare), (".ssh/id_ed25519_protected", protected), (".ssh/id_rsa_legacy", LEGACY_PEM_PROTECTED),
+                (".ssh/id_rsa_bare", LEGACY_PEM_BARE), ("certs/server.pem", CERT_BLOCK + LEGACY_PEM_BARE), ("docs/deploy_key.pem", PEM + "\n"))
+        for rel, content in kept:
+            self.assertEqual(self.tree.read(rel), content, rel)
+        self.assertIn("4 private key file(s) without a passphrase stay where they are:", out)
+        self.assertIn("The ssh-keygen line for each is in", out)
+        # --yes --quarantine moves the bare ones outside .ssh, encrypted; the rest stays; --restore brings one back
+        code, out, err = run_script(self.tree.root, ["--yes", "--quarantine"])
+        self.assertEqual(code, 0, out + err)
+        for rel in ("deploy/id_ed25519", "certs/server.pem", "docs/deploy_key.pem"):
+            self.assertFalse(os.path.exists(self.tree.path(rel)), rel)
+            self.assertTrue(os.path.isfile(self.tree.path(".secrets-quarantine/" + rel + ".enc")), rel)
+        for rel, content in kept[1:4]:
+            self.assertEqual(self.tree.read(rel), content, rel)
+        self.assertEqual(self.tree.read("deploy/id_ed25519.pub"), pub)
+        self.assertIn("PrivateKey: make a new key pair (ssh-keygen -t ed25519 -a 100 -f ~/.ssh/<name>), install its .pub where", out)
+        code, out, err = run_script(self.tree.root, ["--restore", "deploy/id_ed25519"])
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self.tree.read("deploy/id_ed25519"), bare)
         self.assertNoLeftovers()
 
     def test_a_fresh_private_key_goes_to_the_os_store_when_dotenvx_can(self):
@@ -1251,10 +1387,10 @@ class EndToEndTests(unittest.TestCase):
         index = json.loads(self.tree.read(".secrets-quarantine/index.json"))
         self.assertEqual(sorted((r["original"], r["quarantined"]) for r in index),
                          [("build/blob.txt.gz", "build/blob.txt.gz.enc"), ("build/keys.zip", "build/keys.zip.enc"),
-                          ("build/old.tar.gz", "build/old.tar.gz.enc")])
+                          ("build/old.tar.gz", "build/old.tar.gz.enc"), ("docs/deploy_key.pem", "docs/deploy_key.pem.enc")])
         self.assertEqual([r["why"] for r in index if r["original"] == "build/keys.zip"], ["zip archive"])
         self.assertEqual([r["inside"] for r in index if r["original"] == "build/keys.zip"], [["config/prod.env"]])
-        self.assertIn("3 file(s) moved to .secrets-quarantine (encrypted)", out)
+        self.assertIn("4 file(s) moved to .secrets-quarantine (encrypted)", out)
         self.assertIn("/.secrets-quarantine/", self.tree.read(".gitignore"))
         self.assertIn("moved to .secrets-quarantine, AES-256 encrypted; the passphrase of each is kept in", out)
         self.assertIn(".secrets-quarantine/.env, encrypted by dotenvx with the key pair of .env. MANIFEST.txt and index.json"
@@ -1289,7 +1425,7 @@ class EndToEndTests(unittest.TestCase):
         code, out, err = run_script(self.tree.root, ["--yes", "--quarantine"])
         self.assertEqual(code, 0, out + err)
         self.assertIn("build/keys.zip: moved to .secrets-quarantine/build/keys.zip.enc (encrypted)", out)
-        self.assertIn("2 file(s) moved to .secrets-quarantine (encrypted)", out)
+        self.assertIn("3 file(s) moved to .secrets-quarantine (encrypted)", out)
         self.assertIn(".secrets-quarantine/.env holds the quarantine's passphrases, encrypted to the key pair of .env", out)
         self.assertIn("were moved to .secrets-quarantine, AES-256 encrypted; the passphrase of each is kept in", out)
         self.assertIn(".secrets-quarantine/.env, encrypted by dotenvx with the key pair of .env.", out)
@@ -1301,7 +1437,7 @@ class EndToEndTests(unittest.TestCase):
                     data = fh.read()
                 for secret in (STRIPE_KEY, GITHUB_TOKEN):
                     self.assertNotIn(secret.encode("utf-8"), data, name)
-        self.assertEqual(sorted(os.listdir(self.tree.path(".secrets-quarantine"))), [".env", "MANIFEST.txt", "build", "index.json"])
+        self.assertEqual(sorted(os.listdir(self.tree.path(".secrets-quarantine"))), [".env", "MANIFEST.txt", "build", "docs", "index.json"])
         self.assertEqual(sorted(os.listdir(self.tree.path(".secrets-quarantine/build"))), ["blob.txt.gz.enc", "keys.zip.enc"])
         # the passphrases are encrypted to the key pair .env got in this run: no second key pair, no second key file
         keys_env = self.tree.read(".secrets-quarantine/.env")
@@ -1328,7 +1464,7 @@ class EndToEndTests(unittest.TestCase):
         code, out, err = run_script(self.tree.root, ["--yes", "--quarantine"])
         self.assertEqual(code, 0, out + err)
         self.assertIn(".secrets-quarantine/.env holds the quarantine's passphrases, encrypted to the key pair of .env", out)
-        self.assertEqual(quarantine_record(self.tree, "build/more.zip")["key"], "QUARANTINE_KEY_3")
+        self.assertEqual(quarantine_record(self.tree, "build/more.zip")["key"], "QUARANTINE_KEY_4")   # after the two archives and the key file
         self.assertEqual(quarantined_bytes(self.tree, "build/more.zip"), original)
         self.assertNoLeftovers()
 
@@ -1500,7 +1636,7 @@ class EndToEndTests(unittest.TestCase):
             self.assertIn("Setup to tighten", out)
             self.assertIn("the private key of .env is in .env.keys; dotenvx can keep it in the %s instead, with nothing on disk"
                           % store, out)
-            self.assertIn("2 file(s) in .secrets-quarantine are stored as they are, secrets inside; they can be AES-256 encrypted",
+            self.assertIn("3 file(s) in .secrets-quarantine are stored as they are, secrets inside; they can be AES-256 encrypted",
                           out)
             self.assertIn("Dry run: nothing was changed.", out)
             self.assertTrue(os.path.isfile(self.tree.path(".env.keys")))
@@ -1511,7 +1647,7 @@ class EndToEndTests(unittest.TestCase):
             # the fixture's config/.env.production carries a header called DOTENV_PUBLIC_KEY like .env's, but its
             # private key is not here: the key in .env.keys is .env's, and is never taken for the other file's
             self.assertNotIn("config/.env.production is in .env.keys", out)
-            self.assertIn("Tighten the setup now (move 1 private key(s) into the %s, encrypt 2 quarantined file(s))? [y/N]: "
+            self.assertIn("Tighten the setup now (move 1 private key(s) into the %s, encrypt 3 quarantined file(s))? [y/N]: "
                           % store, out)
             self.assertIn("Nothing changed.", out)
             self.assertTrue(os.path.isfile(self.tree.path(".env.keys")))
@@ -1525,9 +1661,9 @@ class EndToEndTests(unittest.TestCase):
             self.assertIn("[ok] .secrets-quarantine/build/keys.zip: encrypted in place as build/keys.zip.enc", out)
             self.assertIn("[ok] private key of .env: moved from .env.keys into the %s, kept by dotenvx (nothing on disk)" % store, out)
             self.assertIn(".secrets-quarantine/.env holds the quarantine's passphrases, encrypted to the key pair of .env", out)
-            self.assertIn("Done: 0 secret(s) stored encrypted; 1 private key(s) moved into the %s; 2 quarantined file(s) encrypted"
+            self.assertIn("Done: 0 secret(s) stored encrypted; 1 private key(s) moved into the %s; 3 quarantined file(s) encrypted"
                           " in place" % store, out)
-            self.assertIn("2 file(s) an earlier run had moved to .secrets-quarantine as they were are now AES-256 encrypted", out)
+            self.assertIn("3 file(s) an earlier run had moved to .secrets-quarantine as they were are now AES-256 encrypted", out)
             self.assertIn("dotenvx from here on", out)
             self.assertNotIn("treat them as exposed", out)     # no secret was handled by this run
             self.assertFalse(os.path.exists(self.tree.path(".env.keys")))
@@ -1576,7 +1712,7 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("[ok] .secrets-quarantine/build/keys.zip: encrypted in place as build/keys.zip.enc", out)
         index = json.loads(self.tree.read(".secrets-quarantine/index.json"))
         self.assertEqual(sorted(r["quarantined"] for r in index),
-                         ["build/blob.txt.gz.enc", "build/keys.zip.enc", "build/more.zip.enc"])
+                         ["build/blob.txt.gz.enc", "build/keys.zip.enc", "build/more.zip.enc", "docs/deploy_key.pem.enc"])
         self.assertTrue(all(r["encrypted"] for r in index), index)
         for rel in ("build/more.zip", "build/keys.zip", "build/blob.txt.gz"):
             self.assertEqual(quarantined_bytes(self.tree, rel), self.before.get(rel.replace("/", os.sep), original), rel)
@@ -1641,7 +1777,7 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(code, 0, out + err)
         self.assertRegex(out, r"(?m)build/keys\.zip: moved to \.secrets-quarantine/build/keys\.zip\s*$")
         self.assertNotIn("(encrypted)", out)
-        self.assertIn("[--] 2 file(s) were moved to .secrets-quarantine AS THEY ARE, secrets inside: openssl was not found", out)
+        self.assertIn("[--] 3 file(s) were moved to .secrets-quarantine AS THEY ARE, secrets inside: openssl was not found", out)
         self.assertIn("were moved to .secrets-quarantine AS THEY ARE (openssl was not found at --openssl", out)
         self.assertEqual(self.tree.read_bytes(".secrets-quarantine/build/keys.zip"), self.before[os.path.join("build", "keys.zip")])
         self.assertFalse(os.path.exists(self.tree.path(".secrets-quarantine/.env")))
@@ -2334,6 +2470,96 @@ class UnitTests(unittest.TestCase):
         for name in ("go.sum", "Podfile.lock", "Package.resolved", "deno.lock", "mix.lock", "yarn.lock"):
             self.assertTrue(sas.is_lockfile(name), name)
 
+    def test_pinned_identifier(self):
+        # outside lock files: a commit id or checksum in hex that a manifest vouches for
+        sha1 = "2e85b818" + "17ebec4241b8f55ef1b62e4f150abcee"
+        sha256 = "7452a46f185b7cc1e0a33b7b5bc3ecb9" + "4dc85968268cf63e08314caae3c96e2f"
+        b64 = integrity_hash("sha512", "x")[len("sha512-"):]
+
+        def finding(raw):
+            return sas.Finding("x", 1, "CloudflareApiToken", raw, "", False, "PLAIN", {})
+
+        public = ('    "cloudflare": "github:cloudflare/node-cloudflare#%s",',
+                  '    "wrangler": "git+https://github.com/cloudflare/workers-sdk.git#%s",',
+                  '    "sdk": "cloudflare/sdk#%s",', '"cloudflare/sdk": "dev-main#%s"',
+                  '    "ssh": "git@github.com:cloudflare/ssh.git#%s",',
+                  '  "gitHead": "%s",', '  "_shasum": "%s",', '    "shasum": "%s",', '"sha": "%s"',
+                  '      - uses: cloudflare/wrangler-action@%s # v3', "      - uses: 'cloudflare/wrangler-action@%s'",
+                  '    rev: %s', '      ref: %s', "gem 'cloudflare', git: 'https://github.com/cloudflare/x.git', ref: '%s'",
+                  'cloudflare = { git = "https://github.com/cloudflare/cloudflare-rs", rev = "%s" }',
+                  'git+https://github.com/cloudflare/python-cloudflare.git@%s#egg=cloudflare',
+                  'source = "git::https://github.com/cloudflare/terraform-modules.git?ref=%s"',
+                  '    commit = "%s",', 'GIT_COMMIT=%s', 'CLOUDFLARE_DEPLOY_SHA=%s',
+                  'url = "https://x/y?token=abc"; ref = "%s"',   # the name of the field is ref, whatever came before the ;
+                  '* cloudflare fix ([abc1234](https://github.com/cloudflare/x/commit/%s))')
+        for line in public:
+            self.assertTrue(sas.pinned_identifier(finding(sha1), (line % sha1).encode("utf-8")), line)
+        self.assertTrue(sas.pinned_identifier(finding(sha256), ('    sha256 = "%s",\n' % sha256).encode("utf-8")))
+        self.assertTrue(sas.pinned_identifier(finding(sha1), ('{"a": "github:cloudflare/a#%s", "b": "cloudflare/b#%s"}\n'
+                                                              % (sha1, sha1)).encode("utf-8")))   # every occurrence
+        # a credential, whatever its shape; a digest nobody vouches for; a base64 shape counts in lock files only
+        credentials = ('"cloudflare_token": "%s"', 'CLOUDFLARE_API_TOKEN=%s', '  apiToken: %s', 'KEY=%s', '  password: %s',
+                       'https://%s@github.com/cloudflare/x.git', 'https://npm.example.com/x.tgz?token=%s',
+                       '"cloudflare": "%s"', 'Authorization: Bearer %s', '%s', '  value: %s', '"authToken": "%s"',
+                       'PASSWORD_HASH=%s', '"secret_sha": "%s"', '  api_key_hash: %s', '"private_key_fingerprint": "%s"',
+                       '{"cloudflare secret sha": "%s"}', '  api key sha: %s', "  'Cloudflare Auth Commit': '%s',")
+        for line in credentials:
+            self.assertFalse(sas.pinned_identifier(finding(sha1), (line % sha1).encode("utf-8")), line)
+        self.assertFalse(sas.pinned_identifier(finding(sha1), ('"a": "github:cloudflare/a#%s", "key": "%s"\n' % (sha1, sha1)).encode("utf-8")))   # once unvouched
+        self.assertFalse(sas.pinned_identifier(finding(sha1[:-1]), ('    rev: %s\n' % sha1[:-1]).encode("utf-8")))   # 39 digits: not a digest
+        self.assertFalse(sas.pinned_identifier(finding(b64[10:50]), ('"contentHash": "%s"\n' % b64).encode("utf-8")))   # base64: lock files only
+        self.assertTrue(sas.lockfile_identifier(finding(b64[10:50]), ('"contentHash": "%s"\n' % b64).encode("utf-8")))
+        self.assertFalse(sas.pinned_identifier(finding(sha1), b"nothing here\n"))
+        self.assertFalse(sas.pinned_identifier(finding(sha1), b""))
+
+    def test_private_key_files_are_recognised_and_their_protection_read(self):
+        root = tempfile.mkdtemp(prefix="sweep-keys-")
+        try:
+            def key(rel, content):
+                data = content if isinstance(content, bytes) else content.encode("utf-8")
+                path = os.path.join(root, rel.replace("/", os.sep))
+                folder = os.path.dirname(path)
+                if not os.path.isdir(folder):
+                    os.makedirs(folder)
+                with io.open(path, "wb") as fh:
+                    fh.write(data)
+                return sas.key_file_of(path, data)
+
+            bare = key("deploy/id_ed25519", openssh_key_text(b"none", b"none"))
+            self.assertEqual((bare.protection, bare.protected, bare.ssh_like, bare.in_ssh_dir), ((None, ""), False, True, False))
+            self.assertEqual(sas.passphrase_text(bare), "none (OpenSSH format)")
+            protected = key(".ssh/id_ed25519", openssh_key_text(b"aes256-ctr", b"bcrypt"))
+            self.assertEqual((protected.protection, protected.protected, protected.in_ssh_dir), (("openssh", "aes256-ctr, bcrypt"), True, True))
+            self.assertEqual(sas.passphrase_text(protected), "yes (OpenSSH format, aes256-ctr, bcrypt)")
+            legacy = key("keys/old.pem", LEGACY_PEM_PROTECTED)
+            self.assertEqual((legacy.protection, legacy.protected, legacy.ssh_like), (("legacy", "AES-128-CBC"), True, False))
+            self.assertEqual(sas.passphrase_text(legacy), "yes, legacy PEM cipher (AES-128-CBC)")
+            plain = key("keys/plain.pem", LEGACY_PEM_BARE)
+            self.assertEqual((plain.protection, plain.protected, plain.ssh_like), ((None, ""), False, False))
+            self.assertEqual(sas.passphrase_text(plain), "none (PEM)")
+            with io.open(os.path.join(root, "keys", "plain.pem.pub"), "wb") as fh:   # a .pub beside it: ssh's
+                fh.write(b"ssh-rsa AAAA x\n")
+            self.assertTrue(key("keys/plain.pem", LEGACY_PEM_BARE).ssh_like)
+            self.assertEqual(key("keys/p8.pem", PKCS8_PROTECTED).protection, ("pkcs8", ""))
+            self.assertEqual(sas.passphrase_text(key("keys/p8.pem", PKCS8_PROTECTED)), "yes (PKCS#8)")
+            self.assertEqual(sas.passphrase_text(key("docs/deploy_key.pem", PEM + "\n")), "none (PKCS#8)")
+            bundle = key("certs/server.pem", CERT_BLOCK + LEGACY_PEM_BARE)   # a certificate with its key: the bare key counts
+            self.assertEqual((bundle.labels, bundle.protection), ([b"CERTIFICATE", b"RSA PRIVATE KEY"], (None, "")))
+            self.assertEqual(key("certs/mixed.pem", LEGACY_PEM_PROTECTED + LEGACY_PEM_BARE).protection, (None, ""))   # the weakest counts
+            self.assertEqual(key("keys/crlf.pem", LEGACY_PEM_PROTECTED.replace("\n", "\r\n")).protection, ("legacy", "AES-128-CBC"))
+            self.assertIsNotNone(key("keys/bom.pem", b"\xef\xbb\xbf" + LEGACY_PEM_BARE.encode("utf-8")))
+            odd = key("keys/odd", "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\n")
+            self.assertEqual(odd.protection[0], "unknown")
+            self.assertFalse(odd.protected)
+            self.assertTrue(sas.passphrase_text(odd).startswith("cannot tell: "))
+            # not key files: a key inside other text, a certificate alone, a public key, text after the block, an empty file
+            for rel, content in (("inventory.yml", "key: |\n" + LEGACY_PEM_BARE), ("cert.pem", CERT_BLOCK),
+                                 ("id_ed25519.pub", "ssh-ed25519 AAAA x\n"), ("note.txt", LEGACY_PEM_BARE + "do not share\n"),
+                                 ("empty", ""), ("sa.json", '{"private_key": "%s"}' % PEM.replace("\n", "\\n"))):
+                self.assertIsNone(key(rel, content), rel)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
     def test_inside_integrity_hash(self):
         aws = sas.Finding("x", 1, "AWS", AWS_ID, "", False, "PLAIN", {})
         inside = ('"integrity": "%s"\n' % integrity_hash("sha512", AWS_ID)).encode("utf-8")
@@ -2590,6 +2816,75 @@ class RealToolsTests(unittest.TestCase):
         self.assertNotIn("generated lock file", out)
         self.assertNotIn("yarn.lock", out)
         self.assertNotIn("mix.lock", out)
+
+    def test_commit_pins_in_manifests_are_set_aside_by_the_real_trufflehog(self):
+        # measured: every real TruffleHog from 3.6 to 3.99 reports CloudflareApiToken for a dependency called
+        # cloudflare pinned to a commit in package.json, for a gitHead under a @cloudflare name, for an action
+        # pinned to a commit and for a rev field; the newest releases no less than the old ones
+        shas = [hashlib.sha1(("real pin %d" % i).encode("utf-8")).hexdigest() for i in range(5)]
+        self.tree.write("package.json", json.dumps({
+            "name": "@cloudflare/demo", "gitHead": shas[0], "version": "1.0.0",
+            "dependencies": {"cloudflare": "github:cloudflare/node-cloudflare#%s" % shas[1],
+                             "wrangler": "git+https://github.com/cloudflare/workers-sdk.git#%s" % shas[2]}},
+            indent=2).encode("utf-8"))
+        self.tree.write(".github/workflows/deploy.yml", ("on: [push]\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    steps:\n"
+                                                        "      - uses: cloudflare/wrangler-action@%s # v3\n" % shas[3]).encode("utf-8"))
+        self.tree.write("Cargo.toml", ('[dependencies]\ncloudflare = { git = "https://github.com/cloudflare/cloudflare-rs", rev = "%s" }\n'
+                                       % shas[4]).encode("utf-8"))
+        code, out, err = run_script(self.tree.root, ["--dry-run"], path=self.path)
+        self.assertEqual(code, 0, out + err)
+        self.assertRegex(out, r"Set aside [1-9]\d* finding\(s\) that are package integrity hashes")
+        for name in ("package.json", "deploy.yml", "Cargo.toml"):
+            self.assertNotIn(name, out)
+
+    def test_private_key_files_with_the_real_trufflehog(self):
+        # measured: TruffleHog 3.40 to 3.99 report an RSA key in the PEM and PKCS#8 forms, a legacy-encrypted PEM key
+        # with ExtraData encrypted=true (its text not verbatim: the blank line after DEK-Info is dropped) and an
+        # OpenSSH-format key with or without a passphrase; never a PKCS#8 ENCRYPTED PRIVATE KEY or a toy key
+        openssl = shutil.which("openssl", path=self.path)
+        if not openssl:
+            self.skipTest("no openssl on PATH")
+
+        def make(rel, command):
+            path = self.tree.path(rel)
+            folder = os.path.dirname(path)
+            if not os.path.isdir(folder):
+                os.makedirs(folder)
+            proc = subprocess.Popen([c.replace("PATH", path) for c in command], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            _, err = proc.communicate()
+            if proc.returncode != 0 or not os.path.isfile(path):
+                self.skipTest("%s could not make a key: %s" % (command[0], err.decode("utf-8", "replace")[:200]))
+
+        make("deploy/legacy.pem", [openssl, "genrsa", "-traditional", "-out", "PATH", "2048"])
+        make("deploy/service.pem", [openssl, "genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048", "-out", "PATH"])
+        make(".ssh/id_rsa_old", [openssl, "genrsa", "-traditional", "-aes256", "-passout", "pass:correct horse", "-out", "PATH", "2048"])
+        keygen = shutil.which("ssh-keygen", path=self.path)
+        if keygen:
+            make("deploy/id_ed25519", [keygen, "-q", "-t", "ed25519", "-N", "", "-f", "PATH"])
+            make(".ssh/id_ed25519", [keygen, "-q", "-t", "ed25519", "-N", "correct horse", "-f", "PATH"])
+        originals = dict((rel, self.tree.read_bytes(rel)) for rel in ("deploy/legacy.pem", "deploy/service.pem", ".ssh/id_rsa_old"))
+        code, out, err = run_script(self.tree.root, ["--dry-run"], path=self.path)
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("Private key files: %d" % (5 if keygen else 3), out)
+        self.assertRegex(out, r"\d+\s+deploy/legacy\.pem\s+none \(PEM\)\s+move to \.secrets-quarantine/deploy/legacy\.pem\.enc")
+        self.assertRegex(out, r"\d+\s+deploy/service\.pem\s+none \(PKCS#8\)\s+move to \.secrets-quarantine/deploy/service\.pem\.enc")
+        self.assertRegex(out, r"-\s+\.ssh/id_rsa_old\s+yes, legacy PEM cipher \(AES-256-CBC\)\s+left as it is; upgrade its passphrase")
+        self.assertIn("ssh-keygen -p -o -a 100 -f deploy/legacy.pem", out)
+        self.assertIn("ssh-keygen -p -o -a 100 -f .ssh/id_rsa_old", out)
+        if keygen:
+            self.assertRegex(out, r"\d+\s+deploy/id_ed25519\s+none \(OpenSSH format\)\s+move to")
+            self.assertRegex(out, r"-\s+\.ssh/id_ed25519\s+yes \(OpenSSH format, aes256-ctr, bcrypt\)\s+left as it is")
+            self.assertIn("ssh-keygen -p -a 100 -f deploy/id_ed25519", out)
+        code, out, err = run_script(self.tree.root, ["--yes", "--quarantine"], path=self.path)
+        self.assertEqual(code, 0, out + err)
+        for rel in ("deploy/legacy.pem", "deploy/service.pem") + (("deploy/id_ed25519",) if keygen else ()):
+            self.assertFalse(os.path.exists(self.tree.path(rel)), rel)
+            self.assertTrue(os.path.isfile(self.tree.path(".secrets-quarantine/" + rel + ".enc")), rel)
+        self.assertEqual(self.tree.read_bytes(".ssh/id_rsa_old"), originals[".ssh/id_rsa_old"])
+        code, out, err = run_script(self.tree.root, ["--restore", "deploy/legacy.pem"], path=self.path)
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self.tree.read_bytes("deploy/legacy.pem"), originals["deploy/legacy.pem"])
+        self.assertEqual(self.tree.leftovers(), [])
 
     def test_quarantined_files_are_encrypted_with_the_real_openssl_and_come_back(self):
         openssl = shutil.which("openssl", path=self.path)
