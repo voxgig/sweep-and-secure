@@ -60,7 +60,7 @@ try:
 except ImportError:  # pragma: no cover - Python 2 without the backport
     lzma = None
 
-__version__ = "1.5.1"
+__version__ = "1.5.2"
 
 # --------------------------------------------------------------------------
 # Python 2 / 3 compatibility
@@ -295,21 +295,38 @@ INTEGRITY_HASH_RE = re.compile(br"(?:\bsha1-[A-Za-z0-9+/]{27}=?|\bsha256-[A-Za-z
 # a digest's length (a commit id, the sha1 URL fragment in yarn.lock, Cargo.lock's checksum, yarn berry's
 # 10c0/...) or base64 of one (packages.lock.json's contentHash). TruffleHog's keyword detectors take
 # them for tokens when a package is called cloudflare, sentry, datadog ... One is set aside only where
-# it is seen to be public: a URL's fragment or path (LOCK_URL_CONTEXT_RE), a checksum, revision or
-# reference field, a mix.lock entry (LOCK_FIELD_CONTEXT_RE), or an entry of a checksum section such as
-# Podfile.lock's SPEC CHECKSUMS (LOCK_SECTION_RE on the header line); and never where it looks like a
-# credential: a URL's user information (user:secret@host), after an equals sign (?token=secret) or after
-# a telling word (LOCK_CREDENTIAL_RE). Anything else in a lock file stays a finding.
+# it is seen to be public: a URL's fragment or path (LOCK_URL_CONTEXT_RE), a dependency or an action
+# pinned to a commit (PIN_CONTEXT_RE), a checksum, revision, ref or commit field, a mix.lock entry
+# (LOCK_FIELD_CONTEXT_RE), or an entry of a checksum section such as Podfile.lock's SPEC CHECKSUMS
+# (LOCK_SECTION_RE on the header line); and never where it looks like a credential: a URL's user
+# information (user:secret@host), after an equals sign (?token=secret) unless one of those fields is
+# named before it (?ref=<commit>), or after a telling word (LOCK_CREDENTIAL_RE). Anything else in a
+# lock file stays a finding.
+# Every other file gets the same treatment for commit ids and checksums written in hex (PIN_DIGEST_RE):
+# a dependency manifest pins a package to a commit ("cloudflare": "github:cloudflare/node-cloudflare#<id>"
+# in package.json, rev = "<id>" in Cargo.toml, uses: cloudflare/wrangler-action@<id> in a workflow), or
+# carries a gitHead or shasum field, and every TruffleHog from 3.6 to 3.99 reports such a commit id as a
+# token of the vendor named just before it (measured). Base64 shapes and section headers count in lock
+# files only, where every long string is a checksum.
 LOCK_DIGEST_RE = re.compile(br"(?<![0-9A-Za-z+=])(?:[0-9a-fA-F]{128}|[0-9a-fA-F]{96}|[0-9a-fA-F]{64}|[0-9a-fA-F]{40}"
                             br"|[0-9a-fA-F]{32}|[A-Za-z0-9+/]{86}==|[A-Za-z0-9+/]{64}|[A-Za-z0-9+/]{43}=|[A-Za-z0-9+/]{27}=)"
                             br"(?![0-9A-Za-z+/=])")
+PIN_DIGEST_RE = re.compile(br"(?<![0-9A-Za-z+])(?:[0-9a-fA-F]{128}|[0-9a-fA-F]{96}|[0-9a-fA-F]{64}|[0-9a-fA-F]{40}"
+                           br"|[0-9a-fA-F]{32})(?![0-9A-Za-z+/=])")   # one may follow "=" here: ?ref=<commit>, GIT_COMMIT=<id>
 LOCK_CREDENTIAL_RE = re.compile(br"(?i)(?:token|passw(?:or)?d|pwd|secret|auth|api[_-]?key|access[_-]?key|private|credential)"
                                 br"[^0-9A-Za-z]{0,8}$")
 LOCK_URL_CONTEXT_RE = re.compile(br"://[^\s\"'<>]*(?:[#/]|[\"']\s*:\s*[\"'])$")   # ...tgz#<digest>, .../tar.gz/<digest>, "<url>": "<digest>"
+PIN_CONTEXT_RE = re.compile(br"(?:[\w.@+:-]*/[\w.@+:/-]*#"            # github:org/repo#<commit>, org/repo#, git@host:org/repo.git#
+                            br"|\bdev-[\w.-]+#"                        # composer: "dev-main#<commit>"
+                            br"|://[^\s\"'<>@]+/[^\s\"'<>@]*@"        # pip: git+https://host/org/repo.git@<commit>
+                            br"|\buses:\s*[\"']?[\w.-]+/[\w./-]+@)$")   # GitHub Actions: uses: owner/action@<commit>
 LOCK_FIELD_CONTEXT_RE = re.compile(br"(?i)(?:integrity|checksum|hash|sha(?:1|256|384|512)?|md5|digest|reference|revision|\b[pr]?rev"
-                                   br"|commit|resolved|resolution|version|shasum|head|signature|fingerprint)s?[\"']?\s*[:=]\s*[\"']?"
+                                   br"|ref|oid|commit|resolved|resolution|version|shasum|head|signature|fingerprint)s?[\"']?\s*[:=]\s*[\"']?"
                                    br"(?:[0-9a-z]{1,8}[/:])?\s*$"
                                    br"|\{:(?:hex|git),")   # mix.lock: {:hex, :name, "1.0.0", "<checksum>", ...}
+FIELD_NAME_RE = re.compile(br"([A-Za-z0-9_.\-]+)[\"']?\s*[:=]\s*[\"']?(?:[0-9a-z]{1,8}[/:])?\s*$")   # the name a field's value follows
+FIELD_CREDENTIAL_RE = re.compile(br"(?i)token|passw|pwd|secret|auth|key|private|credential")   # anywhere in that name: password_hash
+PINNED_WHAT = u"a commit id or checksum the file vouches for"   # how the run log names such a set-aside
 LOCK_SECTION_RE = re.compile(br"(?i)integrity|checksum|hash|digest|revision|commit|resolution|sha(?:1|256|384|512)?\b")
 
 ALWAYS_EXCLUDES = [
@@ -1819,14 +1836,17 @@ def section_header(data, line_start, indent):
     return b""
 
 
-def lockfile_identifier(finding, data):
-    """In a generated lock file: True when every occurrence of the reported text is a bare checksum
-    or commit id (LOCK_DIGEST_RE) in a place seen to be public (a URL's fragment or path, a checksum,
-    revision or reference field, a mix.lock entry, an entry of a checksum section) and in none that
-    looks like a credential (a URL's user information, after an equals sign or after a telling word).
-    Anything else, and text that is not found at all, is False: it stays a finding."""
+def vouched_identifier(finding, data, lock):
+    """True when every occurrence of the reported text in data is a bare checksum or commit id in a
+    place the file vouches for: a URL's fragment or path, a dependency or action pinned to a commit,
+    a checksum, revision, ref or commit field, and in a lock file (lock) also a mix.lock entry or an
+    entry of a checksum section; and in no place that looks like a credential (a URL's user
+    information, after an equals sign that none of those fields precedes, after a telling word). Any
+    digest shape counts in a lock file (LOCK_DIGEST_RE), hex only elsewhere (PIN_DIGEST_RE). Anything
+    else, and text that is not found at all, is False: it stays a finding."""
     if not data:
         return False
+    digest_re = LOCK_DIGEST_RE if lock else PIN_DIGEST_RE
     found = False
     for candidate in candidate_secrets(finding):
         needle = to_bytes(candidate)
@@ -1838,21 +1858,36 @@ def lockfile_identifier(finding, data):
             line = data[line_start:line_end if line_end >= 0 else len(data)]
             offset = start - line_start
             span = None
-            for match in LOCK_DIGEST_RE.finditer(line):
+            for match in digest_re.finditer(line):
                 if match.start() <= offset and match.end() >= offset + len(needle):
                     span = match
                     break
             if span is None:
                 return False
             before, after = line[:span.start()], line[span.end():]
-            if after.lstrip()[:1] == b"@" or before.rstrip()[-1:] == b"=" or LOCK_CREDENTIAL_RE.search(before):
+            field = LOCK_FIELD_CONTEXT_RE.search(before) is not None
+            if field:
+                name = FIELD_NAME_RE.search(before)
+                field = not (name and FIELD_CREDENTIAL_RE.search(name.group(1)))   # password_hash, secret_sha: a credential's
+            if (after.lstrip()[:1] == b"@" or LOCK_CREDENTIAL_RE.search(before)
+                    or (before.rstrip()[-1:] == b"=" and not field)):
                 return False   # a credential, whatever its shape
-            if not (LOCK_URL_CONTEXT_RE.search(before) or LOCK_FIELD_CONTEXT_RE.search(before)):
-                header = section_header(data, line_start, len(line) - len(line.lstrip()))
+            if not (field or LOCK_URL_CONTEXT_RE.search(before) or PIN_CONTEXT_RE.search(before)):
+                header = section_header(data, line_start, len(line) - len(line.lstrip())) if lock else b""
                 if not LOCK_SECTION_RE.search(header):
                     return False   # a digest nobody vouches for: it is listed
             start = data.find(needle, start + 1)
     return found
+
+
+def lockfile_identifier(finding, data):
+    """vouched_identifier() for a generated lock file."""
+    return vouched_identifier(finding, data, True)
+
+
+def pinned_identifier(finding, data):
+    """vouched_identifier() for any other file: a commit id or checksum a manifest vouches for."""
+    return vouched_identifier(finding, data, False)
 
 
 def gzip_member_name(head, fallback):
@@ -2149,8 +2184,12 @@ def build_plan(findings, root, store, args, env_plaintext, exclude_res=(), decry
                 if inside_integrity_hash(finding, raw):
                     set_aside_hash(plan, finding, u"inside a package integrity hash")
                     continue
-                if reason == u"generated lock file" and lockfile_identifier(finding, raw):
-                    set_aside_hash(plan, finding, u"a checksum or commit id in a lock file")
+                if reason == u"generated lock file":
+                    if lockfile_identifier(finding, raw):
+                        set_aside_hash(plan, finding, u"a checksum or commit id in a lock file")
+                        continue
+                elif pinned_identifier(finding, raw):
+                    set_aside_hash(plan, finding, PINNED_WHAT)
                     continue
             entry = plan.unfixable.get(finding.path)
             if entry is None:
@@ -2162,6 +2201,9 @@ def build_plan(findings, root, store, args, env_plaintext, exclude_res=(), decry
             continue
         if inside_integrity_hash(finding, data):
             set_aside_hash(plan, finding, u"inside a package integrity hash")
+            continue
+        if pinned_identifier(finding, data):
+            set_aside_hash(plan, finding, PINNED_WHAT)
             continue
         located = False
         too_short = False
@@ -2284,8 +2326,8 @@ def build_plan(findings, root, store, args, env_plaintext, exclude_res=(), decry
 
 def set_aside_hash(plan, finding, what):
     """Count a finding that is a public identifier (inside a package integrity hash, or a checksum
-    or commit id in a lock file), and name it in the run log so that a set-aside can always be
-    checked afterwards (the value itself is never logged)."""
+    or commit id that a lock file or manifest vouches for), and name it in the run log so that a
+    set-aside can always be checked afterwards (the value itself is never logged)."""
     plan.hashes += 1
     log_only(u"set aside, %s: %s line %s (%s)" % (what, plan.rel(finding.path), finding.line, finding.detector))
 
@@ -3285,8 +3327,9 @@ def print_report(plan, args, style, verified_any):
     if plan.hashes:
         say(u"")
         say(style.dim(u"Set aside %d finding(s) that are package integrity hashes (sha512-..., h1:..., sha256:...) or"
-                      u" checksums and commit ids in lock files: public identifiers that happen to match a detector's"
-                      u" pattern, not secrets.%s" % (plan.hashes, u" Each is named in the run log." if RUN_LOG is not None else u"")))
+                      u" commit ids and checksums that a lock file or manifest vouches for (a dependency pinned to a"
+                      u" commit, a rev, ref or commit field, a checksum field): public identifiers that happen to match"
+                      u" a detector's pattern, not secrets.%s" % (plan.hashes, u" Each is named in the run log." if RUN_LOG is not None else u"")))
     if plan.ignored:
         say(u"")
         say(style.dim(u"Ignored %d finding(s) inside excluded folders (.git, node_modules, ...)." % plan.ignored))

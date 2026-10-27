@@ -86,7 +86,7 @@ between:
 | a file that cannot be fixed in place: an archive TruffleHog looked inside (`.zip`, `.jar`, `.tar.gz`, ...), a binary, a PDF, a generated lock file (`package-lock.json`, `poetry.lock`, ...), an example env file (`.env.example`, `.env.sample`, ...), a file too large or unreadable, or a text file whose only secrets are encoded, shorter than `--min-length` or impossible for dotenvx to store exactly | listed in the "Files holding secrets that cannot be fixed in place" section with the reason, and for archives the files inside that hold each secret (zip, tar with any compression, gzip, bzip2 and xz are opened, nested ones too). The whole file is moved out of the tree into the quarantine folder (`.secrets-quarantine` in the swept folder, `--quarantine-dir` to change), keeping its relative path plus `.enc`: openssl encrypts it (AES-256) under a fresh passphrase, which dotenvx keeps encrypted in the folder's own `.env`, so no plaintext copy of the secret is left anywhere; the folder's `MANIFEST.txt` and `index.json` record where it came from, why, which files inside held secrets and how to get it back (`--restore`). An interactive run offers this as a numbered item, so `s` can leave a file in place; a `--yes` run moves files only when `--quarantine` is given |
 | a text file some of whose secrets are fixed in place and one of which cannot be (encoded, too short, unstorable) | the fixable ones are handled; the file is listed with the other one for you to handle by hand, and is never moved, because moving it would undo the fixes |
 | a symbolic link | listed; fix the file it points to |
-| a match that sits inside a package integrity hash (`sha512-...` in `package-lock.json` or `yarn.lock`, `h1:...` in `go.sum`, `sha256:...` in a Python lock file), or that is a checksum or commit id in a generated lock file where the file vouches for it: in a URL's fragment or path (the sha1 fragment of a `resolved` URL in `yarn.lock`, a commit id in `package-lock.json`), in a checksum, revision or reference field (`Cargo.lock`, `composer.lock`, `Gemfile.lock`), in a `mix.lock` entry, or under a checksum section header (`Podfile.lock`) | set aside and counted, not treated as a secret: those are public identifiers that happen to match a detector's pattern, which TruffleHog's keyword detectors do whenever a package is called `cloudflare`, `sentry`, `datadog` and so on. Only a digest of its algorithm's exact length counts; a digest in a URL's user information (`user:secret@host`), after `=` (`?token=...`), after a word like `token` or `password`, or in any place the file does not vouch for stays a finding; and each set-aside is named in the run log |
+| a match that sits inside a package integrity hash (`sha512-...` in `package-lock.json` or `yarn.lock`, `h1:...` in `go.sum`, `sha256:...` in a Python lock file), or that is a commit id or checksum where the file vouches for it: a dependency pinned to a commit in a manifest (`"cloudflare": "github:cloudflare/node-cloudflare#<commit>"` in `package.json`, `rev = "<commit>"` in `Cargo.toml`, `git+https://...git@<commit>` in `requirements.txt`, `?ref=<commit>` in a Terraform source), an action pinned to one in a workflow (`uses: owner/action@<commit>`), a `gitHead`, `shasum`, `rev`, `ref` or `commit` field, a URL's fragment or path (the sha1 fragment of a `resolved` URL in `yarn.lock`, a commit link in a changelog), and in a generated lock file also a checksum or reference field (`Cargo.lock`, `composer.lock`, `Gemfile.lock`), a `mix.lock` entry or a checksum section (`Podfile.lock`) | set aside and counted, not treated as a secret: those are public identifiers that happen to match a detector's pattern, which TruffleHog's keyword detectors do whenever the word `cloudflare`, `sentry`, `datadog` and so on stands within 40 characters before them (every release from 3.6 to 3.99 does this). Only a digest of its algorithm's exact length counts, and outside lock files only one written in hex; a digest in a URL's user information (`user:secret@host`), after `=` (`?token=...`), after a word like `token` or `password`, or in any place the file does not vouch for stays a finding; and each set-aside is named in the run log |
 | a program or library: `.so`, `.dll`, `.dylib`, `.exe`, `.o`, `.a`, `.pyc`, `.class`, `.wasm`, ... or a file whose first bytes say ELF, PE, Mach-O or WebAssembly | not scanned, and counted: "Skipped N compiled file(s)". A secret compiled into a program cannot be fixed here, and moving the file would break whatever uses it; what an old TruffleHog matches in such files is mostly exported symbol names (TruffleHog 3.75 and later skip them itself). `--scan-compiled` lists what TruffleHog finds in them, each match with the string around it as `strings` would show it, and never rewrites or moves them |
 
 Variable names come from the code around the secret (`AWS_SECRET_ACCESS_KEY =
@@ -290,7 +290,7 @@ Without installing anything, straight from the repository:
 uvx --from git+https://github.com/voxgig/sweep-and-secure sweep-and-secure --dry-run
 ```
 
-To pin a release, append `@v1.5.1` to the git URL, or pass `-v v1.5.1` to the
+To pin a release, append `@v1.5.2` to the git URL, or pass `-v v1.5.2` to the
 installer. To upgrade, run the same command again (`pipx upgrade
 sweep-and-secure` or `uv tool upgrade sweep-and-secure` for those routes). The
 installer takes `-b DIR` for another folder (without `-b` it uses
@@ -384,7 +384,7 @@ everything.
 
 ```
 $ sweep-and-secure --check-setup
-sweep-and-secure 1.5.1  (TruffleHog + dotenvx)
+sweep-and-secure 1.5.2  (TruffleHog + dotenvx)
 Log: /home/me/.local/state/sweep-and-secure/logs/2026-10-23T16-38-58Z-shop-48213.log
 Python 3.13.16 (/usr/bin/python3) on Linux-6.8.0-x86_64-with-glibc2.39
   [ok] trufflehog  3.99.3     /usr/local/bin/trufflehog
@@ -430,7 +430,7 @@ audit.
 ```
 $ cd shop
 $ sweep-and-secure --dry-run
-sweep-and-secure 1.5.1  (TruffleHog + dotenvx)
+sweep-and-secure 1.5.2  (TruffleHog + dotenvx)
 Log: /home/me/.local/state/sweep-and-secure/logs/2026-10-23T16-39-04Z-shop-48213.log
 Folder: /home/me/shop
   Note: this is a security tool that changes files on purpose: it encrypts env files, rewrites
@@ -712,7 +712,7 @@ recognised and never stored twice.
 
 ```
 $ sweep-and-secure --dry-run
-sweep-and-secure 1.5.1  (TruffleHog + dotenvx)
+sweep-and-secure 1.5.2  (TruffleHog + dotenvx)
 Log: /home/me/.local/state/sweep-and-secure/logs/2026-10-23T16-39-20Z-shop-48213.log
 Folder: /home/me/shop
   Note: this is a security tool that changes files on purpose: it encrypts env files, rewrites
@@ -753,7 +753,7 @@ a file put back with its secret still inside is found again by the next run.
 
 ```
 $ sweep-and-secure --restore build/keys.zip
-sweep-and-secure 1.5.1  (TruffleHog + dotenvx)
+sweep-and-secure 1.5.2  (TruffleHog + dotenvx)
 Log: /home/me/.local/state/sweep-and-secure/logs/2026-10-23T16-39-24Z-shop-48213.log
 Folder: /home/me/shop
   [ok] dotenvx     2.38.2     /usr/local/bin/dotenvx
@@ -1093,7 +1093,7 @@ it yourself for a downloaded `sweep_and_secure.py`, from the folder it was
 downloaded into:
 
 ```
-curl -sSfL -O https://github.com/voxgig/sweep-and-secure/releases/download/v1.5.1/SHA256SUMS
+curl -sSfL -O https://github.com/voxgig/sweep-and-secure/releases/download/v1.5.2/SHA256SUMS
 ```
 
 ```
@@ -1109,21 +1109,29 @@ On macOS use `shasum -a 256 -c -` in place of `sha256sum -c -`.
   and is encrypted only with `--env-all`.
 * Several TruffleHog detectors match long random-looking strings, so package
   integrity hashes in `package-lock.json`, `yarn.lock`, `go.sum` and Python lock
-  files show up as findings, and their keyword detectors take the sha1 URL
-  fragments, commit ids and checksums next to a package called `cloudflare`,
-  `sentry` or `datadog` for tokens (every release from 3.0 to 3.99 does this).
-  Matches that sit inside such a hash, and checksums or commit ids that a
-  generated lock file vouches for (in a URL's fragment or path, a checksum,
-  revision or reference field, a `mix.lock` entry or a checksum section), are
-  set aside and counted rather than treated as secrets, and the run log names
-  each one. A string counts as a hash only at its algorithm's exact length (88
-  characters for `sha512-`, 44 for `h1:`, 40, 64 or 128 hex digits for a bare
-  digest), so a shorter or longer random string is never taken for one, and a
-  digest in a URL's user information, after `=` or a word like `token`, or in
-  a place the file does not vouch for, stays a finding. A lock file that still
-  appears in the listing holds something like that, such as a token in a
-  registry URL; its row names the detector and the line, and `--verify` lets
-  TruffleHog confirm a credential against its service.
+  files show up as findings, and their keyword detectors take a commit id or
+  checksum that stands within 40 characters after the word `cloudflare`,
+  `sentry`, `datadog` and so on for a token: the sha1 URL fragment of such a
+  package in `yarn.lock`, and in a manifest a dependency pinned to a commit
+  (`"cloudflare": "github:cloudflare/node-cloudflare#<commit>"` in
+  `package.json`, `rev = "<commit>"` in `Cargo.toml`, `uses:
+  cloudflare/wrangler-action@<commit>` in a workflow) or a `gitHead` field.
+  Measured, every release from 3.6 to 3.99 does this, the newest no less than
+  the old ones, and 3.75 to 3.88 also report a commit id after the word
+  `github` in some layouts. Matches that sit inside such a hash, and commit ids
+  or checksums that the file vouches for (a dependency or action pinned to a
+  commit, a `rev`, `ref`, `commit` or checksum field, a URL's fragment or path,
+  and in a generated lock file also a `mix.lock` entry or a checksum section),
+  are set aside and counted rather than treated as secrets, and the run log
+  names each one. A string counts as a hash only at its algorithm's exact
+  length (88 characters for `sha512-`, 44 for `h1:`, 40, 64 or 128 hex digits
+  for a bare digest, and outside lock files only hex), so a shorter or longer
+  random string is never taken for one, and a digest in a URL's user
+  information, after `=` or a word like `token`, or in a place the file does
+  not vouch for, stays a finding. A file that still appears in the listing
+  holds something like that, such as a token in a registry URL; its row names
+  the detector and the line, and `--verify` lets TruffleHog confirm a
+  credential against its service.
 * Programs and libraries (`.so`, `.dll`, `.exe`, `.pyc`, ...) are not scanned
   unless `--scan-compiled` is given, and are never changed. TruffleHog releases
   before 3.75 read them as raw bytes and match exported symbol names: in a test
@@ -1182,7 +1190,7 @@ tools present.
 
 
 To release: set `__version__` in `sweep_and_secure.py`, merge, then either push
-a matching tag (`git tag v1.5.1 && git push origin v1.5.1`) or run the release
+a matching tag (`git tag v1.5.2 && git push origin v1.5.2`) or run the release
 workflow from the Actions tab with the version, which creates the tag for you.
 The workflow (`.github/workflows/release.yml`) checks that the tag matches the
 version, runs the tests, builds the sdist and wheel, and publishes a GitHub

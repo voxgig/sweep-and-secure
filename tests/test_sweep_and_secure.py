@@ -989,7 +989,7 @@ class EndToEndTests(unittest.TestCase):
         code, out, err = run_script(self.tree.root, ["--dry-run"])
         self.assertEqual(code, 0, out + err)
         self.assertIn("Set aside 3 finding(s) that are package integrity hashes (sha512-..., h1:..., sha256:...) or"
-                      " checksums and commit ids in lock files", out)
+                      " commit ids and checksums that a lock file or manifest vouches for", out)
         for rel in ("yarn.lock", "mix.lock", "package-lock.json"):
             self.assertNotIn(rel, out)
         log = read_file(re.search(r"^Log: (.*)$", out, re.M).group(1).strip())
@@ -1016,6 +1016,60 @@ class EndToEndTests(unittest.TestCase):
         for rel in ("sub/yarn.lock", "sub/pnpm-lock.yaml"):
             self.assertFalse(os.path.exists(self.tree.path(rel)), rel)
             self.assertTrue(os.path.isfile(self.tree.path(".secrets-quarantine/" + rel + ".enc")), rel)
+        self.assertNoLeftovers()
+
+    def test_commit_ids_in_manifests_are_not_secrets(self):
+        # measured: every TruffleHog from 3.6 to 3.99 reports the commit id of a dependency pinned to one as a
+        # token of the vendor named just before it ("cloudflare": "github:cloudflare/node-cloudflare#<id>" in
+        # package.json), and the same for a gitHead field, an action pin, a rev or ref field, a commit link.
+        # Those are public identifiers the file vouches for; a token next to the same word is still a token.
+        shas = [hashlib.sha1(("pin %d" % i).encode("utf-8")).hexdigest() for i in range(9)]
+        token = "cfT0ken_" + "Qm7xPz2vLw9nRt4yUe6iOa1sZb8kHn3cVf5mJq2w"[:32]
+        self.tree.write("package.json", json.dumps({
+            "name": "@cloudflare/demo", "gitHead": shas[0], "version": "1.0.0",
+            "dependencies": {"cloudflare": "github:cloudflare/node-cloudflare#%s" % shas[1],
+                             "wrangler": "git+https://github.com/cloudflare/workers-sdk.git#%s" % shas[2]},
+            "config": {"cloudflare_token": token}}, indent=2).encode("utf-8"))
+        self.tree.write(".github/workflows/deploy.yml", ("name: deploy\non: [push]\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n"
+                                                        "    steps:\n      - uses: actions/checkout@v4\n"
+                                                        "      - uses: cloudflare/wrangler-action@%s # v3\n"
+                                                        "        with:\n          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}\n"
+                                                        % shas[3]).encode("utf-8"))
+        self.tree.write(".pre-commit-config.yaml", ("repos:\n  - repo: https://github.com/cloudflare/pre-commit-hooks\n    rev: %s\n"
+                                                   "    hooks: [{ id: trailing-whitespace }]\n" % shas[4]).encode("utf-8"))
+        self.tree.write("requirements.txt", ("requests==2.31.0\ngit+https://github.com/cloudflare/python-cloudflare.git@%s#egg=cloudflare\n"
+                                             % shas[5]).encode("utf-8"))
+        self.tree.write("Cargo.toml", ('[dependencies]\ncloudflare = { git = "https://github.com/cloudflare/cloudflare-rs", rev = "%s" }\n'
+                                       % shas[6]).encode("utf-8"))
+        self.tree.write("infra/main.tf", ('module "dns" {\n  source = "git::https://github.com/cloudflare/terraform-modules.git?ref=%s"\n}\n'
+                                          % shas[7]).encode("utf-8"))
+        self.tree.write("CHANGELOG.md", ("# 1.0.1\n\n* cloudflare fix ([abc1234](https://github.com/cloudflare/x/commit/%s))\n"
+                                         % shas[8]).encode("utf-8"))
+        code, out, err = run_script(self.tree.root, ["--dry-run"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("Set aside 9 finding(s) that are package integrity hashes (sha512-..., h1:..., sha256:...) or"
+                      " commit ids and checksums that a lock file or manifest vouches for", out)
+        for name in ("deploy.yml", ".pre-commit-config.yaml", "requirements.txt", "Cargo.toml", "main.tf", "CHANGELOG.md"):
+            self.assertNotIn(name, out)
+        # the token in the same file is still listed, and is the only row for it
+        self.assertRegex(out, r"CloudflareApiToken\s+\S+\s+cfT0\.\.\.\S\S\s+package\.json:\d+\s+move to \.env")
+        self.assertEqual(len(re.findall(r"package\.json:\d+", out)), 1)
+        log = read_file(re.search(r"^Log: (.*)$", out, re.M).group(1).strip())
+        self.assertIn("set aside, a commit id or checksum the file vouches for: package.json line 3 (CloudflareApiToken)", log)
+        self.assertIn("set aside, a commit id or checksum the file vouches for: Cargo.toml line 2 (CloudflareApiToken)", log)
+        for sha in shas:
+            self.assertNotIn(sha, log)
+        # a real run moves the token and leaves every pin as it was
+        code, out, err = run_script(self.tree.root, ["--yes"])
+        self.assertEqual(code, 0, out + err)
+        package = self.tree.read("package.json")
+        self.assertNotIn(token, package)
+        self.assertIn('"cloudflare_token": "${', package)
+        for rel, sha in (("package.json", shas[0]), ("package.json", shas[1]), ("package.json", shas[2]),
+                         (".github/workflows/deploy.yml", shas[3]), (".pre-commit-config.yaml", shas[4]),
+                         ("requirements.txt", shas[5]), ("Cargo.toml", shas[6]), ("infra/main.tf", shas[7]),
+                         ("CHANGELOG.md", shas[8])):
+            self.assertIn(sha, self.tree.read(rel), rel)
         self.assertNoLeftovers()
 
     def test_a_fresh_private_key_goes_to_the_os_store_when_dotenvx_can(self):
@@ -2334,6 +2388,46 @@ class UnitTests(unittest.TestCase):
         for name in ("go.sum", "Podfile.lock", "Package.resolved", "deno.lock", "mix.lock", "yarn.lock"):
             self.assertTrue(sas.is_lockfile(name), name)
 
+    def test_pinned_identifier(self):
+        # outside lock files: a commit id or checksum in hex that a manifest vouches for
+        sha1 = "2e85b818" + "17ebec4241b8f55ef1b62e4f150abcee"
+        sha256 = "7452a46f185b7cc1e0a33b7b5bc3ecb9" + "4dc85968268cf63e08314caae3c96e2f"
+        b64 = integrity_hash("sha512", "x")[len("sha512-"):]
+
+        def finding(raw):
+            return sas.Finding("x", 1, "CloudflareApiToken", raw, "", False, "PLAIN", {})
+
+        public = ('    "cloudflare": "github:cloudflare/node-cloudflare#%s",',
+                  '    "wrangler": "git+https://github.com/cloudflare/workers-sdk.git#%s",',
+                  '    "sdk": "cloudflare/sdk#%s",', '"cloudflare/sdk": "dev-main#%s"',
+                  '    "ssh": "git@github.com:cloudflare/ssh.git#%s",',
+                  '  "gitHead": "%s",', '  "_shasum": "%s",', '    "shasum": "%s",', '"sha": "%s"',
+                  '      - uses: cloudflare/wrangler-action@%s # v3', "      - uses: 'cloudflare/wrangler-action@%s'",
+                  '    rev: %s', '      ref: %s', "gem 'cloudflare', git: 'https://github.com/cloudflare/x.git', ref: '%s'",
+                  'cloudflare = { git = "https://github.com/cloudflare/cloudflare-rs", rev = "%s" }',
+                  'git+https://github.com/cloudflare/python-cloudflare.git@%s#egg=cloudflare',
+                  'source = "git::https://github.com/cloudflare/terraform-modules.git?ref=%s"',
+                  '    commit = "%s",', 'GIT_COMMIT=%s', 'CLOUDFLARE_DEPLOY_SHA=%s',
+                  '* cloudflare fix ([abc1234](https://github.com/cloudflare/x/commit/%s))')
+        for line in public:
+            self.assertTrue(sas.pinned_identifier(finding(sha1), (line % sha1).encode("utf-8")), line)
+        self.assertTrue(sas.pinned_identifier(finding(sha256), ('    sha256 = "%s",\n' % sha256).encode("utf-8")))
+        self.assertTrue(sas.pinned_identifier(finding(sha1), ('{"a": "github:cloudflare/a#%s", "b": "cloudflare/b#%s"}\n'
+                                                              % (sha1, sha1)).encode("utf-8")))   # every occurrence
+        # a credential, whatever its shape; a digest nobody vouches for; a base64 shape counts in lock files only
+        credentials = ('"cloudflare_token": "%s"', 'CLOUDFLARE_API_TOKEN=%s', '  apiToken: %s', 'KEY=%s', '  password: %s',
+                       'https://%s@github.com/cloudflare/x.git', 'https://npm.example.com/x.tgz?token=%s',
+                       '"cloudflare": "%s"', 'Authorization: Bearer %s', '%s', '  value: %s', '"authToken": "%s"',
+                       'PASSWORD_HASH=%s', '"secret_sha": "%s"', '  api_key_hash: %s', '"private_key_fingerprint": "%s"')
+        for line in credentials:
+            self.assertFalse(sas.pinned_identifier(finding(sha1), (line % sha1).encode("utf-8")), line)
+        self.assertFalse(sas.pinned_identifier(finding(sha1), ('"a": "github:cloudflare/a#%s", "key": "%s"\n' % (sha1, sha1)).encode("utf-8")))   # once unvouched
+        self.assertFalse(sas.pinned_identifier(finding(sha1[:-1]), ('    rev: %s\n' % sha1[:-1]).encode("utf-8")))   # 39 digits: not a digest
+        self.assertFalse(sas.pinned_identifier(finding(b64[10:50]), ('"contentHash": "%s"\n' % b64).encode("utf-8")))   # base64: lock files only
+        self.assertTrue(sas.lockfile_identifier(finding(b64[10:50]), ('"contentHash": "%s"\n' % b64).encode("utf-8")))
+        self.assertFalse(sas.pinned_identifier(finding(sha1), b"nothing here\n"))
+        self.assertFalse(sas.pinned_identifier(finding(sha1), b""))
+
     def test_inside_integrity_hash(self):
         aws = sas.Finding("x", 1, "AWS", AWS_ID, "", False, "PLAIN", {})
         inside = ('"integrity": "%s"\n' % integrity_hash("sha512", AWS_ID)).encode("utf-8")
@@ -2590,6 +2684,26 @@ class RealToolsTests(unittest.TestCase):
         self.assertNotIn("generated lock file", out)
         self.assertNotIn("yarn.lock", out)
         self.assertNotIn("mix.lock", out)
+
+    def test_commit_pins_in_manifests_are_set_aside_by_the_real_trufflehog(self):
+        # measured: every real TruffleHog from 3.6 to 3.99 reports CloudflareApiToken for a dependency called
+        # cloudflare pinned to a commit in package.json, for a gitHead under a @cloudflare name, for an action
+        # pinned to a commit and for a rev field; the newest releases no less than the old ones
+        shas = [hashlib.sha1(("real pin %d" % i).encode("utf-8")).hexdigest() for i in range(5)]
+        self.tree.write("package.json", json.dumps({
+            "name": "@cloudflare/demo", "gitHead": shas[0], "version": "1.0.0",
+            "dependencies": {"cloudflare": "github:cloudflare/node-cloudflare#%s" % shas[1],
+                             "wrangler": "git+https://github.com/cloudflare/workers-sdk.git#%s" % shas[2]}},
+            indent=2).encode("utf-8"))
+        self.tree.write(".github/workflows/deploy.yml", ("on: [push]\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    steps:\n"
+                                                        "      - uses: cloudflare/wrangler-action@%s # v3\n" % shas[3]).encode("utf-8"))
+        self.tree.write("Cargo.toml", ('[dependencies]\ncloudflare = { git = "https://github.com/cloudflare/cloudflare-rs", rev = "%s" }\n'
+                                       % shas[4]).encode("utf-8"))
+        code, out, err = run_script(self.tree.root, ["--dry-run"], path=self.path)
+        self.assertEqual(code, 0, out + err)
+        self.assertRegex(out, r"Set aside [1-9]\d* finding\(s\) that are package integrity hashes")
+        for name in ("package.json", "deploy.yml", "Cargo.toml"):
+            self.assertNotIn(name, out)
 
     def test_quarantined_files_are_encrypted_with_the_real_openssl_and_come_back(self):
         openssl = shutil.which("openssl", path=self.path)
