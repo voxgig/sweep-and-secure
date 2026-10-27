@@ -324,8 +324,7 @@ LOCK_FIELD_CONTEXT_RE = re.compile(br"(?i)(?:integrity|checksum|hash|sha(?:1|256
                                    br"|ref|oid|commit|resolved|resolution|version|shasum|head|signature|fingerprint)s?[\"']?\s*[:=]\s*[\"']?"
                                    br"(?:[0-9a-z]{1,8}[/:])?\s*$"
                                    br"|\{:(?:hex|git),")   # mix.lock: {:hex, :name, "1.0.0", "<checksum>", ...}
-FIELD_NAME_RE = re.compile(br"([A-Za-z0-9_.\-]+)[\"']?\s*[:=]\s*[\"']?(?:[0-9a-z]{1,8}[/:])?\s*$")   # the name a field's value follows
-FIELD_CREDENTIAL_RE = re.compile(br"(?i)token|passw|pwd|secret|auth|key|private|credential")   # anywhere in that name: password_hash
+FIELD_CREDENTIAL_RE = re.compile(br"(?i)token|passw|pwd|secret|auth|key|private|credential")   # anywhere in a field's name: password_hash
 PINNED_WHAT = u"a commit id or checksum the file vouches for"   # how the run log names such a set-aside
 LOCK_SECTION_RE = re.compile(br"(?i)integrity|checksum|hash|digest|revision|commit|resolution|sha(?:1|256|384|512)?\b")
 
@@ -1836,6 +1835,18 @@ def section_header(data, line_start, indent):
     return b""
 
 
+def field_name(before):
+    """The whole name of the field whose value starts where before ends: the text after the last
+    separator ({ , [ ( ;) up to the last ':' or '=', quotes and spaces stripped, so that a quoted
+    name with spaces ("cloudflare secret sha") is seen entire. b"" when there is no such field."""
+    cut = max(before.rfind(b":"), before.rfind(b"="))
+    if cut < 0:
+        return b""
+    head = before[:cut]
+    start = max(head.rfind(sep) for sep in (b"{", b",", b"[", b"(", b";")) + 1
+    return head[start:].strip().strip(b"\"'").strip()
+
+
 def vouched_identifier(finding, data, lock):
     """True when every occurrence of the reported text in data is a bare checksum or commit id in a
     place the file vouches for: a URL's fragment or path, a dependency or action pinned to a commit,
@@ -1866,9 +1877,8 @@ def vouched_identifier(finding, data, lock):
                 return False
             before, after = line[:span.start()], line[span.end():]
             field = LOCK_FIELD_CONTEXT_RE.search(before) is not None
-            if field:
-                name = FIELD_NAME_RE.search(before)
-                field = not (name and FIELD_CREDENTIAL_RE.search(name.group(1)))   # password_hash, secret_sha: a credential's
+            if field and FIELD_CREDENTIAL_RE.search(field_name(before)):
+                field = False   # password_hash, "cloudflare secret sha": a credential's, whatever the last word
             if (after.lstrip()[:1] == b"@" or LOCK_CREDENTIAL_RE.search(before)
                     or (before.rstrip()[-1:] == b"=" and not field)):
                 return False   # a credential, whatever its shape

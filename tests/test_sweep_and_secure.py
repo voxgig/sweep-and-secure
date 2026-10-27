@@ -2408,6 +2408,7 @@ class UnitTests(unittest.TestCase):
                   'git+https://github.com/cloudflare/python-cloudflare.git@%s#egg=cloudflare',
                   'source = "git::https://github.com/cloudflare/terraform-modules.git?ref=%s"',
                   '    commit = "%s",', 'GIT_COMMIT=%s', 'CLOUDFLARE_DEPLOY_SHA=%s',
+                  'url = "https://x/y?token=abc"; ref = "%s"',   # the name of the field is ref, whatever came before the ;
                   '* cloudflare fix ([abc1234](https://github.com/cloudflare/x/commit/%s))')
         for line in public:
             self.assertTrue(sas.pinned_identifier(finding(sha1), (line % sha1).encode("utf-8")), line)
@@ -2418,7 +2419,8 @@ class UnitTests(unittest.TestCase):
         credentials = ('"cloudflare_token": "%s"', 'CLOUDFLARE_API_TOKEN=%s', '  apiToken: %s', 'KEY=%s', '  password: %s',
                        'https://%s@github.com/cloudflare/x.git', 'https://npm.example.com/x.tgz?token=%s',
                        '"cloudflare": "%s"', 'Authorization: Bearer %s', '%s', '  value: %s', '"authToken": "%s"',
-                       'PASSWORD_HASH=%s', '"secret_sha": "%s"', '  api_key_hash: %s', '"private_key_fingerprint": "%s"')
+                       'PASSWORD_HASH=%s', '"secret_sha": "%s"', '  api_key_hash: %s', '"private_key_fingerprint": "%s"',
+                       '{"cloudflare secret sha": "%s"}', '  api key sha: %s', "  'Cloudflare Auth Commit': '%s',")
         for line in credentials:
             self.assertFalse(sas.pinned_identifier(finding(sha1), (line % sha1).encode("utf-8")), line)
         self.assertFalse(sas.pinned_identifier(finding(sha1), ('"a": "github:cloudflare/a#%s", "key": "%s"\n' % (sha1, sha1)).encode("utf-8")))   # once unvouched
