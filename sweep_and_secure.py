@@ -2013,15 +2013,18 @@ def inside_archive_name(line, start, end):
         if not (url.start() <= start and end <= url.end()):
             continue
         address = url.group(0)
-        path_start = address.find(b"/", address.find(b"://") + 3)
-        if path_start < 0:
+        head = address.find(b"://") + 3
+        tail = address[head:]
+        stop = len(tail)
+        for mark in (b"?", b"#"):   # the query and the fragment are not the path, whatever slashes they hold
+            cut = tail.find(mark)
+            if 0 <= cut < stop:
+                stop = cut
+        slash = tail.find(b"/", 0, stop)
+        if slash < 0:
             return False
-        path = address[path_start:]
-        for stop in (b"?", b"#"):
-            cut = path.find(stop)
-            if cut >= 0:
-                path = path[:cut]
-        base = url.start() + path_start
+        path = tail[slash:stop]
+        base = url.start() + head + slash
         segments = path.split(b"/")
         name = segments[-1]
         if not ARCHIVE_NAME_RE.match(name):
@@ -3431,6 +3434,7 @@ def secrets_text(findings, lines=False, data=None):
     in "resolved")'): enough to judge a match without seeing the value."""
     shown = OrderedDict()
     seen = set()
+    secrets = [candidate for f in findings for candidate in candidate_secrets(f)] if data is not None else []
     for finding in findings:
         if (finding.detector, finding.raw) in seen:
             continue
@@ -3443,6 +3447,8 @@ def secrets_text(findings, lines=False, data=None):
             notes.append(u"%d chars" % len(finding.raw))
             field = finding_field(data, finding)
             if field:
+                if len(field) > 40 or any(secret and secret in field for secret in secrets):
+                    field = mask(field)   # a key that is itself a secret ({"<token>": "<secret>"}) is never shown or logged
                 notes.append(u'in "%s"' % field)
         if notes:
             text += u" (%s)" % u", ".join(notes)

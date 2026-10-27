@@ -2614,6 +2614,8 @@ class UnitTests(unittest.TestCase):
                      b'"resolved": "https://npm.example.com/x/-/x-1.0.0.tgz?token=' + token + b'"',       # in the query
                      b'"resolved": "https://npm.example.com/' + token + b'/x-1.0.0.tgz"',                  # not repeated by the name
                      b'"url": "https://example.com/api/' + token + b'"',                                   # no archive name
+                     b'"url": "https://example.com?token=/' + token + b'.zip"',                             # a slash in the query, no path
+                     b'"url": "https://example.com#/' + token + b'.tgz"',                                   # a slash in the fragment
                      b'"key": "' + token + b'"'):                                                           # no URL at all
             pos = text.find(token)
             self.assertFalse(sas.inside_archive_name(text, pos, pos + len(token)), text)
@@ -2631,6 +2633,17 @@ class UnitTests(unittest.TestCase):
         self.assertEqual(sas.finding_field(b'{"a": 1, "secret_sha": "abc"}\n', plain("abc")), "secret_sha")
         self.assertIsNone(sas.finding_field(b"just abc here\n", plain("abc")))
         self.assertIsNone(sas.finding_field(b"nothing\n", plain("abc")))
+        # a field name that is itself a reported secret, or is suspiciously long, is masked in the listing and the log
+        data = ('{"%s": "%s", "long%s": "%s"}\n' % (GITHUB_TOKEN, STRIPE_KEY, "x" * 60, STRIPE_KEY_2)).encode("utf-8")
+        findings = [sas.Finding("x", 1, "Github", GITHUB_TOKEN, "", False, "PLAIN", {}),
+                    sas.Finding("x", 1, "Stripe", STRIPE_KEY, "", False, "PLAIN", {}),
+                    sas.Finding("x", 1, "Stripe", STRIPE_KEY_2, "", False, "PLAIN", {})]
+        shown = sas.secrets_text(findings, lines=True, data=data)
+        self.assertNotIn(GITHUB_TOKEN, shown)
+        self.assertNotIn(STRIPE_KEY, shown)
+        self.assertIn('in "%s"' % sas.mask(GITHUB_TOKEN), shown)          # the Stripe key sits under the token
+        self.assertIn('in "%s"' % sas.mask("long" + "x" * 60), shown)      # the long name is cut as well
+        self.assertNotIn("xxxxxxxxxx", shown)
 
     def test_inside_integrity_hash(self):
         aws = sas.Finding("x", 1, "AWS", AWS_ID, "", False, "PLAIN", {})
