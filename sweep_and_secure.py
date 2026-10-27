@@ -60,7 +60,7 @@ try:
 except ImportError:  # pragma: no cover - Python 2 without the backport
     lzma = None
 
-__version__ = "1.5.2"
+__version__ = "1.6.0"
 
 # --------------------------------------------------------------------------
 # Python 2 / 3 compatibility
@@ -380,6 +380,24 @@ TEMP_PREFIX = ".sweep-and-secure-"
 
 # .env.example, .env.sample, template.env ...: placeholders for humans, not secrets to lock up.
 EXAMPLE_ENV_WORDS = set("example sample template dist defaults tpl".split())
+
+# Private key files: a file that is nothing but PEM blocks, a private key among them (an SSH key, a TLS
+# key, a certificate with its key). ssh and servers read such a key from its file, so it is never
+# rewritten with a placeholder. One without a passphrase is offered to the quarantine like any file that
+# cannot be fixed in place, unless it lies in a .ssh folder, where ssh needs it; one with a passphrase is
+# left where it is; and the listing prints the ssh-keygen line that adds a passphrase, or upgrades one set
+# with the legacy PEM cipher. The protection is read from the file itself: an OpenSSH-format key names
+# its cipher and KDF in its header (none/none without a passphrase, aes256-ctr/bcrypt with one), a PEM
+# key says Proc-Type: 4,ENCRYPTED with the cipher in DEK-Info (one round of MD5 derives its key from the
+# passphrase: weak), a PKCS#8 key says ENCRYPTED PRIVATE KEY (PBKDF2). Measured: every TruffleHog from
+# 3.40 to 3.99 reports such keys (a protected one with ExtraData encrypted=true; 3.88 leaves protected
+# ones out), none reports a PKCS#8 ENCRYPTED PRIVATE KEY, and keys it cannot parse (an ed25519 PKCS#8
+# key, a toy key) are not reported either.
+PEM_BLOCK_RE = re.compile(br"-----BEGIN ([A-Z0-9 ]+?)-----[ \t]*\r?\n(.*?)-----END \1-----", re.S)
+PRIVATE_KEY_LABEL_RE = re.compile(br"PRIVATE KEY$")   # RSA PRIVATE KEY, OPENSSH PRIVATE KEY, ENCRYPTED PRIVATE KEY ...
+OPENSSH_KEY_MAGIC = b"openssh-key-v1\x00"
+KEY_FILE_WHY = u"private key file"
+SSH_KEY_NAME_RE = re.compile(r"(?i)^id_[a-z0-9_]+$")   # id_rsa, id_ed25519, id_ecdsa_sk ...: ssh's own naming
 
 # Generated files that tooling checks or regenerates: a placeholder inside them breaks the
 # tool, so the secret has to be removed by regenerating the file.
@@ -1621,6 +1639,7 @@ class Plan(object):
         self.compiled_skipped = OrderedDict()  # path -> kind: compiled files TruffleHog read anyway, set aside
         self.compiled_by_name = []   # compiled files seen in the tree and left out of the scan
         self.custody = OrderedDict()  # env path -> ("native", store) | ("file", keys path) | ("existing", None)
+        self.key_files = OrderedDict()  # path -> KeyFile: SSH and other private key files, never rewritten
         self.quarantine_crypto = None  # {"openssl", "kdf", "dotenvx", "version"} when quarantined files are encrypted
         self.quarantine_plain_reason = u""   # why they are moved as they are, when they are
         self.upgrades = None           # what a later run can tighten: keys in files, plaintext quarantined files
@@ -1774,6 +1793,137 @@ class Unfixable(object):
         self.inside = []        # archives: (path inside, [findings that file holds]) in archive order
         self.unplaced = []      # archives: findings no file inside holds verbatim
         self.note = u""         # why the view inside is incomplete, when it is
+
+
+class KeyFile(object):
+    """A file that is nothing but PEM blocks, a private key among them: an SSH key, a TLS key, a
+    certificate with its key. Never rewritten (see KEY_FILE_WHY); one without a passphrase outside a
+    .ssh folder gets an Unfixable entry, which the quarantine machinery may move."""
+
+    def __init__(self, path, blocks):
+        self.path = path
+        self.labels = [label for label, _ in blocks]   # b"OPENSSH PRIVATE KEY", b"CERTIFICATE", ...
+        self.protection = (None, u"")   # see key_protection()
+        self.findings = []
+        self.entry = None
+        self.in_ssh_dir = ".ssh" in os.path.normpath(path).split(os.sep)
+        self.ssh_like = False   # OpenSSH format, an id_* name, a .ssh folder or a .pub file beside it
+
+    @property
+    def protected(self):
+        return self.protection[0] in ("openssh", "legacy", "pkcs8")
+
+    @property
+    def openssh_format(self):
+        return b"OPENSSH PRIVATE KEY" in self.labels
+
+
+def pem_blocks(data):
+    """[(label, body)] when data is nothing but PEM blocks (whitespace and a byte order mark aside),
+    else []."""
+    text = data[3:] if data.startswith(b"\xef\xbb\xbf") else data
+    blocks, pos = [], 0
+    for match in PEM_BLOCK_RE.finditer(text):
+        if text[pos:match.start()].strip():
+            return []
+        blocks.append((match.group(1), match.group(2)))
+        pos = match.end()
+    if not blocks or text[pos:].strip():
+        return []
+    return blocks
+
+
+def pem_headers_and_body(body):
+    """A PEM block's headers (Proc-Type, DEK-Info ...) as a dict of lower-case names, and its base64."""
+    headers, lines, in_headers = {}, [], True
+    for raw in body.splitlines():
+        line = raw.strip()
+        if in_headers:
+            if not line:
+                in_headers = False
+                continue
+            if b":" in line:
+                name, value = line.split(b":", 1)
+                headers[name.strip().lower()] = value.strip()
+                continue
+            in_headers = False
+        if line:
+            lines.append(line)
+    return headers, b"".join(lines)
+
+
+def ssh_string(raw, pos):
+    """(bytes, next position) of a length-prefixed string in an OpenSSH binary blob; (None, pos) when
+    the blob ends first."""
+    if len(raw) < pos + 4:
+        return None, pos
+    length = struct.unpack(">I", raw[pos:pos + 4])[0]
+    if len(raw) < pos + 4 + length:
+        return None, pos
+    return raw[pos + 4:pos + 4 + length], pos + 4 + length
+
+
+def key_protection(label, body):
+    """How a private key block is protected: ("openssh", "aes256-ctr, bcrypt"), ("legacy", "AES-128-CBC"),
+    ("pkcs8", ""), (None, "") when no passphrase protects it, ("unknown", why) when it cannot be read."""
+    headers, b64 = pem_headers_and_body(body)
+    if label == b"ENCRYPTED PRIVATE KEY":
+        return ("pkcs8", u"")
+    if label == b"OPENSSH PRIVATE KEY":
+        try:
+            raw = base64.b64decode(b64)
+        except (TypeError, ValueError, binascii.Error):
+            return ("unknown", u"its base64 could not be decoded")
+        if not raw.startswith(OPENSSH_KEY_MAGIC):
+            return ("unknown", u"it does not start with the openssh-key-v1 header")
+        cipher, pos = ssh_string(raw, len(OPENSSH_KEY_MAGIC))
+        kdf, pos = ssh_string(raw, pos)
+        if cipher is None or kdf is None:
+            return ("unknown", u"its header is cut short")
+        if cipher == b"none":
+            return (None, u"")
+        return ("openssh", u"%s, %s" % (to_text(cipher), to_text(kdf)))
+    if headers.get(b"proc-type", b"").replace(b" ", b"") == b"4,ENCRYPTED":
+        cipher = headers.get(b"dek-info", b"").split(b",")[0].strip()
+        return ("legacy", to_text(cipher) if cipher else u"unknown cipher")
+    return (None, u"")
+
+
+KEY_PROTECTION_RANK = {None: 0, "unknown": 1, "legacy": 2, "pkcs8": 3, "openssh": 4}
+
+
+def key_file_of(path, data):
+    """A KeyFile when data (the bytes of path) is nothing but PEM blocks with a private key among them,
+    else None. With several keys the weakest protection counts: a bundle with one bare key is bare."""
+    blocks = pem_blocks(data)
+    keys = [(label, body) for label, body in blocks if PRIVATE_KEY_LABEL_RE.search(label)]
+    if not keys:
+        return None
+    key = KeyFile(path, blocks)
+    key.protection = min((key_protection(label, body) for label, body in keys), key=lambda p: KEY_PROTECTION_RANK[p[0]])
+    key.ssh_like = (key.openssh_format or key.in_ssh_dir or SSH_KEY_NAME_RE.match(os.path.basename(path)) is not None
+                    or os.path.isfile(path + ".pub"))
+    return key
+
+
+def passphrase_text(key):
+    """'yes (OpenSSH format, aes256-ctr, bcrypt)', 'yes, legacy PEM cipher (AES-128-CBC)', 'none (PEM)' ..."""
+    kind, detail = key.protection
+    if kind == "openssh":
+        return u"yes (OpenSSH format, %s)" % detail
+    if kind == "legacy":
+        return u"yes, legacy PEM cipher (%s)" % detail
+    if kind == "pkcs8":
+        return u"yes (PKCS#8)"
+    if kind == "unknown":
+        return u"cannot tell: %s" % detail
+    if key.openssh_format:
+        shape = u"OpenSSH format"
+    elif b"PRIVATE KEY" in key.labels:
+        shape = u"PKCS#8"
+    else:
+        shape = u"PEM"
+    return u"none (%s)" % shape
 
 
 def detectors_of(findings):
@@ -2170,6 +2320,7 @@ def build_plan(findings, root, store, args, env_plaintext, exclude_res=(), decry
     seen = {}
     leftovers = []   # (finding, why): secrets in text files that could not be handled
     compiled_cache = {}
+    not_keys = set()   # text files looked at and found not to be private key files
     ordered = sorted(findings, key=lambda f: (f.path, f.line, f.raw))
     for finding in ordered:
         if exclude_res and is_excluded(finding.path, exclude_res):
@@ -2188,6 +2339,25 @@ def build_plan(findings, root, store, args, env_plaintext, exclude_res=(), decry
                 log_only(u"set aside, compiled code: %s (%s) %s" % (plan.rel(finding.path), kind, finding.detector))
             continue
         data, reason = load_for_edit(finding.path, cache)
+        if data is not None and finding.path not in not_keys:
+            # a private key file: never rewritten; without a passphrase (and outside .ssh) movable to quarantine
+            key_file = plan.key_files.get(finding.path)
+            if key_file is None:
+                key_file = key_file_of(finding.path, data)
+                if key_file is None:
+                    not_keys.add(finding.path)
+                else:
+                    plan.key_files[finding.path] = key_file
+                    log_only(u"private key file: %s (passphrase %s)" % (plan.rel(finding.path), passphrase_text(key_file)))
+            if key_file is not None:
+                key_file.findings.append(finding)
+                if not key_file.protected and not key_file.in_ssh_dir:
+                    entry = plan.unfixable.get(finding.path)
+                    if entry is None:
+                        entry = key_file.entry = Unfixable(finding.path, KEY_FILE_WHY, None, True)
+                        plan.unfixable[finding.path] = entry
+                    entry.findings.append(finding)
+                continue
         if data is None:
             if not reason.endswith(u" archive"):
                 raw = file_bytes(finding.path, raw_cache)
@@ -3206,6 +3376,9 @@ def secrets_text(findings, lines=False):
 def print_unfixable(plan, args, style):
     """The files whose secrets cannot be fixed in place: why, what is inside (archives), the
     secrets, and what this run does with each: moved whole to quarantine, or left in place."""
+    entries = [entry for entry in plan.unfixable.values() if entry.why != KEY_FILE_WHY]   # key files have their own listing
+    if not entries:
+        return
     say(u"")
     if plan.quarantine and plan.quarantine_crypto:
         tail = (u"  (a chosen file is moved whole to %s, AES-256 encrypted, its passphrase kept by dotenvx; nothing in it"
@@ -3216,9 +3389,9 @@ def print_unfixable(plan, args, style):
         tail = (u"  (a chosen file is moved whole to %s; nothing in it is rewritten)" % plan.rel(plan.quarantine))
     else:
         tail = u"  (not rewritten; with --yes, pass --quarantine to move them out of the tree)"
-    say(style.bold(u"Files holding secrets that cannot be fixed in place: %d" % len(plan.unfixable)) + style.dim(tail))
+    say(style.bold(u"Files holding secrets that cannot be fixed in place: %d" % len(entries)) + style.dim(tail))
     rows = []
-    for entry in plan.unfixable.values():
+    for entry in entries:
         number = u"%d" % entry.item.number if entry.item is not None else u"-"
         name = plan.rel(entry.path)
         if entry.item is not None:
@@ -3247,10 +3420,68 @@ def print_unfixable(plan, args, style):
             rows.append((number if first else u"", name if first else u"", why, secrets, action if first else u""))
     for line in table(rows, (u"#", u"File", u"Why / inside", u"Secrets", u"Action")):
         say(line)
-    for entry in plan.unfixable.values():
+    for entry in entries:
         if entry.note:
             say(style.dim(u"  %s: %s" % (plan.rel(entry.path), entry.note)))
-    if plan.quarantine and not plan.quarantine_flagged and any(e.item is not None for e in plan.unfixable.values()):
+    if plan.quarantine and not plan.quarantine_flagged and any(e.item is not None for e in entries):
+        say(style.dim(u"  Offered because this run asks first: y moves them too, s lets you leave them in place."
+                      u" A --yes run moves files only with --quarantine."))
+
+
+def key_command_path(plan, path):
+    """A key's path as typed in a command where the user stands: relative when the swept folder is the
+    working directory, absolute otherwise; quoted when it holds whitespace."""
+    try:
+        here = os.path.realpath(plan.root) == os.path.realpath(os.getcwd())
+    except OSError:
+        here = False
+    shown = plan.rel(path) if here else fs_text(os.path.abspath(path))
+    return u'"%s"' % shown if re.search(r"\s", shown) else shown
+
+
+def print_key_files(plan, args, style):
+    """The private key files TruffleHog found: whether a passphrase protects each, what this run does
+    with it (moves a bare one to the quarantine when asked, leaves the rest), and the ssh-keygen lines
+    that add a passphrase or upgrade one set with the legacy PEM cipher."""
+    say(u"")
+    say(style.bold(u"Private key files: %d" % len(plan.key_files))
+        + style.dim(u"  (ssh and servers read a key from its file, so none is rewritten; a passphrase protects a key"
+                    u" at rest, where the file lies does not)"))
+    rows = []
+    for key in plan.key_files.values():
+        entry = key.entry
+        if entry is not None and entry.item is not None:
+            number, action = u"%d" % entry.item.number, action_text(entry.item, plan, args)
+        elif entry is not None:
+            number, action = u"-", u"stays in place (pass --quarantine to move it)"
+        elif not key.protected:
+            number, action = u"-", u"left as it is (ssh needs it there): add a passphrase (below)"
+        elif key.protection[0] == "legacy":
+            number, action = u"-", u"left as it is; upgrade its passphrase (below)"
+        else:
+            number, action = u"-", u"left as it is"
+        rows.append((number, plan.rel(key.path), passphrase_text(key), action))
+    for line in table(rows, (u"#", u"File", u"Passphrase", u"Action")):
+        say(line)
+    bare = [key for key in plan.key_files.values() if not key.protected]
+    legacy = [key for key in plan.key_files.values() if key.protection[0] == "legacy"]
+    if bare:
+        say(style.dim(u"  Add a passphrase (ssh asks for it when the key is used, or ssh-agent remembers it):"))
+        for key in bare:
+            if key.openssh_format:
+                say(u"    ssh-keygen -p -a 100 -f %s" % key_command_path(plan, key.path))
+            else:
+                say(u"    ssh-keygen -p -o -a 100 -f %s%s" % (key_command_path(plan, key.path),
+                    style.dim(u"   (rewrites the key in the OpenSSH format%s)" % (u"" if key.ssh_like else u": only for a key ssh uses"))))
+        if any(not key.ssh_like for key in bare):
+            say(style.dim(u"  A key that a server or program reads at start-up cannot take a passphrase: keep it out of the tree,"
+                          u" and rotate it if it was ever committed."))
+    if legacy:
+        say(style.dim(u"  Upgrade a passphrase set with the legacy PEM cipher (a single round of MD5 derives its key):"))
+        for key in legacy:
+            say(u"    ssh-keygen -p -o -a 100 -f %s" % key_command_path(plan, key.path))
+    if plan.quarantine and not plan.quarantine_flagged and any(key.entry is not None and key.entry.item is not None
+                                                                for key in plan.key_files.values()):
         say(style.dim(u"  Offered because this run asks first: y moves them too, s lets you leave them in place."
                       u" A --yes run moves files only with --quarantine."))
 
@@ -3319,6 +3550,8 @@ def print_report(plan, args, style, verified_any):
             say(style.dim(u"  * = TruffleHog verified this credential is live"))
     if plan.unfixable:
         print_unfixable(plan, args, style)
+    if plan.key_files:
+        print_key_files(plan, args, style)
     if plan.compiled:
         print_compiled(plan, args, style)
     skipped = compiled_skipped(plan)
@@ -4174,6 +4407,12 @@ def print_next_steps(plan, chosen, keys_files, args, style):
                   QUARANTINE_MANIFEST, QUARANTINE_INDEX))
         say(u"     Nothing reads them from there. Fix or rebuild them without the secrets and move them back, or")
         say(u"     delete them; never commit that folder. If a file was tracked by git, commit its removal.")
+    bare_keys = [key for key in plan.key_files.values() if not key.protected
+                 and not (key.entry is not None and key.entry.item is not None and key.entry.item.status == "done")]
+    if bare_keys:
+        bullet(u"%d private key file(s) without a passphrase stay where they are: %s. The ssh-keygen line for each is in"
+               % (len(bare_keys), u", ".join(plan.rel(key.path) for key in bare_keys)))
+        say(u"     the listing above; a key that sat in a project tree or in git history is exposed and has to be rotated.")
     if plan.compiled:
         bullet(u"The findings in compiled code were listed and left alone. Check each with  strings <file> |"
                u" grep -n <start of the value>;  a real credential there has to be rotated, and the program rebuilt without it.")
@@ -4207,6 +4446,10 @@ def print_next_steps(plan, chosen, keys_files, args, style):
         say(u"     How-to guides:")
         for detector, guide in with_guide:
             say(u"       %-18s %s" % (detector, guide))
+    if u"PrivateKey" in without:
+        without.remove(u"PrivateKey")
+        say(u"     PrivateKey: make a new key pair (ssh-keygen -t ed25519 -a 100 -f ~/.ssh/<name>), install its .pub where")
+        say(u"     the old one was accepted, then delete the old key.")
     if without:
         say(u"     Rotate through the provider's console: %s" % u", ".join(without))
     git_root = find_git_root(plan.root)
@@ -4293,7 +4536,9 @@ def parse_args(argv):
             "\n"
             "  secrets in dotenv files   -> encrypted in place        (KEY=\"encrypted:...\")\n"
             "  secrets in other files    -> moved into the project's .env, encrypted, and the\n"
-            "                               plaintext replaced by a placeholder like ${KEY}"),
+            "                               plaintext replaced by a placeholder like ${KEY}\n"
+            "  private key files         -> never rewritten: one without a passphrase can be moved to the\n"
+            "                               quarantine, and the ssh-keygen line that adds one is printed"),
         epilog=(
             "exit codes: 0 done (or nothing to do), 1 missing tool / scan incomplete or failed / encryption failed,\n"
             "            2 you said no or gave no answer (stdin not a terminal, nothing piped, no --yes), 130 interrupted\n"

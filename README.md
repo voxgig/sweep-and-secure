@@ -6,8 +6,11 @@ folder, and lock them away. One command scans the tree with
 found and what it intends to do, and, once you say yes, encrypts the secrets
 with [dotenvx](https://dotenvx.com), replaces the plaintext in your files with
 placeholders, and moves the files it cannot fix in place (archives, binaries,
-PDFs, lock files, example env files) out of the tree into an encrypted
-quarantine folder that remembers where each came from. The keys are dotenvx's
+PDFs, lock files, example env files, SSH keys without a passphrase) out of the
+tree into an encrypted quarantine folder that remembers where each came from. A
+private key file is never rewritten: a passphrase-protected one is left where it
+is, and the run prints the `ssh-keygen` line that adds or upgrades a passphrase.
+The keys are dotenvx's
 to keep: a fresh private key goes into the operating system's secret store
 where dotenvx can put it, into `.env.keys` where it cannot, and the run ends
 with a short dotenvx primer, because from then on dotenvx is the tool you use;
@@ -60,10 +63,14 @@ between:
    project's `.env`, encrypted there, and the plaintext in the source file is
    replaced by a placeholder such as `${KEY}`. The same secret in several files
    gets one name. A file whose secrets cannot be fixed in place (an archive, a
-   binary, a PDF, a lock file, an example env file) is moved whole into a
-   quarantine folder when you choose it, encrypted there with openssl under a
-   passphrase that dotenvx keeps, and the folder's manifest and index record
-   where it came from.
+   binary, a PDF, a lock file, an example env file, a private key file without a
+   passphrase) is moved whole into a quarantine folder when you choose it,
+   encrypted there with openssl under a passphrase that dotenvx keeps, and the
+   folder's manifest and index record where it came from. A private key file is
+   never rewritten, since ssh and servers read a key from its file; one with a
+   passphrase is left alone, and the listing prints the `ssh-keygen` line that
+   adds a passphrase to a bare key or upgrades one set with the legacy PEM cipher
+   (see [SSH keys and other private key files](#ssh-keys-and-other-private-key-files)).
 5. **dotenvx keeps the keys.** A fresh private key goes into the operating
    system's secret store (macOS Keychain, Windows Credential Manager, Linux
    Secret Service) through `dotenvx native up` where this dotenvx and machine
@@ -84,6 +91,7 @@ between:
 | a dotenv file (`.env`, `.env.production`, `prod.env`, ...), as the value of `KEY=...` | `dotenvx encrypt -k KEY` encrypts that key in place: `KEY="encrypted:..."`. Every key whose value holds the secret is encrypted, not just the first |
 | anywhere else (source code, JSON, YAML, Markdown, certificates, ...) | the value is added to the project's `.env` (`--env-file` to change) and encrypted there; the plaintext in the file is replaced by `${KEY}` (`--placeholder` to change) |
 | a file that cannot be fixed in place: an archive TruffleHog looked inside (`.zip`, `.jar`, `.tar.gz`, ...), a binary, a PDF, a generated lock file (`package-lock.json`, `poetry.lock`, ...), an example env file (`.env.example`, `.env.sample`, ...), a file too large or unreadable, or a text file whose only secrets are encoded, shorter than `--min-length` or impossible for dotenvx to store exactly | listed in the "Files holding secrets that cannot be fixed in place" section with the reason, and for archives the files inside that hold each secret (zip, tar with any compression, gzip, bzip2 and xz are opened, nested ones too). The whole file is moved out of the tree into the quarantine folder (`.secrets-quarantine` in the swept folder, `--quarantine-dir` to change), keeping its relative path plus `.enc`: openssl encrypts it (AES-256) under a fresh passphrase, which dotenvx keeps encrypted in the folder's own `.env`, so no plaintext copy of the secret is left anywhere; the folder's `MANIFEST.txt` and `index.json` record where it came from, why, which files inside held secrets and how to get it back (`--restore`). An interactive run offers this as a numbered item, so `s` can leave a file in place; a `--yes` run moves files only when `--quarantine` is given |
+| a private key file: nothing but PEM blocks, a private key among them (`id_ed25519`, `id_rsa`, a `.pem` or `.key` file, a certificate with its key) | never rewritten: ssh and servers read a key from its file, and `${KEY}` in it would break them. Listed in a "Private key files" section with whether a passphrase protects it, read from the file itself: `none`, `yes (OpenSSH format, aes256-ctr, bcrypt)`, `yes, legacy PEM cipher (AES-128-CBC)` or `yes (PKCS#8)`. One without a passphrase is offered to the quarantine like any file that cannot be fixed in place, unless it lies in a `.ssh` folder, where ssh needs it; one with a passphrase is left where it is. For every bare key the listing prints `ssh-keygen -p -a 100 -f KEY` (a PEM key gets `-o` too, which rewrites it in the OpenSSH format, so only for a key ssh uses), and for a legacy-cipher passphrase `ssh-keygen -p -o -a 100 -f KEY` |
 | a text file some of whose secrets are fixed in place and one of which cannot be (encoded, too short, unstorable) | the fixable ones are handled; the file is listed with the other one for you to handle by hand, and is never moved, because moving it would undo the fixes |
 | a symbolic link | listed; fix the file it points to |
 | a match that sits inside a package integrity hash (`sha512-...` in `package-lock.json` or `yarn.lock`, `h1:...` in `go.sum`, `sha256:...` in a Python lock file), or that is a commit id or checksum where the file vouches for it: a dependency pinned to a commit in a manifest (`"cloudflare": "github:cloudflare/node-cloudflare#<commit>"` in `package.json`, `rev = "<commit>"` in `Cargo.toml`, `git+https://...git@<commit>` in `requirements.txt`, `?ref=<commit>` in a Terraform source), an action pinned to one in a workflow (`uses: owner/action@<commit>`), a `gitHead`, `shasum`, `rev`, `ref` or `commit` field, a URL's fragment or path (the sha1 fragment of a `resolved` URL in `yarn.lock`, a commit link in a changelog), and in a generated lock file also a checksum or reference field (`Cargo.lock`, `composer.lock`, `Gemfile.lock`), a `mix.lock` entry or a checksum section (`Podfile.lock`) | set aside and counted, not treated as a secret: those are public identifiers that happen to match a detector's pattern, which TruffleHog's keyword detectors do whenever the word `cloudflare`, `sentry`, `datadog` and so on stands within 40 characters before them (every release from 3.6 to 3.99 does this). Only a digest of its algorithm's exact length counts, and outside lock files only one written in hex; a digest in a URL's user information (`user:secret@host`), after `=` (`?token=...`), after a word like `token` or `password`, or in any place the file does not vouch for stays a finding; and each set-aside is named in the run log |
@@ -246,8 +254,10 @@ removed (they may hold a plaintext copy of an env file, so they never stay).
 - It only finds what TruffleHog has a detector for. A plain
   `DB_PASSWORD=hunter2` in a `.env` file is listed under "other plaintext keys"
   and encrypted only with `--env-all`.
-- It does not edit binaries, PDFs or lock files, and it does not edit inside
-  archives; such files are moved whole to quarantine, or left for you.
+- It does not edit binaries, PDFs, lock files or private key files, and it does
+  not edit inside archives; such files are moved whole to quarantine, or left
+  for you. It does not add a passphrase to a key either: that needs you to
+  choose one, so it prints the `ssh-keygen` line instead.
 - It does not scan programs and libraries unless asked (`--scan-compiled`), and
   it never changes them: a credential compiled into a program has to be rotated,
   and the program rebuilt without it.
@@ -290,7 +300,7 @@ Without installing anything, straight from the repository:
 uvx --from git+https://github.com/voxgig/sweep-and-secure sweep-and-secure --dry-run
 ```
 
-To pin a release, append `@v1.5.2` to the git URL, or pass `-v v1.5.2` to the
+To pin a release, append `@v1.6.0` to the git URL, or pass `-v v1.6.0` to the
 installer. To upgrade, run the same command again (`pipx upgrade
 sweep-and-secure` or `uv tool upgrade sweep-and-secure` for those routes). The
 installer takes `-b DIR` for another folder (without `-b` it uses
@@ -384,7 +394,7 @@ everything.
 
 ```
 $ sweep-and-secure --check-setup
-sweep-and-secure 1.5.2  (TruffleHog + dotenvx)
+sweep-and-secure 1.6.0  (TruffleHog + dotenvx)
 Log: /home/me/.local/state/sweep-and-secure/logs/2026-10-23T16-38-58Z-shop-48213.log
 Python 3.13.16 (/usr/bin/python3) on Linux-6.8.0-x86_64-with-glibc2.39
   [ok] trufflehog  3.99.3     /usr/local/bin/trufflehog
@@ -430,7 +440,7 @@ audit.
 ```
 $ cd shop
 $ sweep-and-secure --dry-run
-sweep-and-secure 1.5.2  (TruffleHog + dotenvx)
+sweep-and-secure 1.6.0  (TruffleHog + dotenvx)
 Log: /home/me/.local/state/sweep-and-secure/logs/2026-10-23T16-39-04Z-shop-48213.log
 Folder: /home/me/shop
   Note: this is a security tool that changes files on purpose: it encrypts env files, rewrites
@@ -712,7 +722,7 @@ recognised and never stored twice.
 
 ```
 $ sweep-and-secure --dry-run
-sweep-and-secure 1.5.2  (TruffleHog + dotenvx)
+sweep-and-secure 1.6.0  (TruffleHog + dotenvx)
 Log: /home/me/.local/state/sweep-and-secure/logs/2026-10-23T16-39-20Z-shop-48213.log
 Folder: /home/me/shop
   Note: this is a security tool that changes files on purpose: it encrypts env files, rewrites
@@ -753,7 +763,7 @@ a file put back with its secret still inside is found again by the next run.
 
 ```
 $ sweep-and-secure --restore build/keys.zip
-sweep-and-secure 1.5.2  (TruffleHog + dotenvx)
+sweep-and-secure 1.6.0  (TruffleHog + dotenvx)
 Log: /home/me/.local/state/sweep-and-secure/logs/2026-10-23T16-39-24Z-shop-48213.log
 Folder: /home/me/shop
   [ok] dotenvx     2.38.2     /usr/local/bin/dotenvx
@@ -761,6 +771,65 @@ Folder: /home/me/shop
 $ ls build
 keys.zip
 ```
+
+### SSH keys and other private key files
+
+TruffleHog's `PrivateKey` detector finds key blocks wherever they sit: key
+files, a key pasted into YAML or JSON, a `.env` value with escaped newlines,
+inside archives. A key *inside* another file is handled like any secret there
+(stored encrypted, a placeholder left behind). A key *file*, nothing but PEM
+blocks, is different: ssh and servers read the key from the file, so a
+placeholder would break it, and the file is never rewritten. Instead the run
+reads from the file how the key is protected and lists it:
+
+```
+Private key files: 4  (ssh and servers read a key from its file, so none is rewritten; a passphrase protects a key at rest, where the file lies does not)
+  #  File                       Passphrase                                Action
+  -  .ssh/id_ed25519            yes (OpenSSH format, aes256-ctr, bcrypt)  left as it is
+  -  .ssh/id_rsa_old            yes, legacy PEM cipher (AES-128-CBC)      left as it is; upgrade its passphrase (below)
+  3  deploy/id_ed25519          none (OpenSSH format)                     move to .secrets-quarantine/deploy/id_ed25519.enc (encrypted)
+  4  certs/server.pem           none (PEM)                                move to .secrets-quarantine/certs/server.pem.enc (encrypted)
+  Add a passphrase (ssh asks for it when the key is used, or ssh-agent remembers it):
+    ssh-keygen -p -a 100 -f deploy/id_ed25519
+    ssh-keygen -p -o -a 100 -f certs/server.pem   (rewrites the key in the OpenSSH format: only for a key ssh uses)
+  A key that a server or program reads at start-up cannot take a passphrase: keep it out of the tree, and rotate it if it was ever committed.
+  Upgrade a passphrase set with the legacy PEM cipher (a single round of MD5 derives its key):
+    ssh-keygen -p -o -a 100 -f .ssh/id_rsa_old
+```
+
+**Is a passphrase enough?** It depends on the format, which the header of the
+file tells:
+
+- `-----BEGIN OPENSSH PRIVATE KEY-----` with a passphrase: the key is encrypted
+  with AES-256 under a key derived by bcrypt (16 rounds by default, `-a 100`
+  for more). With a decent passphrase this is sound protection at rest, and such
+  a key is left where it is.
+- `-----BEGIN RSA PRIVATE KEY-----` with `Proc-Type: 4,ENCRYPTED`: the legacy
+  PEM form. A single round of MD5 derives its key from the passphrase, so a
+  leaked file can be guessed at offline very fast. The run prints the
+  `ssh-keygen -p -o -a 100 -f KEY` line that re-encrypts it in the OpenSSH
+  format; or rotate the key.
+- `-----BEGIN ENCRYPTED PRIVATE KEY-----` (PKCS#8): PBKDF2, fine with a strong
+  passphrase. TruffleHog does not report these, so they are not listed.
+
+A passphrase protects the key's contents, not its location. A key file inside a
+project tree still ends up in git history, backups and archives, where it can be
+attacked forever, so even a protected one belongs in `~/.ssh`, and one that was
+ever committed should be rotated.
+
+**A key without a passphrase** has two real fixes, and the run prints the
+command for the first: add a passphrase with `ssh-keygen -p` (ssh asks for it
+when the key is used; `ssh-agent` remembers it for a session), or rotate it:
+`ssh-keygen -t ed25519 -a 100 -f ~/.ssh/<name>`, install the new `.pub` where
+the old key was accepted, delete the old key. In a project tree such a key is
+offered to the quarantine like any file that cannot be fixed in place
+(`--quarantine` with `--yes`); in a `.ssh` folder it is left where ssh needs it,
+with the `ssh-keygen` line. A key that a server or program reads at start-up (a
+TLS key, a signing key) cannot take a passphrase: keep it out of the tree, and
+rotate it if it was ever committed.
+
+Sweeping `~/.ssh` itself works and changes nothing there: every key is listed
+with its protection and the command to improve it.
 
 ### Choosing which items
 
@@ -1093,7 +1162,7 @@ it yourself for a downloaded `sweep_and_secure.py`, from the folder it was
 downloaded into:
 
 ```
-curl -sSfL -O https://github.com/voxgig/sweep-and-secure/releases/download/v1.5.2/SHA256SUMS
+curl -sSfL -O https://github.com/voxgig/sweep-and-secure/releases/download/v1.6.0/SHA256SUMS
 ```
 
 ```
@@ -1132,6 +1201,11 @@ On macOS use `shasum -a 256 -c -` in place of `sha256sum -c -`.
   holds something like that, such as a token in a registry URL; its row names
   the detector and the line, and `--verify` lets TruffleHog confirm a
   credential against its service.
+* TruffleHog reports a private key only when it can parse it: an RSA, EC or DSA
+  key in the PEM or PKCS#8 form, an OpenSSH-format key with or without a
+  passphrase (3.88 leaves passphrase-protected keys out). A PKCS#8
+  `ENCRYPTED PRIVATE KEY`, an ed25519 key in the PKCS#8 form or a toy key is not
+  reported, so it is not listed; the first is passphrase-protected anyway.
 * Programs and libraries (`.so`, `.dll`, `.exe`, `.pyc`, ...) are not scanned
   unless `--scan-compiled` is given, and are never changed. TruffleHog releases
   before 3.75 read them as raw bytes and match exported symbol names: in a test
@@ -1190,7 +1264,7 @@ tools present.
 
 
 To release: set `__version__` in `sweep_and_secure.py`, merge, then either push
-a matching tag (`git tag v1.5.2 && git push origin v1.5.2`) or run the release
+a matching tag (`git tag v1.6.0 && git push origin v1.6.0`) or run the release
 workflow from the Actions tab with the version, which creates the tag for you.
 The workflow (`.github/workflows/release.yml`) checks that the tag matches the
 version, runs the tests, builds the sdist and wheel, and publishes a GitHub
