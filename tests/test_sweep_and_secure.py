@@ -1195,6 +1195,48 @@ class EndToEndTests(unittest.TestCase):
         self.assertTrue(os.path.isfile(self.tree.path(".secrets-quarantine/sub/package-lock.json.enc")))
         self.assertNoLeftovers()
 
+    def test_an_old_releases_loose_patterns_are_held_to_the_current_ones(self):
+        # measured: TruffleHog 3.5x reports any 20-character run within 40 characters of the letters "pd" as a
+        # PagerDuty key (3.60 and later want u+ and 18 characters), and a 32-character run after "assignable" as a
+        # Signable token (the detector excludes that word itself now). The fake carries both old patterns; a match
+        # inside a base64 blob (a data: URI) is encoded bytes, whatever detector lines up with it.
+        token, run = "u+AbCdEfGhIjKlMnOpQr", "a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5"
+        payload = "Q" * 40 + "/" + base64.b64encode(bytes(bytearray(range(120)))).decode("ascii")
+        self.tree.write("assets/site.css", b".pd-badge .pager-item-active-xy { color: #333; }\n.pager { display: flex; }\n")
+        self.tree.write("assets/inline.css", (".cloudflare{background:url(data:image/png;base64,%s)}\n" % payload).encode("utf-8"))
+        self.tree.write("config/alerts.yml", ("pagerduty_token: %s\n" % token).encode("utf-8"))
+        self.tree.write("config/signable.ini", ("signable_key = %s\n" % run).encode("utf-8"))
+        self.tree.write("src/types.ts", ('export const isAssignable = (x: unknown) => tag === "%s";\n' % run).encode("utf-8"))
+        code, out, err = run_script(self.tree.root, ["--dry-run"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("Set aside 1 finding(s) that are package integrity hashes (sha512-..., h1:..., sha256:...) or"
+                      " commit ids, checksums and package names that a lock file or manifest vouches for", out)
+        self.assertIn("or runs inside a base64 blob (a data: URI, an encoded file)", out)
+        self.assertIn("Set aside 2 finding(s) that TruffleHog's current detectors would not report: a PagerDuty key is u+ and"
+                      " 18 characters (TruffleHog 3.60 and later); the word before a Signable match was assignable or designable"
+                      " (TruffleHog's own exclusion). This release's older patterns were held to the current ones; updating"
+                      " TruffleHog is still worth doing.", out)
+        for name in ("site.css", "inline.css", "types.ts"):
+            self.assertNotIn(name, out)
+        self.assertRegex(out, r"PagerDutyApiKey\s+PAGERDUTY_TOKEN\s+u\+Ab\.\.\.Qr\s+config/alerts\.yml:1\s+move to \.env")
+        self.assertRegex(out, r"Signable\s+SIGNABLE_KEY\s+a0b1\.\.\.d5\s+config/signable\.ini:1\s+move to \.env")
+        log = read_file(re.search(r"^Log: (.*)$", out, re.M).group(1).strip())
+        self.assertRegex(log, r"set aside, not what the current TruffleHog reports \(a PagerDuty key is u\+ and 18 characters"
+                              r" \(TruffleHog 3\.60 and later\)\): assets[/\\]site\.css line 1 \(PagerDutyApiKey\)")
+        self.assertRegex(log, r"set aside, not what the current TruffleHog reports \(the word before a Signable match was assignable"
+                              r" or designable \(TruffleHog's own exclusion\)\): src[/\\]types\.ts line 1 \(Signable\)")
+        self.assertRegex(log, r"set aside, inside a base64 blob: assets[/\\]inline\.css line 1 \(CloudflareApiToken\)")
+        for value in ("pager-item-active-xy", run, "Q" * 40, token):
+            self.assertNotIn(value, log)
+        code, out, err = run_script(self.tree.root, ["--yes"])
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self.tree.read("assets/site.css"), ".pd-badge .pager-item-active-xy { color: #333; }\n.pager { display: flex; }\n")
+        self.assertIn(payload, self.tree.read("assets/inline.css"))
+        self.assertIn(run, self.tree.read("src/types.ts"))
+        self.assertEqual(self.tree.read("config/alerts.yml"), "pagerduty_token: ${PAGERDUTY_TOKEN}\n")
+        self.assertEqual(self.tree.read("config/signable.ini"), "signable_key = ${SIGNABLE_KEY}\n")
+        self.assertNoLeftovers()
+
     def test_a_fresh_private_key_goes_to_the_os_store_when_dotenvx_can(self):
         store_dir = tempfile.mkdtemp(prefix="sweep-store-")
         store_file = os.path.join(store_dir, "store.json")
@@ -2644,6 +2686,38 @@ class UnitTests(unittest.TestCase):
         self.assertIn('in "%s"' % sas.mask(GITHUB_TOKEN), shown)          # the Stripe key sits under the token
         self.assertIn('in "%s"' % sas.mask("long" + "x" * 60), shown)      # the long name is cut as well
         self.assertNotIn("xxxxxxxxxx", shown)
+
+    def test_current_patterns_and_base64_blobs(self):
+        def finding(detector, raw):
+            return sas.Finding("x", 1, detector, raw, "", False, "PLAIN", {})
+
+        # a PagerDuty key is u+ and 18 characters since TruffleHog 3.60; anything else an old release reports is set aside
+        self.assertIn("u+ and 18 characters", sas.current_pattern_rejects(finding("PagerDutyApiKey", "pager-item-active-xy"), None))
+        self.assertIsNone(sas.current_pattern_rejects(finding("PagerDutyApiKey", "u+AbCdEfGhIjKlMnOpQr"), None))
+        self.assertIsNone(sas.current_pattern_rejects(finding("CloudflareApiToken", "pager-item-active-xy"), None))   # no rule for it
+        # a Signable match after the word assignable or designable, in the 40 characters the keyword window spans
+        run = "a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5"
+        sig = finding("Signable", run)
+        for text in ('export const isAssignable = (x) => x === "%s";\n', "designable-thing: %s\n", "Assignable %s\n"):
+            self.assertIn("assignable or designable", sas.current_pattern_rejects(sig, (text % run).encode("utf-8")), text)
+        for text in ("signable_key = %s\n", "Signable token: %s\n", "assignable and signable: %s\n", "x: %s\n"):
+            self.assertIsNone(sas.current_pattern_rejects(sig, (text % run).encode("utf-8")), text)
+        self.assertIsNone(sas.current_pattern_rejects(sig, None))   # without the file there is nothing to check
+        # inside a base64 blob: a data: URI payload, or well inside a long run; not alone, at an edge, or with other characters
+        payload = base64.b64encode(bytes(bytearray(range(96)))).decode("ascii")
+        middle = payload[30:70]
+        cf = finding("CloudflareApiToken", middle)
+        self.assertTrue(sas.inside_base64_blob(cf, (".x{background:url(data:image/png;base64,%s)}\n" % payload).encode("utf-8")))
+        self.assertTrue(sas.inside_base64_blob(finding("CloudflareApiToken", payload[:40]),
+                                               ("src: url(data:font/woff2;base64,%s)\n" % payload).encode("utf-8")))   # at the payload's start
+        self.assertTrue(sas.inside_base64_blob(cf, ("blob = \"%s\"\n" % payload).encode("utf-8")))
+        self.assertFalse(sas.inside_base64_blob(finding("CloudflareApiToken", payload[:40]), ("blob = \"%s\"\n" % payload).encode("utf-8")))  # at the run's edge
+        self.assertFalse(sas.inside_base64_blob(cf, ("KEY=%s\n" % middle).encode("utf-8")))                       # standing alone
+        self.assertFalse(sas.inside_base64_blob(finding("CloudflareApiToken", payload[12:52]),
+                                                ("KEY=%s\n" % payload[:64]).encode("utf-8")))   # most of a 64-character run: a long secret, not a blob
+        self.assertFalse(sas.inside_base64_blob(cf, ("blob = \"%s\"\nKEY=%s\n" % (payload, middle)).encode("utf-8")))   # once outside
+        self.assertFalse(sas.inside_base64_blob(finding("Github", "ghp_" + "A" * 36), ("blob = \"%s\"\n" % payload).encode("utf-8")))  # not found
+        self.assertFalse(sas.inside_base64_blob(cf, b""))
 
     def test_inside_integrity_hash(self):
         aws = sas.Finding("x", 1, "AWS", AWS_ID, "", False, "PLAIN", {})
