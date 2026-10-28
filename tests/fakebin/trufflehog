@@ -51,6 +51,9 @@ DETECTORS = [
     # "assignable" also contains, so @babel/helper-explode-assignable-expression's tarball URL trips it
     # (current releases skip that package by name: TruffleHog issue 1517).
     ("Signable", re.compile(r"(?i)signable(?:.|\n){0,40}?\b([a-zA-Z-0-9]{32})\b"), {}),
+    # TruffleHog 3.5x's PagerDuty detector: any 20-character run within 40 characters of "pagerduty" or "pd"
+    # (pd- and pd_ here, so that the fixture's own texts stay quiet); 3.60 and later want u+ and 18 characters.
+    ("PagerDutyApiKey", re.compile(r"(?i)(?:pagerduty|pd[-_])(?:.|\n){0,40}?\b([a-zA-Z0-9_+-]{20})\b"), {}),
 ]
 AWS_ID = re.compile(r"\bAKIA[0-9A-Z]{16}\b")
 AWS_SECRET = re.compile(r"(?<![A-Za-z0-9/+=])[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])")

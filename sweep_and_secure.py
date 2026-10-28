@@ -60,7 +60,7 @@ try:
 except ImportError:  # pragma: no cover - Python 2 without the backport
     lzma = None
 
-__version__ = "1.6.1"
+__version__ = "1.6.2"
 
 # --------------------------------------------------------------------------
 # Python 2 / 3 compatibility
@@ -334,6 +334,30 @@ LOCK_WHAT = u"a checksum, commit id or package name in a lock file"
 # <version>.tgz), is public whatever shape a detector saw in it.
 URL_IN_LINE_RE = re.compile(br"https?://[^\s\"'<>]+")
 ARCHIVE_NAME_RE = re.compile(br"(?i)^[A-Za-z0-9_.+~-]+\.(?:tgz|tar\.gz|tar\.bz2|tar\.xz|tar|zip|whl|gem|crate|jar|nupkg|egg)$")
+# Patterns TruffleHog itself tightened later. A 3.5x release reports every 20-character run within 40
+# characters of the letters "pd" as a PagerDuty key (3.60 and later want the u+ that PagerDuty user tokens
+# carry), and until 3.6x a Signable match could follow the word "assignable" or "designable", which the
+# detector now excludes by itself. A finding the current detector would not report is set aside, counted
+# and named in the run log: an old release then answers as the current one does where TruffleHog corrected
+# itself. CURRENT_SHAPES: detector -> (what the reported text must match, why); KEYWORD_EXCLUSIONS:
+# detector -> (the keyword, the two letters before it that make another word, why).
+CURRENT_SHAPES = {
+    u"PagerDutyApiKey": (re.compile(r"^u\+[A-Za-z0-9_+-]{18}$"),
+                         u"a PagerDuty key is u+ and 18 characters (TruffleHog 3.60 and later)"),
+}
+KEYWORD_EXCLUSIONS = {
+    u"Signable": (re.compile(br"(?i)signable"), (b"as", b"de"),
+                  u"the word before a Signable match was assignable or designable (TruffleHog's own exclusion)"),
+}
+# Base64 blobs: the payload of a data: URI, or a run of 128 or more base64 characters. A detector pattern that
+# lines up with encoded bytes is noise: a secret inside such a run is itself encoded, and TruffleHog reports it
+# decoded (decoder BASE64), with text that is not in the file as such. A run counts only when it is at least
+# twice as long as the match, has BASE64_MARGIN characters on either side of it and is not part of a URL (a
+# path of long segments has the same characters), so that a base64-shaped secret standing alone, at the edge
+# of a run, making up most of one, or in a URL path stays a finding. A verified finding is never a blob.
+DATA_URI_PAYLOAD_RE = re.compile(br";base64,([A-Za-z0-9+/=]+)")
+BASE64_RUN_RE = re.compile(br"[A-Za-z0-9+/]{128,}={0,2}")
+BASE64_MARGIN = 8
 LOCK_SECTION_RE = re.compile(br"(?i)integrity|checksum|hash|digest|revision|commit|resolution|sha(?:1|256|384|512)?\b")
 
 ALWAYS_EXCLUDES = [
@@ -1648,6 +1672,8 @@ class Plan(object):
         self.compiled_by_name = []   # compiled files seen in the tree and left out of the scan
         self.custody = OrderedDict()  # env path -> ("native", store) | ("file", keys path) | ("existing", None)
         self.key_files = OrderedDict()  # path -> KeyFile: SSH and other private key files, never rewritten
+        self.loose = 0               # findings TruffleHog's current detectors would not report (an older release's pattern)
+        self.loose_reasons = OrderedDict()   # why -> count, for the report
         self.quarantine_crypto = None  # {"openssl", "kdf", "dotenvx", "version"} when quarantined files are encrypted
         self.quarantine_plain_reason = u""   # why they are moved as they are, when they are
         self.upgrades = None           # what a later run can tighten: keys in files, plaintext quarantined files
@@ -2003,6 +2029,76 @@ def field_name(before):
     head = before[:cut]
     start = max(head.rfind(sep) for sep in (b"{", b",", b"[", b"(", b";")) + 1
     return head[start:].strip().strip(b"\"'").strip()
+
+
+def current_pattern_rejects(finding, data):
+    """Why TruffleHog's current detector would not report this finding of an older release, or None: the
+    reported text has not the shape the current pattern requires (CURRENT_SHAPES), or everywhere the text
+    occurs in the file the keyword before it is part of another word the current detector excludes
+    (KEYWORD_EXCLUSIONS; needs data). A verified finding is a live credential whatever the pattern: None."""
+    if finding.verified:
+        return None
+    shape = CURRENT_SHAPES.get(finding.detector)
+    if shape is not None and not any(shape[0].match(candidate) for candidate in candidate_secrets(finding)):
+        return shape[1]
+    exclusion = KEYWORD_EXCLUSIONS.get(finding.detector)
+    if exclusion is not None and data:
+        keyword_re, prefixes, why = exclusion
+        excluded = False
+        for candidate in candidate_secrets(finding):
+            needle = to_bytes(candidate)
+            start = data.find(needle)
+            while start >= 0:
+                # the detector's window: the keyword ends within 40 characters of the match; 2 more for the prefix
+                window = data[max(0, start - 50):start]
+                for hit in keyword_re.finditer(window):
+                    if hit.end() < len(window) - 40:
+                        continue
+                    if hit.start() < 2 or window[hit.start() - 2:hit.start()].lower() not in prefixes:
+                        return None   # a context the current detector reports as well: the finding stays
+                    excluded = True
+                start = data.find(needle, start + 1)
+        if excluded:
+            return why
+    return None
+
+
+def inside_base64_blob(finding, data):
+    """True when every occurrence of the reported text sits inside a base64 blob: the payload of a data: URI,
+    or a run of base64 characters (BASE64_RUN_RE) at least twice as long as the text, with BASE64_MARGIN of
+    them on either side, that is not part of a URL (a path of long segments has the same characters). False
+    when the text is not found at all, and for a verified finding: a live credential is never encoded noise."""
+    if not data or finding.verified:
+        return False
+    found = False
+    spans_by_line = {}   # line start -> (data: URI payload spans, URL spans, base64 run spans), as file offsets
+    for candidate in candidate_secrets(finding):
+        needle = to_bytes(candidate)
+        start = data.find(needle)
+        line_start = line_end = -1
+        while start >= 0:
+            found = True
+            end = start + len(needle)
+            if start >= line_end:   # the first occurrence on a line: the line's spans are computed once
+                line_start = data.rfind(b"\n", 0, start) + 1
+                line_end = data.find(b"\n", start)
+                if line_end < 0:
+                    line_end = len(data)
+                if line_start not in spans_by_line:
+                    line = data[line_start:line_end]
+                    spans_by_line[line_start] = (
+                        [(line_start + m.start(1), line_start + m.end(1)) for m in DATA_URI_PAYLOAD_RE.finditer(line)],
+                        [(line_start + m.start(), line_start + m.end()) for m in URL_IN_LINE_RE.finditer(line)],
+                        [(line_start + m.start(), line_start + m.end()) for m in BASE64_RUN_RE.finditer(line)])
+            payloads, urls, runs = spans_by_line[line_start]
+            if not any(a <= start and end <= b for a, b in payloads):
+                if any(a <= start and end <= b for a, b in urls):
+                    return False   # a URL path, not a blob
+                if not any(a + BASE64_MARGIN <= start and end + BASE64_MARGIN <= b and b - a >= 2 * len(needle)
+                           for a, b in runs):
+                    return False
+            start = data.find(needle, start + 1)
+    return found
 
 
 def inside_archive_name(line, start, end):
@@ -2373,6 +2469,10 @@ def build_plan(findings, root, store, args, env_plaintext, exclude_res=(), decry
         if exclude_res and is_excluded(finding.path, exclude_res):
             plan.ignored += 1   # TruffleHog did not honour the exclude (Windows paths); we do
             continue
+        why_not = current_pattern_rejects(finding, None)   # the shape alone; the keyword check needs the file, below
+        if why_not:
+            set_aside_loose(plan, finding, why_not)
+            continue
         kind = compiled_kind(finding.path, compiled_cache)
         if kind:
             # a program or library: never rewritten or moved; listed with --scan-compiled, else set aside
@@ -2418,6 +2518,13 @@ def build_plan(findings, root, store, args, env_plaintext, exclude_res=(), decry
                 elif pinned_identifier(finding, raw):
                     set_aside_hash(plan, finding, PINNED_WHAT)
                     continue
+                why_not = current_pattern_rejects(finding, raw)   # the keyword check, now that the file is read
+                if why_not:
+                    set_aside_loose(plan, finding, why_not)
+                    continue
+                if inside_base64_blob(finding, raw):
+                    set_aside_hash(plan, finding, u"inside a base64 blob")
+                    continue
             entry = plan.unfixable.get(finding.path)
             if entry is None:
                 kind = archive_kind(finding.path) if reason.endswith(u" archive") else None
@@ -2431,6 +2538,13 @@ def build_plan(findings, root, store, args, env_plaintext, exclude_res=(), decry
             continue
         if pinned_identifier(finding, data):
             set_aside_hash(plan, finding, PINNED_WHAT)
+            continue
+        why_not = current_pattern_rejects(finding, data)   # the keyword check, now that the file is read
+        if why_not:
+            set_aside_loose(plan, finding, why_not)
+            continue
+        if inside_base64_blob(finding, data):
+            set_aside_hash(plan, finding, u"inside a base64 blob")
             continue
         located = False
         too_short = False
@@ -2549,6 +2663,15 @@ def build_plan(findings, root, store, args, env_plaintext, exclude_res=(), decry
     for number, item in enumerate(plan.items, 1):
         item.number = number
     return plan
+
+
+def set_aside_loose(plan, finding, why):
+    """Count a finding that TruffleHog's current detector would not report (an older release's looser
+    pattern), and name it in the run log (the value itself is never logged)."""
+    plan.loose += 1
+    plan.loose_reasons[why] = plan.loose_reasons.get(why, 0) + 1
+    log_only(u"set aside, not what the current TruffleHog reports (%s): %s line %s (%s)"
+             % (why, plan.rel(finding.path), finding.line, finding.detector))
 
 
 def set_aside_hash(plan, finding, what):
@@ -3655,8 +3778,15 @@ def print_report(plan, args, style, verified_any):
         say(style.dim(u"Set aside %d finding(s) that are package integrity hashes (sha512-..., h1:..., sha256:...) or"
                       u" commit ids, checksums and package names that a lock file or manifest vouches for (a dependency"
                       u" pinned to a commit, a rev, ref or commit field, a checksum field, a package archive's name in a"
-                      u" registry URL): public identifiers that happen to match a detector's pattern, not secrets.%s"
+                      u" registry URL), or runs inside a base64 blob (a data: URI, an encoded file): public identifiers"
+                      u" and encoded bytes that happen to match a detector's pattern, not secrets.%s"
                       % (plan.hashes, u" Each is named in the run log." if RUN_LOG is not None else u"")))
+    if plan.loose:
+        say(u"")
+        say(style.dim(u"Set aside %d finding(s) that TruffleHog's current detectors would not report: %s. This release's"
+                      u" older patterns were held to the current ones; updating TruffleHog is still worth doing.%s"
+                      % (plan.loose, u"; ".join(plan.loose_reasons.keys()),
+                         u" Each is named in the run log." if RUN_LOG is not None else u"")))
     if plan.ignored:
         say(u"")
         say(style.dim(u"Ignored %d finding(s) inside excluded folders (.git, node_modules, ...)." % plan.ignored))
