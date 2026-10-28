@@ -2740,17 +2740,24 @@ class UnitTests(unittest.TestCase):
         def finding(detector, raw, verified=False):
             return sas.Finding("x", 1, detector, raw, "", verified, "PLAIN", {})
 
-        # identifiers: words joined camelCase, snake_case, kebab-case or dotted, acronyms and stubs allowed
+        # identifiers: common words joined camelCase, snake_case, kebab-case or dotted; acronyms, stubs and a word
+        # the list lacks are allowed as long as the words make up half the letters
         for text in ("createShopListingsEditor", "createWorkerRequestContextHandlerFactory", "pager-item-active-xy",
                      "CREATE_SHOP_LISTING_EDITOR", "config.editor.active", "parseXMLDocumentHandler",
-                     "HTMLParserFactoryBuilder", "create-listing-navigator-sm"):
+                     "HTMLParserFactoryBuilder", "create-listing-navigator-sm", "MAX_PAGE_SIZE_LIMIT",
+                     "createShopFoozleEditor", "handlersCreatedByFactories"):
             self.assertTrue(sas.identifier_shaped(text), text)
-        # keys and other runs: digits, case changes off the words, one piece, too many stubs or acronyms
+        # keys and other runs: digits, pieces that are not words (Codex, PR 15: a random letters-only Stripe key whose
+        # pieces all carry a vowel), one piece, too many stubs or acronyms
         for text in ("Qm7xP2vL9kR4tZ8wN3yH6bJ1cF5gD0sA7eU2iO4p", "KqZxVbNmPqWrTyPlKjHgFdSa", "AbcdEfghIjklMnopQrstUvwxYz",
+                     "sk_live_" + "SVYogDqigrah" + "KipySigxexao", "KipyDqigrahSigxexaoYogLive", "sk_live_" + "ShopEditor" + "Qxzvbnmkpqwrtlzy",
                      "kqzxvbnmpqwrtyplkjhgfdsa", "a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5", "u+AbCdEfGhIjKlMnOpQr",
                      "createShop2Editor", "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij", "ABCD-EFGH-IJKL-MNOP-QRST",
-                     "MAX_PAGE_SIZE_LIMIT", "xy", "", "https://user:pw@shop-listing-editor.test/db"):
+                     "my_shop_id", "xy", "", "https://user:pw@shop-listing-editor.test/db"):
             self.assertFalse(sas.identifier_shaped(text), text)
+        for piece, is_word in (("handlers", True), ("Listings", True), ("created", True), ("CREATE", True), ("factories", True),
+                               ("Sigxexao", False), ("yog", False), ("ab", False)):
+            self.assertEqual(sas.dictionary_word(piece), is_word, piece)
         old, new = (3, 55, 1), (3, 99, 3)
         ident = "createWorkerRequestContextHandlerFactory"
         self.assertIn("an identifier", sas.current_pattern_rejects(finding("CloudflareApiToken", ident), None, old))

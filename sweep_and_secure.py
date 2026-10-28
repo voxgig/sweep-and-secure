@@ -367,7 +367,7 @@ REMOVED_DETECTORS = {
 # that vendor's key (measured with 3.55.1: a camelCase constant and "exampleexample..." near "cloudflare" were
 # both tokens; 3.75 and later run the filter in the engine whatever the flags and report neither). For such a
 # release the tool applies the same filter to its unverified findings: the terms, and an identifier test of
-# its own (identifier_shaped). The current engine exempts the detectors that declare their findings never
+# its own (identifier_shaped: common words joined camelCase or with - and _). The current engine exempts the detectors that declare their findings never
 # false positives (a URL with a password, a JDBC string, a private key, a Slack webhook, a GCP service
 # account), and so does the tool.
 TRUFFLEHOG_FILTERS_IN_ENGINE = (3, 75)
@@ -379,7 +379,81 @@ IDENTIFIER_WHY = (u"an identifier (words joined camelCase or with - and _), not 
                   u" such matches since 3.75 whatever the flags, this release ran that filter only while verifying")
 IDENTIFIER_CHARS_RE = re.compile(r"^[A-Za-z][A-Za-z_.-]*$")   # no digits: a key has them, an identifier rarely does
 CAMEL_PIECE_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z]|$)|[A-Z]?[a-z]+|[A-Z]+")
-VOWEL_RE = re.compile(r"[aeiouy]", re.I)
+# The words identifiers are made of: common words of code and the web. An identifier must show at least two of
+# them making up at least half its letters (identifier_shaped), so that a random key whose case changes happen
+# to fall on pronounceable pieces (a Stripe-shaped key of 24 letters, say) is never taken for one. The list is
+# the tool's own.
+IDENTIFIER_WORDS = frozenset(u"""
+add remove create delete update insert select get set put post patch fetch load save store read write open close
+start stop run exec execute call invoke apply bind build make generate compile render draw paint mount unmount
+attach detach connect disconnect send receive emit listen watch observe notify publish subscribe dispatch handle
+process parse format encode decode encrypt decrypt sign verify validate check test assert compare match find
+search filter sort order group map reduce fold join split merge concat append prepend push pop shift slice splice
+copy clone move swap replace resolve reject retry cancel abort pause resume reset clear flush refresh reload
+restore backup export import upload download sync lock unlock enable disable toggle show hide expand collapse
+scroll drag drop click hover focus blur submit change input enter exit login logout register signup signin allow
+deny grant revoke accept decline approve confirm prompt ask answer reply respond request require provide inject
+wrap unwrap extend implement override inherit compose decorate convert transform translate migrate upgrade
+downgrade install uninstall deploy release launch init setup configure define declare assign compute calculate
+count measure track trace debug log print display preview play record capture scan sweep secure protect guard
+escape sanitize normalize trim pad fill truncate round floor ceil abs sum avg min max mean total
+item list array dict hash table row column cell tree node leaf root parent child sibling graph edge vertex path
+route router url uri link href src file folder dir directory document doc page pager pagination section header
+footer body head title subtitle heading label caption text string number int integer float double bool boolean
+char byte bytes buffer stream chunk block frame packet message msg event signal error exception warning notice
+status state flag mode type kind class struct enum interface protocol schema model entity record field attribute
+attr property prop param params argument args option options config setting settings preference default value
+result response payload data meta info detail summary description desc name key token secret password credential
+auth session cookie cache storage database query index offset limit cursor iterator generator source target
+destination origin output context scope env environment variable var constant const function func method handler
+callback listener observer subscriber publisher emitter dispatcher reducer action effect hook middleware plugin
+module package library bundle asset resource component element widget control button icon image img picture
+photo avatar logo banner badge tag chip pill card panel tab menu nav navbar sidebar toolbar drawer modal dialog
+popup popover tooltip toast alert spinner loader progress slider carousel gallery dropdown checkbox radio switch
+form textarea placeholder hint help tip anchor breadcrumb layout container wrapper content main aside article box
+flex grid gap margin padding border outline shadow radius corner color background foreground theme dark light font
+size weight width height line spacing align center left right top bottom middle inner outer before after active
+visited disabled enabled hidden visible selected checked expanded collapsed closed loading loaded pending ready
+done complete success failure failed invalid valid dirty clean draft published archived deleted removed new old
+current previous prev next first last initial final primary secondary tertiary custom basic advanced simple
+standard premium free paid pro plus lite mini small medium large huge tiny wide narrow full half empty auto manual
+static dynamic fixed relative absolute sticky inline none all any some every each other another same more less
+most least only extra super sub pre multi single triple global local remote shared common general special public
+private protected internal external safe unsafe legacy modern native virtual real mock fake stub spy dummy demo
+example sample spec fixture snapshot template pattern rule policy permission role admin user guest member owner
+author editor viewer reader writer creator manager controller service provider factory builder adapter proxy
+client server host port domain site web app application program software system platform device mobile desktop
+tablet phone browser window screen monitor keyboard mouse touch
+shop product catalog category brand listing offer deal sale cart basket checkout payment invoice receipt refund
+discount coupon voucher price cost amount subtotal tax fee currency shipping delivery tracking inventory stock
+supplier vendor merchant seller buyer customer account profile contact address street city country region zip
+postal email mail inbox outbox letter note comment review rating star like dislike favorite bookmark share follow
+follower friend feed story blog news press media video audio music song album artist playlist movie film episode
+season channel game player team score level stage match calendar schedule date time hour minute second day week
+month year today tomorrow yesterday now later soon early late morning evening night holiday weekend booking
+reservation ticket seat room hotel flight trip travel journey location place position point spot area zone marker
+pin layer chart plot axis legend series bar pie donut metric stat stats analytics report dashboard overview
+insight trend forecast budget revenue income expense profit loss balance transaction transfer deposit withdraw
+wallet bank loan credit debit plan subscription trial tier quota usage billing license agreement terms privacy
+consent legal support issue bug feature task job project milestone sprint backlog board priority severity
+assignee reporter deadline due todo spreadsheet sheet presentation slide attachment archive trash recycle
+suggestion autocomplete recommendation related popular trending featured latest recent random best worst hot cold
+warm
+api rest graphql http https socket websocket tcp udp dns ssl tls cert certificate gateway balancer cluster pod
+docker registry pipeline workflow prod production dev development staging canary beta alpha stable nightly version
+branch commit pull repo repository github gitlab bitbucket lint minify transpile polyfill runtime compiler engine
+kernel driver firmware hardware memory disk volume partition replica shard queue topic consumer producer broker
+worker scheduler cron timer interval timeout delay debounce throttle backoff circuit breaker fallback ttl expiry
+expire bearer oauth saml sso ldap jwt salt nonce digest checksum signature cipher encryption decryption seed uuid
+guid slug alias nickname username locale language lang timezone encoding charset unicode ascii utf base binary
+hex octal decimal bit word sentence paragraph character symbol digit space newline indent quote comma dot slash
+dash underscore bracket brace paren angle greater equal minus times divide modulo power square cube circle
+triangle rectangle polygon shape vector matrix tensor scalar dimension degree radian pixel percent ratio scale
+factor bias gradient rank grade segment batch epoch step iteration loop cycle phase machine transition trigger
+condition outcome
+""".split())
+WORD_ENDINGS = ((u"ies", u"y"), (u"es", u""), (u"s", u""), (u"ed", u""), (u"ed", u"e"), (u"ing", u""), (u"ing", u"e"),
+                (u"er", u""), (u"er", u"e"), (u"ers", u""), (u"ers", u"e"), (u"ly", u""))
 # Base64 blobs: the payload of a data: URI, or a run of 128 or more base64 characters. A detector pattern that
 # lines up with encoded bytes is noise: a secret inside such a run is itself encoded, and TruffleHog reports it
 # decoded (decoder BASE64), with text that is not in the file as such. A run counts only when it is at least
@@ -2062,11 +2136,22 @@ def field_name(before):
     return head[start:].strip().strip(b"\"'").strip()
 
 
+def dictionary_word(piece):
+    """True when piece, in any case, is one of IDENTIFIER_WORDS or a common form of one (handlers, listing, created)."""
+    low = piece.lower()
+    if low in IDENTIFIER_WORDS:
+        return True
+    for ending, back in WORD_ENDINGS:
+        if low.endswith(ending) and len(low) - len(ending) >= 3 and low[:-len(ending)] + back in IDENTIFIER_WORDS:
+            return True
+    return False
+
+
 def identifier_shaped(text):
     """True when text reads as words joined the way identifiers are (camelCase, snake_case, kebab-case or
-    dotted): no digits, two or more pieces, each a word of three or more letters with a vowel, an all-caps
-    acronym of up to five letters or a one- or two-letter stub (two of those at most), the words making up
-    most of the letters. A key is random: it has digits, and its case changes do not fall on words."""
+    dotted): no digits, two or more pieces, at least two of them words from IDENTIFIER_WORDS making up at least
+    half the letters, and at most two one- or two-letter stubs or all-caps acronyms (HTML, SQL). A key is random:
+    it has digits, and the pieces its case changes make are not words."""
     if not text or not IDENTIFIER_CHARS_RE.match(text):
         return False
     pieces = []
@@ -2074,17 +2159,15 @@ def identifier_shaped(text):
         pieces.extend(CAMEL_PIECE_RE.findall(chunk))
     if len(pieces) < 2:
         return False
-    word_letters = 0
-    others = 0
+    words = word_letters = others = 0
     for piece in pieces:
-        if len(piece) <= 2 or (piece.isupper() and len(piece) <= 5):
-            others += 1      # a stub (xy, id, sm) or an acronym (HTML, SQL)
-        elif VOWEL_RE.search(piece):
+        if dictionary_word(piece):
+            words += 1
             word_letters += len(piece)
-        else:
-            return False     # three or more letters without a vowel, not all caps: not a word
+        elif len(piece) <= 2 or (piece.isupper() and len(piece) <= 5):
+            others += 1      # a stub (xy, id, sm) or an acronym (HTML, SQL)
     letters = sum(len(piece) for piece in pieces)
-    return word_letters > 0 and others <= 2 and word_letters * 10 >= letters * 6
+    return words >= 2 and others <= 2 and word_letters * 2 >= letters
 
 
 def current_pattern_rejects(finding, data, trufflehog_version=None):
