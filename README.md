@@ -95,7 +95,7 @@ between:
 | a text file some of whose secrets are fixed in place and one of which cannot be (encoded, too short, unstorable) | the fixable ones are handled; the file is listed with the other one for you to handle by hand, and is never moved, because moving it would undo the fixes |
 | a symbolic link | listed; fix the file it points to |
 | a match that sits inside a package integrity hash (`sha512-...` in `package-lock.json` or `yarn.lock`, `h1:...` in `go.sum`, `sha256:...` in a Python lock file), or that is a commit id or checksum where the file vouches for it: a dependency pinned to a commit in a manifest (`"cloudflare": "github:cloudflare/node-cloudflare#<commit>"` in `package.json`, `rev = "<commit>"` in `Cargo.toml`, `git+https://...git@<commit>` in `requirements.txt`, `?ref=<commit>` in a Terraform source), an action pinned to one in a workflow (`uses: owner/action@<commit>`), a `gitHead`, `shasum`, `rev`, `ref` or `commit` field, a URL's fragment or path (the sha1 fragment of a `resolved` URL in `yarn.lock`, a commit link in a changelog), and in a generated lock file also a checksum or reference field (`Cargo.lock`, `composer.lock`, `Gemfile.lock`), a `mix.lock` entry or a checksum section (`Podfile.lock`); or that is a run of a package archive's file name in a registry URL (`helper-explode-assignable-expression-7.18.6.tgz`, which an older TruffleHog's Signable detector took for a token because the word `assignable` stands just before it) or of the path segment that name repeats | set aside and counted, not treated as a secret: those are public identifiers that happen to match a detector's pattern, which TruffleHog's keyword detectors do whenever the word `cloudflare`, `sentry`, `datadog` and so on stands within 40 characters before them (every release from 3.6 to 3.99 does this). Only a digest of its algorithm's exact length counts, and outside lock files only one written in hex; a digest in a URL's user information (`user:secret@host`), after `=` (`?token=...`), after a word like `token` or `password`, or in any place the file does not vouch for stays a finding; and each set-aside is named in the run log |
-| a match that TruffleHog's current detector would not report, from an older release's looser pattern: a 3.5x release's PagerDuty pattern takes any 20-character run within 40 characters of the letters `pd` for a key, where 3.60 and later require the `u+` that PagerDuty user tokens carry; a Signable match after the word `assignable` or `designable`, which the detector now excludes itself | set aside and counted ("Set aside N finding(s) that TruffleHog's current detectors would not report"): the current patterns are applied to the older release's findings, and each is named in the run log |
+| a match that TruffleHog's current detectors would not report, from an older release: a 3.5x release's PagerDuty pattern takes any 20-character run within 40 characters of the letters `pd` for a key, where 3.60 and later require the `u+` that PagerDuty user tokens carry; a Signable match after the word `assignable` or `designable`, which the detector now excludes itself; a finding of a detector TruffleHog has since removed (Etsy, which took any 24-character run near the word `etsy` for a key, and six others); and, from a release before 3.75, a match that TruffleHog's own false-positive filter drops: one holding a placeholder term (`example`, `sample`, `abcde`, ...) or one that reads as an identifier (words joined camelCase or with `-` and `_`). Those releases ran the filter only while verifying, so with this tool's default `--no-verification` nothing was filtered; 3.75 and later run it whatever the flags | set aside and counted ("Set aside N finding(s) that TruffleHog's current detectors would not report"): the current detectors' behaviour is applied to the older release's findings and each is named in the run log; a finding that `--verify` confirmed live is never set aside |
 | a match inside a base64 blob: the payload of a `data:` URI (an inline image or font in CSS or HTML), or a run of 128 or more base64 characters outside a URL, at least twice as long as the match, with the match well inside it | set aside and counted with the hashes: a pattern that lines up with encoded bytes is noise, and a secret inside such a blob is itself encoded, which TruffleHog reports decoded. A finding that `--verify` confirmed live is never set aside this way |
 | a program or library: `.so`, `.dll`, `.dylib`, `.exe`, `.o`, `.a`, `.pyc`, `.class`, `.wasm`, ... or a file whose first bytes say ELF, PE, Mach-O or WebAssembly | not scanned, and counted: "Skipped N compiled file(s)". A secret compiled into a program cannot be fixed here, and moving the file would break whatever uses it; what an old TruffleHog matches in such files is mostly exported symbol names (TruffleHog 3.75 and later skip them itself). `--scan-compiled` lists what TruffleHog finds in them, each match with the string around it as `strings` would show it, and never rewrites or moves them |
 
@@ -302,7 +302,7 @@ Without installing anything, straight from the repository:
 uvx --from git+https://github.com/voxgig/sweep-and-secure sweep-and-secure --dry-run
 ```
 
-To pin a release, append `@v1.6.2` to the git URL, or pass `-v v1.6.2` to the
+To pin a release, append `@v1.6.3` to the git URL, or pass `-v v1.6.3` to the
 installer. To upgrade, run the same command again (`pipx upgrade
 sweep-and-secure` or `uv tool upgrade sweep-and-secure` for those routes). The
 installer takes `-b DIR` for another folder (without `-b` it uses
@@ -396,7 +396,7 @@ everything.
 
 ```
 $ sweep-and-secure --check-setup
-sweep-and-secure 1.6.2  (TruffleHog + dotenvx)
+sweep-and-secure 1.6.3  (TruffleHog + dotenvx)
 Log: /home/me/.local/state/sweep-and-secure/logs/2026-10-23T16-38-58Z-shop-48213.log
 Python 3.13.16 (/usr/bin/python3) on Linux-6.8.0-x86_64-with-glibc2.39
   [ok] trufflehog  3.99.3     /usr/local/bin/trufflehog
@@ -442,7 +442,7 @@ audit.
 ```
 $ cd shop
 $ sweep-and-secure --dry-run
-sweep-and-secure 1.6.2  (TruffleHog + dotenvx)
+sweep-and-secure 1.6.3  (TruffleHog + dotenvx)
 Log: /home/me/.local/state/sweep-and-secure/logs/2026-10-23T16-39-04Z-shop-48213.log
 Folder: /home/me/shop
   Note: this is a security tool that changes files on purpose: it encrypts env files, rewrites
@@ -724,7 +724,7 @@ recognised and never stored twice.
 
 ```
 $ sweep-and-secure --dry-run
-sweep-and-secure 1.6.2  (TruffleHog + dotenvx)
+sweep-and-secure 1.6.3  (TruffleHog + dotenvx)
 Log: /home/me/.local/state/sweep-and-secure/logs/2026-10-23T16-39-20Z-shop-48213.log
 Folder: /home/me/shop
   Note: this is a security tool that changes files on purpose: it encrypts env files, rewrites
@@ -765,7 +765,7 @@ a file put back with its secret still inside is found again by the next run.
 
 ```
 $ sweep-and-secure --restore build/keys.zip
-sweep-and-secure 1.6.2  (TruffleHog + dotenvx)
+sweep-and-secure 1.6.3  (TruffleHog + dotenvx)
 Log: /home/me/.local/state/sweep-and-secure/logs/2026-10-23T16-39-24Z-shop-48213.log
 Folder: /home/me/shop
   [ok] dotenvx     2.38.2     /usr/local/bin/dotenvx
@@ -1164,7 +1164,7 @@ it yourself for a downloaded `sweep_and_secure.py`, from the folder it was
 downloaded into:
 
 ```
-curl -sSfL -O https://github.com/voxgig/sweep-and-secure/releases/download/v1.6.2/SHA256SUMS
+curl -sSfL -O https://github.com/voxgig/sweep-and-secure/releases/download/v1.6.3/SHA256SUMS
 ```
 
 ```
@@ -1216,8 +1216,23 @@ On macOS use `shasum -a 256 -c -` in place of `sha256sum -c -`.
   characters of the letters `pd` (also inside `upd`, `pdf` or a base64 blob) for
   a key, where 3.60 and later require the `u+` that PagerDuty user tokens carry;
   a Signable match after the word `assignable` or `designable` is excluded by the
-  detector itself since 3.6x. Such findings are set aside, counted and named in
-  the run log, as are matches inside a base64 blob (the payload of a `data:` URI
+  detector itself since 3.6x. A release before 3.75 ran TruffleHog's own
+  false-positive filter only while verifying a match, so under this tool's default
+  `--no-verification` it filtered nothing, and an identifier or a placeholder near
+  a vendor's name became that vendor's key (3.55.1 reports
+  `createWorkerRequestContextHandlerFactory` after the word `cloudflare` as a
+  Cloudflare token; 3.75 and later run the filter in the engine whatever the flags
+  and report nothing). For such a release the tool applies the filter itself: a
+  match holding a placeholder term (`example`, `sample`, `abcde`, ...) is set
+  aside, and so is one that reads as an identifier by the tool's own test (words
+  of three or more letters joined camelCase, snake_case or kebab-case, no digits),
+  except for the detectors whose current versions never drop a finding this way (a
+  URL with a password, a JDBC string, a private key, a Slack webhook, a GCP service
+  account). Findings of detectors TruffleHog has since removed (Etsy, which
+  took any 24-character run near the word `etsy` for a key; NYTimes, Opengraphr,
+  Prospect.io, Abbysale, Integromat, RoninApp) are set aside whatever the
+  release. All of these are counted and named in the run log, as are matches
+  inside a base64 blob (the payload of a `data:` URI
   in CSS or HTML, a run of 128 or more base64 characters outside a URL, at
   least twice as long as the match, with the match well inside it): a pattern
   that lines up with encoded bytes is noise, and a secret inside such a blob is
@@ -1287,7 +1302,7 @@ tools present.
 
 
 To release: set `__version__` in `sweep_and_secure.py`, merge, then either push
-a matching tag (`git tag v1.6.2 && git push origin v1.6.2`) or run the release
+a matching tag (`git tag v1.6.3 && git push origin v1.6.3`) or run the release
 workflow from the Actions tab with the version, which creates the tag for you.
 The workflow (`.github/workflows/release.yml`) checks that the tag matches the
 version, runs the tests, builds the sdist and wheel, and publishes a GitHub

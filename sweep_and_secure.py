@@ -60,7 +60,7 @@ try:
 except ImportError:  # pragma: no cover - Python 2 without the backport
     lzma = None
 
-__version__ = "1.6.2"
+__version__ = "1.6.3"
 
 # --------------------------------------------------------------------------
 # Python 2 / 3 compatibility
@@ -349,6 +349,37 @@ KEYWORD_EXCLUSIONS = {
     u"Signable": (re.compile(br"(?i)signable"), (b"as", b"de"),
                   u"the word before a Signable match was assignable or designable (TruffleHog's own exclusion)"),
 }
+# Detectors TruffleHog itself retired (checked against each release's detector list, pkg/engine/defaults.go):
+# a finding of one is nothing the current TruffleHog would report. The Etsy one took any 24-character run
+# near the word "etsy" for a key.
+REMOVED_DETECTORS = {
+    u"EtsyApiKey": u"TruffleHog removed its Etsy detector after 3.63 (any 24-character run near the word etsy was a key to it)",
+    u"Nytimes": u"TruffleHog removed its NYTimes detector after 3.63",
+    u"Opengraphr": u"TruffleHog removed its Opengraphr detector after 3.63",
+    u"ProspectIO": u"TruffleHog removed its Prospect.io detector before 3.63",
+    u"Abbysale": u"TruffleHog removed its Abbysale detector after 3.75",
+    u"Integromat": u"TruffleHog removed its Integromat detector after 3.75",
+    u"RoninApp": u"TruffleHog removed its RoninApp detector after 3.75",
+}
+# TruffleHog's own false-positive filter drops a match that holds a placeholder term and, for most detectors,
+# one made of dictionary words. Releases before 3.75 ran it only while verifying a match, so with
+# --no-verification (this tool's default) nothing was filtered and every identifier near a vendor's name became
+# that vendor's key (measured with 3.55.1: a camelCase constant and "exampleexample..." near "cloudflare" were
+# both tokens; 3.75 and later run the filter in the engine whatever the flags and report neither). For such a
+# release the tool applies the same filter to its unverified findings: the terms, and an identifier test of
+# its own (identifier_shaped). The current engine exempts the detectors that declare their findings never
+# false positives (a URL with a password, a JDBC string, a private key, a Slack webhook, a GCP service
+# account), and so does the tool.
+TRUFFLEHOG_FILTERS_IN_ENGINE = (3, 75)
+FALSE_POSITIVE_TERMS = (u"example", u"xxxxxx", u"aaaaaa", u"abcde", u"00000", u"sample", u"*****")
+UNFILTERED_DETECTORS = frozenset([u"GCP", u"JDBC", u"PrivateKey", u"SlackWebhook", u"URI"])
+TERM_WHY = (u"a placeholder term (example, sample, abcde, ...) that TruffleHog's own filter drops; this release ran that"
+            u" filter only while verifying")
+IDENTIFIER_WHY = (u"an identifier (words joined camelCase or with - and _), not a key; TruffleHog's own word filter drops"
+                  u" such matches since 3.75 whatever the flags, this release ran that filter only while verifying")
+IDENTIFIER_CHARS_RE = re.compile(r"^[A-Za-z][A-Za-z_.-]*$")   # no digits: a key has them, an identifier rarely does
+CAMEL_PIECE_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z]|$)|[A-Z]?[a-z]+|[A-Z]+")
+VOWEL_RE = re.compile(r"[aeiouy]", re.I)
 # Base64 blobs: the payload of a data: URI, or a run of 128 or more base64 characters. A detector pattern that
 # lines up with encoded bytes is noise: a secret inside such a run is itself encoded, and TruffleHog reports it
 # decoded (decoder BASE64), with text that is not in the file as such. A run counts only when it is at least
@@ -2031,16 +2062,53 @@ def field_name(before):
     return head[start:].strip().strip(b"\"'").strip()
 
 
-def current_pattern_rejects(finding, data):
-    """Why TruffleHog's current detector would not report this finding of an older release, or None: the
-    reported text has not the shape the current pattern requires (CURRENT_SHAPES), or everywhere the text
+def identifier_shaped(text):
+    """True when text reads as words joined the way identifiers are (camelCase, snake_case, kebab-case or
+    dotted): no digits, two or more pieces, each a word of three or more letters with a vowel, an all-caps
+    acronym of up to five letters or a one- or two-letter stub (two of those at most), the words making up
+    most of the letters. A key is random: it has digits, and its case changes do not fall on words."""
+    if not text or not IDENTIFIER_CHARS_RE.match(text):
+        return False
+    pieces = []
+    for chunk in re.split(r"[^A-Za-z]+", text):
+        pieces.extend(CAMEL_PIECE_RE.findall(chunk))
+    if len(pieces) < 2:
+        return False
+    word_letters = 0
+    others = 0
+    for piece in pieces:
+        if len(piece) <= 2 or (piece.isupper() and len(piece) <= 5):
+            others += 1      # a stub (xy, id, sm) or an acronym (HTML, SQL)
+        elif VOWEL_RE.search(piece):
+            word_letters += len(piece)
+        else:
+            return False     # three or more letters without a vowel, not all caps: not a word
+    letters = sum(len(piece) for piece in pieces)
+    return word_letters > 0 and others <= 2 and word_letters * 10 >= letters * 6
+
+
+def current_pattern_rejects(finding, data, trufflehog_version=None):
+    """Why TruffleHog's current detectors would not report this finding of an older release, or None: the
+    detector was removed (REMOVED_DETECTORS); the reported text has not the shape the current pattern requires
+    (CURRENT_SHAPES); the release ran TruffleHog's own false-positive filter only while verifying and the text
+    holds a placeholder term or reads as an identifier (TRUFFLEHOG_FILTERS_IN_ENGINE); or everywhere the text
     occurs in the file the keyword before it is part of another word the current detector excludes
     (KEYWORD_EXCLUSIONS; needs data). A verified finding is a live credential whatever the pattern: None."""
     if finding.verified:
         return None
+    why = REMOVED_DETECTORS.get(finding.detector)
+    if why:
+        return why
     shape = CURRENT_SHAPES.get(finding.detector)
     if shape is not None and not any(shape[0].match(candidate) for candidate in candidate_secrets(finding)):
         return shape[1]
+    if (trufflehog_version and trufflehog_version < TRUFFLEHOG_FILTERS_IN_ENGINE and finding.raw
+            and finding.detector not in UNFILTERED_DETECTORS):
+        lower = finding.raw.lower()
+        if any(term in lower for term in FALSE_POSITIVE_TERMS):
+            return TERM_WHY
+        if identifier_shaped(finding.raw):
+            return IDENTIFIER_WHY
     exclusion = KEYWORD_EXCLUSIONS.get(finding.detector)
     if exclusion is not None and data:
         keyword_re, prefixes, why = exclusion
@@ -2455,7 +2523,8 @@ def inspect_archive(archive):
     archive.note = u"; ".join(notes)
 
 
-def build_plan(findings, root, store, args, env_plaintext, exclude_res=(), decryptor=None, quarantine=None):
+def build_plan(findings, root, store, args, env_plaintext, exclude_res=(), decryptor=None, quarantine=None,
+               trufflehog_version=None):
     plan = Plan(root, store, quarantine)
     plan.args = args
     cache = {}
@@ -2469,7 +2538,7 @@ def build_plan(findings, root, store, args, env_plaintext, exclude_res=(), decry
         if exclude_res and is_excluded(finding.path, exclude_res):
             plan.ignored += 1   # TruffleHog did not honour the exclude (Windows paths); we do
             continue
-        why_not = current_pattern_rejects(finding, None)   # the shape alone; the keyword check needs the file, below
+        why_not = current_pattern_rejects(finding, None, trufflehog_version)   # without the file; the keyword check needs it, below
         if why_not:
             set_aside_loose(plan, finding, why_not)
             continue
@@ -2518,7 +2587,7 @@ def build_plan(findings, root, store, args, env_plaintext, exclude_res=(), decry
                 elif pinned_identifier(finding, raw):
                     set_aside_hash(plan, finding, PINNED_WHAT)
                     continue
-                why_not = current_pattern_rejects(finding, raw)   # the keyword check, now that the file is read
+                why_not = current_pattern_rejects(finding, raw, trufflehog_version)   # the keyword check, now that the file is read
                 if why_not:
                     set_aside_loose(plan, finding, why_not)
                     continue
@@ -2539,7 +2608,7 @@ def build_plan(findings, root, store, args, env_plaintext, exclude_res=(), decry
         if pinned_identifier(finding, data):
             set_aside_hash(plan, finding, PINNED_WHAT)
             continue
-        why_not = current_pattern_rejects(finding, data)   # the keyword check, now that the file is read
+        why_not = current_pattern_rejects(finding, data, trufflehog_version)   # the keyword check, now that the file is read
         if why_not:
             set_aside_loose(plan, finding, why_not)
             continue
@@ -5089,7 +5158,7 @@ def main(argv=None):
             removed = remove_stale(stale)
             say(style.dim(u"Removed %d leftover staging file(s) from an interrupted run: %s" % (len(removed), names)))
     decryptor = make_decryptor(tools["dotenvx"]["path"], root, args)
-    plan = build_plan(findings, root, store, args, plaintext, exclude_res, decryptor, quarantine)
+    plan = build_plan(findings, root, store, args, plaintext, exclude_res, decryptor, quarantine, version)
     plan.compiled_by_name = compiled_by_name
     if plan.quarantine and any(item.kind == "quarantine" for item in plan.items):
         prepare_quarantine_crypto(plan, tools["dotenvx"]["path"], args)
