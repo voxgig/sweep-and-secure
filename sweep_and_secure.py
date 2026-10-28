@@ -349,13 +349,14 @@ KEYWORD_EXCLUSIONS = {
     u"Signable": (re.compile(br"(?i)signable"), (b"as", b"de"),
                   u"the word before a Signable match was assignable or designable (TruffleHog's own exclusion)"),
 }
-# Base64 blobs: the payload of a data: URI, or a run of 64 or more base64 characters. A detector pattern that
+# Base64 blobs: the payload of a data: URI, or a run of 128 or more base64 characters. A detector pattern that
 # lines up with encoded bytes is noise: a secret inside such a run is itself encoded, and TruffleHog reports it
 # decoded (decoder BASE64), with text that is not in the file as such. A run counts only when it is at least
-# twice as long as the match and has BASE64_MARGIN characters on either side of it, so that a base64-shaped
-# secret standing alone, at the edge of a run, or making up most of one, stays a finding.
+# twice as long as the match, has BASE64_MARGIN characters on either side of it and is not part of a URL (a
+# path of long segments has the same characters), so that a base64-shaped secret standing alone, at the edge
+# of a run, making up most of one, or in a URL path stays a finding. A verified finding is never a blob.
 DATA_URI_PAYLOAD_RE = re.compile(br";base64,([A-Za-z0-9+/=]+)")
-BASE64_RUN_RE = re.compile(br"[A-Za-z0-9+/]{64,}={0,2}")
+BASE64_RUN_RE = re.compile(br"[A-Za-z0-9+/]{128,}={0,2}")
 BASE64_MARGIN = 8
 LOCK_SECTION_RE = re.compile(br"(?i)integrity|checksum|hash|digest|revision|commit|resolution|sha(?:1|256|384|512)?\b")
 
@@ -2032,52 +2033,70 @@ def field_name(before):
 
 def current_pattern_rejects(finding, data):
     """Why TruffleHog's current detector would not report this finding of an older release, or None: the
-    reported text has not the shape the current pattern requires (CURRENT_SHAPES), or the keyword before it
-    in the file is part of another word the current detector excludes (KEYWORD_EXCLUSIONS; needs data)."""
+    reported text has not the shape the current pattern requires (CURRENT_SHAPES), or everywhere the text
+    occurs in the file the keyword before it is part of another word the current detector excludes
+    (KEYWORD_EXCLUSIONS; needs data). A verified finding is a live credential whatever the pattern: None."""
+    if finding.verified:
+        return None
     shape = CURRENT_SHAPES.get(finding.detector)
     if shape is not None and not any(shape[0].match(candidate) for candidate in candidate_secrets(finding)):
         return shape[1]
     exclusion = KEYWORD_EXCLUSIONS.get(finding.detector)
     if exclusion is not None and data:
         keyword_re, prefixes, why = exclusion
+        excluded = False
         for candidate in candidate_secrets(finding):
-            pos = data.find(to_bytes(candidate))
-            if pos < 0:
-                continue
-            window = data[max(0, pos - 48):pos]
-            hits = list(keyword_re.finditer(window))
-            if hits and all(hit.start() >= 2 and window[hit.start() - 2:hit.start()].lower() in prefixes for hit in hits):
-                return why
+            needle = to_bytes(candidate)
+            start = data.find(needle)
+            while start >= 0:
+                # the detector's window: the keyword ends within 40 characters of the match; 2 more for the prefix
+                window = data[max(0, start - 50):start]
+                for hit in keyword_re.finditer(window):
+                    if hit.end() < len(window) - 40:
+                        continue
+                    if hit.start() < 2 or window[hit.start() - 2:hit.start()].lower() not in prefixes:
+                        return None   # a context the current detector reports as well: the finding stays
+                    excluded = True
+                start = data.find(needle, start + 1)
+        if excluded:
+            return why
     return None
-
-
-def line_around(data, start, end):
-    """(the line that holds data[start:end], its offset in data)."""
-    line_start = data.rfind(b"\n", 0, start) + 1
-    line_end = data.find(b"\n", end)
-    return data[line_start:line_end if line_end >= 0 else len(data)], line_start
 
 
 def inside_base64_blob(finding, data):
     """True when every occurrence of the reported text sits inside a base64 blob: the payload of a data: URI,
-    or a run of 64 or more base64 characters at least twice as long as the text, with BASE64_MARGIN of them on
-    either side. False when the text is not found at all."""
-    if not data:
+    or a run of base64 characters (BASE64_RUN_RE) at least twice as long as the text, with BASE64_MARGIN of
+    them on either side, that is not part of a URL (a path of long segments has the same characters). False
+    when the text is not found at all, and for a verified finding: a live credential is never encoded noise."""
+    if not data or finding.verified:
         return False
     found = False
+    spans_by_line = {}   # line start -> (data: URI payload spans, URL spans, base64 run spans), as file offsets
     for candidate in candidate_secrets(finding):
         needle = to_bytes(candidate)
         start = data.find(needle)
+        line_start = line_end = -1
         while start >= 0:
             found = True
             end = start + len(needle)
-            line, offset = line_around(data, start, end)
-            inside = any(offset + m.start(1) <= start and end <= offset + m.end(1) for m in DATA_URI_PAYLOAD_RE.finditer(line))
-            if not inside:
-                inside = any(offset + m.start() + BASE64_MARGIN <= start and end + BASE64_MARGIN <= offset + m.end()
-                             and m.end() - m.start() >= 2 * len(needle) for m in BASE64_RUN_RE.finditer(line))
-            if not inside:
-                return False
+            if start >= line_end:   # the first occurrence on a line: the line's spans are computed once
+                line_start = data.rfind(b"\n", 0, start) + 1
+                line_end = data.find(b"\n", start)
+                if line_end < 0:
+                    line_end = len(data)
+                if line_start not in spans_by_line:
+                    line = data[line_start:line_end]
+                    spans_by_line[line_start] = (
+                        [(line_start + m.start(1), line_start + m.end(1)) for m in DATA_URI_PAYLOAD_RE.finditer(line)],
+                        [(line_start + m.start(), line_start + m.end()) for m in URL_IN_LINE_RE.finditer(line)],
+                        [(line_start + m.start(), line_start + m.end()) for m in BASE64_RUN_RE.finditer(line)])
+            payloads, urls, runs = spans_by_line[line_start]
+            if not any(a <= start and end <= b for a, b in payloads):
+                if any(a <= start and end <= b for a, b in urls):
+                    return False   # a URL path, not a blob
+                if not any(a + BASE64_MARGIN <= start and end + BASE64_MARGIN <= b and b - a >= 2 * len(needle)
+                           for a, b in runs):
+                    return False
             start = data.find(needle, start + 1)
     return found
 

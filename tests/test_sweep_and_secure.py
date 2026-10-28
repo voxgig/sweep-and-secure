@@ -28,6 +28,7 @@ import atexit
 import base64
 import struct
 import tempfile
+import time
 import unittest
 import tarfile
 import zipfile
@@ -2703,21 +2704,74 @@ class UnitTests(unittest.TestCase):
         for text in ("signable_key = %s\n", "Signable token: %s\n", "assignable and signable: %s\n", "x: %s\n"):
             self.assertIsNone(sas.current_pattern_rejects(sig, (text % run).encode("utf-8")), text)
         self.assertIsNone(sas.current_pattern_rejects(sig, None))   # without the file there is nothing to check
-        # inside a base64 blob: a data: URI payload, or well inside a long run; not alone, at an edge, or with other characters
-        payload = base64.b64encode(bytes(bytearray(range(96)))).decode("ascii")
+        # the same token after isAssignable and in a genuine signable_key line: the finding stays (Codex, PR 14)
+        two = ('const isAssignable = (x) => x === "%s";\nsignable_key = %s\n' % (run, run)).encode("utf-8")
+        self.assertIsNone(sas.current_pattern_rejects(sig, two))
+        twice = ('const isAssignable = "%s";\nconst reassignable = "%s";\n' % (run, run)).encode("utf-8")
+        self.assertIn("assignable or designable", sas.current_pattern_rejects(sig, twice))
+        bare_too = ('const isAssignable = "%s";\nconst other = "%s";\n' % (run, run)).encode("utf-8")   # no keyword near the second
+        self.assertIn("assignable or designable", sas.current_pattern_rejects(sig, bare_too))
+        self.assertIsNone(sas.current_pattern_rejects(sig, b"signable " + run.encode("ascii") + b"\n"))   # the keyword at the file's start
+        # a verified finding is a live credential, whatever an old pattern or its surroundings look like
+        live = sas.Finding("x", 1, "PagerDutyApiKey", "pager-item-active-xy", "", True, "PLAIN", {})
+        self.assertIsNone(sas.current_pattern_rejects(live, None))
+        self.assertIsNone(sas.current_pattern_rejects(sas.Finding("x", 1, "Signable", run, "", True, "PLAIN", {}), twice))
+        # inside a base64 blob: a data: URI payload, or well inside a long run; not alone, at an edge, in a URL path,
+        # in a short run, with other characters, or when verified
+        payload = base64.b64encode(bytes(bytearray(range(96)))).decode("ascii")   # 128 characters
         middle = payload[30:70]
         cf = finding("CloudflareApiToken", middle)
         self.assertTrue(sas.inside_base64_blob(cf, (".x{background:url(data:image/png;base64,%s)}\n" % payload).encode("utf-8")))
         self.assertTrue(sas.inside_base64_blob(finding("CloudflareApiToken", payload[:40]),
-                                               ("src: url(data:font/woff2;base64,%s)\n" % payload).encode("utf-8")))   # at the payload's start
+                                               ("src: url(data:font/woff2;base64,%s)\n" % payload[:60]).encode("utf-8")))   # a short payload, at its start
         self.assertTrue(sas.inside_base64_blob(cf, ("blob = \"%s\"\n" % payload).encode("utf-8")))
         self.assertFalse(sas.inside_base64_blob(finding("CloudflareApiToken", payload[:40]), ("blob = \"%s\"\n" % payload).encode("utf-8")))  # at the run's edge
         self.assertFalse(sas.inside_base64_blob(cf, ("KEY=%s\n" % middle).encode("utf-8")))                       # standing alone
-        self.assertFalse(sas.inside_base64_blob(finding("CloudflareApiToken", payload[12:52]),
-                                                ("KEY=%s\n" % payload[:64]).encode("utf-8")))   # most of a 64-character run: a long secret, not a blob
         self.assertFalse(sas.inside_base64_blob(cf, ("blob = \"%s\"\nKEY=%s\n" % (payload, middle)).encode("utf-8")))   # once outside
+        self.assertFalse(sas.inside_base64_blob(cf, ("KEY=%s\n" % payload[:100]).encode("utf-8")))   # under 128 characters: a long secret, not a blob
+        self.assertFalse(sas.inside_base64_blob(finding("CloudflareApiToken", payload[12:52]),
+                                                ("KEY=%s\n" % payload[:64]).encode("utf-8")))
+        url = ("cloudflare_url = \"https://x/abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz/%s"
+               "/abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz\"\n" % middle)
+        self.assertFalse(sas.inside_base64_blob(cf, url.encode("utf-8")))   # a URL path of long segments (Codex, PR 14)
+        self.assertFalse(sas.inside_base64_blob(sas.Finding("x", 1, "CloudflareApiToken", middle, "", True, "PLAIN", {}),
+                                                ("blob = \"%s\"\n" % payload).encode("utf-8")))   # verified: live, whatever surrounds it
         self.assertFalse(sas.inside_base64_blob(finding("Github", "ghp_" + "A" * 36), ("blob = \"%s\"\n" % payload).encode("utf-8")))  # not found
         self.assertFalse(sas.inside_base64_blob(cf, b""))
+        # a megabyte-long line holding the match thousands of times is looked at once per line, not once per occurrence
+        huge = ("huge = \"" + "Q" * 16 + "/" + "/".join([middle] * 25000) + "/" + "Q" * 16 + "\"\n").encode("utf-8")
+        started = time.time()
+        self.assertTrue(sas.inside_base64_blob(cf, huge))
+        self.assertLess(time.time() - started, 10)
+
+    def test_verified_findings_are_never_set_aside_as_blobs(self):
+        # Codex, PR 14: a credential that --verify confirmed live is never encoded noise, whatever surrounds it,
+        # and a token in a URL path is not inside a base64 blob
+        payload = base64.b64encode(bytes(bytearray(range(96)))).decode("ascii")
+        token = payload[30:70]
+        folder = tempfile.mkdtemp(prefix="sweep-unit-")
+        try:
+            blob = os.path.join(folder, "blob.py")
+            with io.open(blob, "wb") as fh:
+                fh.write(("cloudflare_blob = \"%s\"\n" % payload).encode("utf-8"))
+            url = os.path.join(folder, "url.py")
+            with io.open(url, "wb") as fh:
+                fh.write(("cloudflare_url = \"https://x/abcdefghijklmnopqrstuvwxyzabcdefghijkl/%s"
+                          "/abcdefghijklmnopqrstuvwxyzabcdefghijkl\"\n" % token).encode("utf-8"))
+            args = sas.parse_args([folder, "--yes"])
+
+            def plan_for(path, verified):
+                finding = sas.Finding(path, 1, "CloudflareApiToken", token, "", verified, "PLAIN", {})
+                return sas.build_plan([finding], folder, os.path.join(folder, ".env"), args, [], [])
+
+            plan = plan_for(blob, False)
+            self.assertEqual((plan.hashes, plan.items, list(plan.unfixable)), (1, [], []))
+            plan = plan_for(blob, True)
+            self.assertEqual((plan.hashes, len(plan.items)), (0, 1))
+            plan = plan_for(url, False)
+            self.assertEqual((plan.hashes, len(plan.items)), (0, 1))
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
 
     def test_inside_integrity_hash(self):
         aws = sas.Finding("x", 1, "AWS", AWS_ID, "", False, "PLAIN", {})
