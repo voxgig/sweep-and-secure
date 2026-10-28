@@ -60,7 +60,7 @@ try:
 except ImportError:  # pragma: no cover - Python 2 without the backport
     lzma = None
 
-__version__ = "1.6.0"
+__version__ = "1.6.1"
 
 # --------------------------------------------------------------------------
 # Python 2 / 3 compatibility
@@ -325,7 +325,15 @@ LOCK_FIELD_CONTEXT_RE = re.compile(br"(?i)(?:integrity|checksum|hash|sha(?:1|256
                                    br"(?:[0-9a-z]{1,8}[/:])?\s*$"
                                    br"|\{:(?:hex|git),")   # mix.lock: {:hex, :name, "1.0.0", "<checksum>", ...}
 FIELD_CREDENTIAL_RE = re.compile(br"(?i)token|passw|pwd|secret|auth|key|private|credential")   # anywhere in a field's name: password_hash
-PINNED_WHAT = u"a commit id or checksum the file vouches for"   # how the run log names such a set-aside
+PINNED_WHAT = u"a commit id, checksum or package name the file vouches for"   # how the run log names such a set-aside
+LOCK_WHAT = u"a checksum, commit id or package name in a lock file"
+# A detector may also match a run of a package's name and version: TruffleHog's Signable detector took
+# "-explode-assignable-expression-7" out of @babel/helper-explode-assignable-expression's tarball URL (the
+# word "assignable" stands just before it) until it skipped that name by hand (its issue 1517). A run of a
+# package archive's file name in a URL, or of the path segment that name repeats (npm's /<name>/-/<name>-
+# <version>.tgz), is public whatever shape a detector saw in it.
+URL_IN_LINE_RE = re.compile(br"https?://[^\s\"'<>]+")
+ARCHIVE_NAME_RE = re.compile(br"(?i)^[A-Za-z0-9_.+~-]+\.(?:tgz|tar\.gz|tar\.bz2|tar\.xz|tar|zip|whl|gem|crate|jar|nupkg|egg)$")
 LOCK_SECTION_RE = re.compile(br"(?i)integrity|checksum|hash|digest|revision|commit|resolution|sha(?:1|256|384|512)?\b")
 
 ALWAYS_EXCLUDES = [
@@ -1997,6 +2005,42 @@ def field_name(before):
     return head[start:].strip().strip(b"\"'").strip()
 
 
+def inside_archive_name(line, start, end):
+    """True when line[start:end] is part of the file name of a package archive in a URL on the line
+    (.../-/helper-explode-assignable-expression-7.18.6.tgz), or of a path segment that file name repeats
+    (the /helper-explode-assignable-expression/ before it): a package's name and version, public."""
+    for url in URL_IN_LINE_RE.finditer(line):
+        if not (url.start() <= start and end <= url.end()):
+            continue
+        address = url.group(0)
+        head = address.find(b"://") + 3
+        tail = address[head:]
+        stop = len(tail)
+        for mark in (b"?", b"#"):   # the query and the fragment are not the path, whatever slashes they hold
+            cut = tail.find(mark)
+            if 0 <= cut < stop:
+                stop = cut
+        slash = tail.find(b"/", 0, stop)
+        if slash < 0:
+            return False
+        path = tail[slash:stop]
+        base = url.start() + head + slash
+        segments = path.split(b"/")
+        name = segments[-1]
+        if not ARCHIVE_NAME_RE.match(name):
+            return False
+        name_start = base + len(path) - len(name)
+        if name_start <= start and end <= name_start + len(name):
+            return True
+        position = base
+        for segment in segments:
+            if segment and position <= start and end <= position + len(segment) and name.startswith(segment + b"-"):
+                return True
+            position += len(segment) + 1
+        return False
+    return False
+
+
 def vouched_identifier(finding, data, lock):
     """True when every occurrence of the reported text in data is a bare checksum or commit id in a
     place the file vouches for: a URL's fragment or path, a dependency or action pinned to a commit,
@@ -2024,6 +2068,9 @@ def vouched_identifier(finding, data, lock):
                     span = match
                     break
             if span is None:
+                if inside_archive_name(line, offset, offset + len(needle)):
+                    start = data.find(needle, start + 1)
+                    continue
                 return False
             before, after = line[:span.start()], line[span.end():]
             field = LOCK_FIELD_CONTEXT_RE.search(before) is not None
@@ -2366,7 +2413,7 @@ def build_plan(findings, root, store, args, env_plaintext, exclude_res=(), decry
                     continue
                 if reason == u"generated lock file":
                     if lockfile_identifier(finding, raw):
-                        set_aside_hash(plan, finding, u"a checksum or commit id in a lock file")
+                        set_aside_hash(plan, finding, LOCK_WHAT)
                         continue
                 elif pinned_identifier(finding, raw):
                     set_aside_hash(plan, finding, PINNED_WHAT)
@@ -3356,19 +3403,55 @@ def restore_from_quarantine(args, root, store, dotenvx, style):
     return 0
 
 
-def secrets_text(findings, lines=False):
+FIELD_BEFORE_RES = (
+    re.compile(br"\"([^\"\n]{1,80})\"\s*:\s*\"?[^\"\n]*$"),            # JSON: "resolved": "https://...
+    re.compile(br"(?:^|[\s{,(\[])([A-Za-z_][\w.\-]*)\s*[:=]\s*[^\s\"'{},]*$"),   # YAML, TOML, env: KEY=...  {tarball: https://...
+    re.compile(br"^\s*([A-Za-z_][\w.\-]*)\s+\"[^\"\n]*$"),              # yarn.lock: resolved "https://...
+)
+
+
+def finding_field(data, finding):
+    """The name of the field whose value holds the reported text, read from the line it sits on
+    ("resolved", "integrity", KEY), or None when the line has no such shape."""
+    for candidate in candidate_secrets(finding):
+        pos = data.find(to_bytes(candidate))
+        if pos < 0:
+            continue
+        prefix = data[data.rfind(b"\n", 0, pos) + 1:pos]
+        for pattern in FIELD_BEFORE_RES:
+            match = pattern.search(prefix)
+            if match:
+                return match.group(1).decode("utf-8", "replace")
+        return None
+    return None
+
+
+def secrets_text(findings, lines=False, data=None):
     """'Stripe sk_l...23, AWS AKIA...M2' for a list of findings: each distinct secret counted
     once, and '(x2)' when two different secrets happen to mask to the same text. With lines,
-    the line TruffleHog reported each one on, so that a match can be looked at by hand."""
+    the line TruffleHog reported each one on, so that a match can be looked at by hand; with
+    data (the file's bytes) also its length and the field it sits in ('(line 26234, 32 chars,
+    in "resolved")'): enough to judge a match without seeing the value."""
     shown = OrderedDict()
     seen = set()
+    secrets = [candidate for f in findings for candidate in candidate_secrets(f)] if data is not None else []
     for finding in findings:
         if (finding.detector, finding.raw) in seen:
             continue
         seen.add((finding.detector, finding.raw))
         text = u"%s%s %s" % (finding.detector, u" *" if finding.verified else u"", mask(finding.raw))
+        notes = []
         if lines and finding.line:
-            text += u" (line %d)" % finding.line
+            notes.append(u"line %d" % finding.line)
+        if data is not None:
+            notes.append(u"%d chars" % len(finding.raw))
+            field = finding_field(data, finding)
+            if field:
+                if len(field) > 40 or any(secret and secret in field for secret in secrets):
+                    field = mask(field)   # a key that is itself a secret ({"<token>": "<secret>"}) is never shown or logged
+                notes.append(u'in "%s"' % field)
+        if notes:
+            text += u" (%s)" % u", ".join(notes)
         shown[text] = shown.get(text, 0) + 1
     return u", ".join(text if count == 1 else u"%s (x%d)" % (text, count) for text, count in shown.items())
 
@@ -3414,7 +3497,7 @@ def print_unfixable(plan, args, style):
         else:   # line numbers for files that are text (a lock file, an example env file, a source file)
             textual = not entry.why.startswith((u"PDF", u"binary file", u"larger than", u"cannot be read",
                                                 u"symbolic link", u"file is gone"))
-            lines = [(entry.why, secrets_text(entry.findings, lines=textual))]
+            lines = [(entry.why, secrets_text(entry.findings, lines=textual, data=file_bytes(entry.path, {}) if textual else None))]
         for index, (why, secrets) in enumerate(lines):
             first = index == 0
             rows.append((number if first else u"", name if first else u"", why, secrets, action if first else u""))
@@ -3570,9 +3653,10 @@ def print_report(plan, args, style, verified_any):
     if plan.hashes:
         say(u"")
         say(style.dim(u"Set aside %d finding(s) that are package integrity hashes (sha512-..., h1:..., sha256:...) or"
-                      u" commit ids and checksums that a lock file or manifest vouches for (a dependency pinned to a"
-                      u" commit, a rev, ref or commit field, a checksum field): public identifiers that happen to match"
-                      u" a detector's pattern, not secrets.%s" % (plan.hashes, u" Each is named in the run log." if RUN_LOG is not None else u"")))
+                      u" commit ids, checksums and package names that a lock file or manifest vouches for (a dependency"
+                      u" pinned to a commit, a rev, ref or commit field, a checksum field, a package archive's name in a"
+                      u" registry URL): public identifiers that happen to match a detector's pattern, not secrets.%s"
+                      % (plan.hashes, u" Each is named in the run log." if RUN_LOG is not None else u"")))
     if plan.ignored:
         say(u"")
         say(style.dim(u"Ignored %d finding(s) inside excluded folders (.git, node_modules, ...)." % plan.ignored))

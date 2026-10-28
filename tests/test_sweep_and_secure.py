@@ -1015,12 +1015,12 @@ class EndToEndTests(unittest.TestCase):
         code, out, err = run_script(self.tree.root, ["--dry-run"])
         self.assertEqual(code, 0, out + err)
         self.assertIn("Set aside 3 finding(s) that are package integrity hashes (sha512-..., h1:..., sha256:...) or"
-                      " commit ids and checksums that a lock file or manifest vouches for", out)
+                      " commit ids, checksums and package names that a lock file or manifest vouches for", out)
         for rel in ("yarn.lock", "mix.lock", "package-lock.json"):
             self.assertNotIn(rel, out)
         log = read_file(re.search(r"^Log: (.*)$", out, re.M).group(1).strip())
-        self.assertIn("set aside, a checksum or commit id in a lock file: yarn.lock line 6 (CloudflareApiToken)", log)
-        self.assertIn("set aside, a checksum or commit id in a lock file: mix.lock line 2 (SentryToken)", log)
+        self.assertIn("set aside, a checksum, commit id or package name in a lock file: yarn.lock line 6 (CloudflareApiToken)", log)
+        self.assertIn("set aside, a checksum, commit id or package name in a lock file: mix.lock line 2 (SentryToken)", log)
         self.assertNotIn(sha1, log)
         # a credential in a lock file is still one (user:secret@host, ?token=...), and the row says where
         self.tree.write("sub/yarn.lock", ('# yarn lockfile v1\n\ncloudflare-sdk@^2.0.0:\n  version "2.0.0"\n'
@@ -1032,8 +1032,8 @@ class EndToEndTests(unittest.TestCase):
         code, out, err = run_script(self.tree.root, ["--dry-run"])
         self.assertEqual(code, 0, out + err)
         self.assertIn("Set aside 3 finding(s)", out)
-        self.assertRegex(out, r"sub/yarn\.lock\s+generated lock file\s+CloudflareApiToken 2e85\.\.\.ee \(line 5\)")
-        self.assertRegex(out, r"sub/pnpm-lock\.yaml\s+generated lock file\s+CloudflareApiToken 2e85\.\.\.ee \(line 6\)")
+        self.assertRegex(out, r"sub/yarn\.lock\s+generated lock file\s+CloudflareApiToken 2e85\.\.\.ee \(line 5, 40 chars, in \"resolved\"\)")
+        self.assertRegex(out, r"sub/pnpm-lock\.yaml\s+generated lock file\s+CloudflareApiToken 2e85\.\.\.ee \(line 6, 40 chars, in \"tarball\"\)")
         # --yes --quarantine moves those two; the lock files whose matches were set aside stay
         code, out, err = run_script(self.tree.root, ["--yes", "--quarantine"])
         self.assertEqual(code, 0, out + err)
@@ -1074,15 +1074,15 @@ class EndToEndTests(unittest.TestCase):
         code, out, err = run_script(self.tree.root, ["--dry-run"])
         self.assertEqual(code, 0, out + err)
         self.assertIn("Set aside 9 finding(s) that are package integrity hashes (sha512-..., h1:..., sha256:...) or"
-                      " commit ids and checksums that a lock file or manifest vouches for", out)
+                      " commit ids, checksums and package names that a lock file or manifest vouches for", out)
         for name in ("deploy.yml", ".pre-commit-config.yaml", "requirements.txt", "Cargo.toml", "main.tf", "CHANGELOG.md"):
             self.assertNotIn(name, out)
         # the token in the same file is still listed, and is the only row for it
         self.assertRegex(out, r"CloudflareApiToken\s+\S+\s+cfT0\.\.\.\S\S\s+package\.json:\d+\s+move to \.env")
         self.assertEqual(len(re.findall(r"package\.json:\d+", out)), 1)
         log = read_file(re.search(r"^Log: (.*)$", out, re.M).group(1).strip())
-        self.assertIn("set aside, a commit id or checksum the file vouches for: package.json line 3 (CloudflareApiToken)", log)
-        self.assertIn("set aside, a commit id or checksum the file vouches for: Cargo.toml line 2 (CloudflareApiToken)", log)
+        self.assertIn("set aside, a commit id, checksum or package name the file vouches for: package.json line 3 (CloudflareApiToken)", log)
+        self.assertIn("set aside, a commit id, checksum or package name the file vouches for: Cargo.toml line 2 (CloudflareApiToken)", log)
         for sha in shas:
             self.assertNotIn(sha, log)
         # a real run moves the token and leaves every pin as it was
@@ -1152,6 +1152,47 @@ class EndToEndTests(unittest.TestCase):
         code, out, err = run_script(self.tree.root, ["--restore", "deploy/id_ed25519"])
         self.assertEqual(code, 0, out + err)
         self.assertEqual(self.tree.read("deploy/id_ed25519"), bare)
+        self.assertNoLeftovers()
+
+    def test_package_names_in_registry_urls_are_not_secrets(self):
+        # measured: TruffleHog releases before the fix for its issue 1517 report "-explode-assignable-expression-7",
+        # a 32-character run of @babel/helper-explode-assignable-expression's tarball URL, as a Signable token: the
+        # word "assignable" stands just before it. A run of a package archive's file name, or of the path segment
+        # that name repeats, is the package's name and version: public, whatever shape a detector saw in it.
+        url = ("https://registry.npmjs.org/@babel/helper-explode-assignable-expression/-/"
+               "helper-explode-assignable-expression-7.18.6.tgz")
+        sha1 = "2e85b818" + "17ebec4241b8f55ef1b62e4f150abcee"
+        self.tree.write("package-lock.json", json.dumps({"name": "demo", "lockfileVersion": 3, "packages": {
+            "node_modules/@babel/helper-explode-assignable-expression": {
+                "version": "7.18.6", "resolved": url, "integrity": integrity_hash("sha512", "x"), "dev": True}}},
+            indent=2).encode("utf-8"))
+        self.tree.write("yarn.lock", ('# yarn lockfile v1\n\n\n"@babel/helper-explode-assignable-expression@^7.18.6":\n'
+                                      '  version "7.18.6"\n  resolved "%s#%s"\n  integrity %s\n'
+                                      % (url, sha1, integrity_hash("sha512", "y"))).encode("utf-8"))
+        # a credential in a lock file stays one, and its row says where it sits and how long it is
+        self.tree.write("sub/package-lock.json", json.dumps({"name": "sub", "lockfileVersion": 3, "packages": {
+            "node_modules/cloudflare-sdk": {
+                "version": "1.0.0",
+                "resolved": "https://npm.example.com/cloudflare-sdk/-/cloudflare-sdk-1.0.0.tgz?token=%s" % sha1}}},
+            indent=2).encode("utf-8"))
+        code, out, err = run_script(self.tree.root, ["--dry-run"])
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("Set aside 2 finding(s) that are package integrity hashes (sha512-..., h1:..., sha256:...) or"
+                      " commit ids, checksums and package names that a lock file or manifest vouches for", out)
+        self.assertNotIn("yarn.lock", out)
+        self.assertNotRegex(out, r"\d\s+package-lock\.json\s+generated lock file")
+        self.assertRegex(out, r"sub/package-lock\.json\s+generated lock file\s+CloudflareApiToken 2e85\.\.\.ee"
+                              r" \(line 7, 40 chars, in \"resolved\"\)\s+move to \.secrets-quarantine/sub/package-lock\.json\.enc")
+        log = read_file(re.search(r"^Log: (.*)$", out, re.M).group(1).strip())
+        self.assertIn("set aside, a checksum, commit id or package name in a lock file: package-lock.json line 7 (Signable)", log)
+        self.assertIn("set aside, a checksum, commit id or package name in a lock file: yarn.lock line 6 (Signable)", log)
+        self.assertNotIn("explode-assignable", log)
+        code, out, err = run_script(self.tree.root, ["--yes", "--quarantine"])
+        self.assertEqual(code, 0, out + err)
+        self.assertTrue(os.path.isfile(self.tree.path("package-lock.json")))
+        self.assertTrue(os.path.isfile(self.tree.path("yarn.lock")))
+        self.assertFalse(os.path.exists(self.tree.path("sub/package-lock.json")))
+        self.assertTrue(os.path.isfile(self.tree.path(".secrets-quarantine/sub/package-lock.json.enc")))
         self.assertNoLeftovers()
 
     def test_a_fresh_private_key_goes_to_the_os_store_when_dotenvx_can(self):
@@ -2559,6 +2600,50 @@ class UnitTests(unittest.TestCase):
                 self.assertIsNone(key(rel, content), rel)
         finally:
             shutil.rmtree(root, ignore_errors=True)
+
+    def test_inside_archive_name_and_finding_field(self):
+        line = (b'      "resolved": "https://registry.npmjs.org/@babel/helper-explode-assignable-expression/-/'
+                b'helper-explode-assignable-expression-7.18.6.tgz",')
+        run = b"-explode-assignable-expression-7"
+        last = line.rfind(run)
+        self.assertTrue(sas.inside_archive_name(line, last, last + len(run)))      # in the archive's file name
+        first = line.find(run)
+        self.assertTrue(sas.inside_archive_name(line, first, first + len(run)))    # in the segment that name repeats
+        token = b"abcdefghijklmnopqrstuvwxyz012345"
+        for text in (b'"resolved": "https://npm-proxy.fury.io/' + token + b'/org/pkg/-/pkg-1.0.0.tgz"',   # a segment of its own
+                     b'"resolved": "https://npm.example.com/x/-/x-1.0.0.tgz?token=' + token + b'"',       # in the query
+                     b'"resolved": "https://npm.example.com/' + token + b'/x-1.0.0.tgz"',                  # not repeated by the name
+                     b'"url": "https://example.com/api/' + token + b'"',                                   # no archive name
+                     b'"url": "https://example.com?token=/' + token + b'.zip"',                             # a slash in the query, no path
+                     b'"url": "https://example.com#/' + token + b'.tgz"',                                   # a slash in the fragment
+                     b'"key": "' + token + b'"'):                                                           # no URL at all
+            pos = text.find(token)
+            self.assertFalse(sas.inside_archive_name(text, pos, pos + len(token)), text)
+        finding = sas.Finding("x", 1, "Signable", run.decode("ascii"), "", False, "PLAIN", {})
+        self.assertTrue(sas.lockfile_identifier(finding, line + b"\n"))
+        self.assertTrue(sas.pinned_identifier(finding, line + b"\n"))
+        self.assertEqual(sas.finding_field(line + b"\n", finding), "resolved")
+
+        def plain(raw):
+            return sas.Finding("x", 1, "D", raw, "", False, "PLAIN", {})
+        self.assertEqual(sas.finding_field(b'  resolved "https://x/-/x-1.0.0.tgz#abc"\n', plain("x-1.0.0")), "resolved")
+        self.assertEqual(sas.finding_field(b"TOKEN=abc\n", plain("abc")), "TOKEN")
+        self.assertEqual(sas.finding_field(b"  api_key: abc\n", plain("abc")), "api_key")
+        self.assertEqual(sas.finding_field(b"    resolution: {tarball: https://npm.example.com/x.tgz?token=abc}\n", plain("abc")), "tarball")
+        self.assertEqual(sas.finding_field(b'{"a": 1, "secret_sha": "abc"}\n', plain("abc")), "secret_sha")
+        self.assertIsNone(sas.finding_field(b"just abc here\n", plain("abc")))
+        self.assertIsNone(sas.finding_field(b"nothing\n", plain("abc")))
+        # a field name that is itself a reported secret, or is suspiciously long, is masked in the listing and the log
+        data = ('{"%s": "%s", "long%s": "%s"}\n' % (GITHUB_TOKEN, STRIPE_KEY, "x" * 60, STRIPE_KEY_2)).encode("utf-8")
+        findings = [sas.Finding("x", 1, "Github", GITHUB_TOKEN, "", False, "PLAIN", {}),
+                    sas.Finding("x", 1, "Stripe", STRIPE_KEY, "", False, "PLAIN", {}),
+                    sas.Finding("x", 1, "Stripe", STRIPE_KEY_2, "", False, "PLAIN", {})]
+        shown = sas.secrets_text(findings, lines=True, data=data)
+        self.assertNotIn(GITHUB_TOKEN, shown)
+        self.assertNotIn(STRIPE_KEY, shown)
+        self.assertIn('in "%s"' % sas.mask(GITHUB_TOKEN), shown)          # the Stripe key sits under the token
+        self.assertIn('in "%s"' % sas.mask("long" + "x" * 60), shown)      # the long name is cut as well
+        self.assertNotIn("xxxxxxxxxx", shown)
 
     def test_inside_integrity_hash(self):
         aws = sas.Finding("x", 1, "AWS", AWS_ID, "", False, "PLAIN", {})

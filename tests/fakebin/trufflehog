@@ -47,6 +47,10 @@ DETECTORS = [
     # next to package names (measured: every real release from 3.0 to 3.99 does this).
     ("SentryToken", re.compile(r"(?i)sentry(?:.|\n){0,40}?\b([a-f0-9]{64})\b"), {}),
     ("CloudflareApiToken", re.compile(r"(?i)cloudflare(?:.|\n){0,40}?\b([A-Za-z0-9_-]{40})\b"), {}),
+    # An older TruffleHog's Signable detector: a 32-character run after the word "signable", which the word
+    # "assignable" also contains, so @babel/helper-explode-assignable-expression's tarball URL trips it
+    # (current releases skip that package by name: TruffleHog issue 1517).
+    ("Signable", re.compile(r"(?i)signable(?:.|\n){0,40}?\b([a-zA-Z-0-9]{32})\b"), {}),
 ]
 AWS_ID = re.compile(r"\bAKIA[0-9A-Z]{16}\b")
 AWS_SECRET = re.compile(r"(?<![A-Za-z0-9/+=])[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])")
