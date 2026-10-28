@@ -993,7 +993,10 @@ class EndToEndTests(unittest.TestCase):
             self.assertNotIn("libplanted", out)
             code, out, err = run_script(tree.root, ["--dry-run", "--scan-compiled"], extra_env={"FAKE_TRUFFLEHOG_VINTAGE": "3.12"})
             self.assertEqual(code, 0, out + err)
-            self.assertIn("Findings in compiled code: 5 in 3 file(s)", out)
+            # the .pyc's token spells abcde..., a placeholder to TruffleHog's own filter, which a release this old ran only
+            # while verifying: held to that filter, the finding is set aside and the .pyc drops out of the list
+            self.assertIn("Findings in compiled code: 4 in 2 file(s)", out)
+            self.assertIn("Set aside 1 finding(s) that TruffleHog's current detectors would not report: a placeholder term", out)
             self.assertNotIn("skips compiled files itself", out)   # 3.12 still reads them: no such note
         finally:
             tree.cleanup()
@@ -1195,6 +1198,51 @@ class EndToEndTests(unittest.TestCase):
         self.assertFalse(os.path.exists(self.tree.path("sub/package-lock.json")))
         self.assertTrue(os.path.isfile(self.tree.path(".secrets-quarantine/sub/package-lock.json.enc")))
         self.assertNoLeftovers()
+
+    def test_an_old_release_without_trufflehogs_own_filter_is_held_to_it(self):
+        # measured with TruffleHog 3.55.1 and --no-verification: a camelCase constant and a placeholder near the
+        # word "cloudflare" are both reported as Cloudflare tokens (the release ran its own false-positive filter
+        # only while verifying), and it still has the Etsy detector that later releases removed (any
+        # 24-character run near the word "etsy"). 3.75 and later report none of them. A tree of its own: the
+        # fixture's GitHub token spells abcde..., which that filter drops too.
+        token = "Qm7xP2vL9kR4tZ8wN3yH6bJ1cF5gD0sA7eU2iO4p"
+        tree = ProjectTree({})
+        try:
+            shutil.rmtree(tree.path("build"))
+            tree.write("src/shop.ts", b"// etsy shop integration\nexport const createShopListingsEditor = (shop: Shop) => new Editor(shop);\n")
+            tree.write("src/worker.ts", b"// cloudflare worker\nconst createWorkerRequestContextHandlerFactory = 1;\n")
+            tree.write("docs/snippet.md", b"cloudflare token: exampleexampleexampleexampleexampleexamp\n")
+            tree.write("config/cf.yml", ("cloudflare_api_token: %s\n" % token).encode("utf-8"))
+            old = {"FAKE_TRUFFLEHOG_VINTAGE": "3.55"}
+            code, out, err = run_script(tree.root, ["--dry-run"], extra_env=old)
+            self.assertEqual(code, 0, out + err)
+            self.assertIn("Set aside 3 finding(s) that TruffleHog's current detectors would not report:", out)
+            self.assertIn("TruffleHog removed its Etsy detector after 3.63 (any 24-character run near the word etsy was a key to it)", out)
+            self.assertIn("a placeholder term (example, sample, abcde, ...) that TruffleHog's own filter drops; this release ran that"
+                          " filter only while verifying", out)
+            self.assertIn("an identifier (words joined camelCase or with - and _), not a key; TruffleHog's own word filter drops such"
+                          " matches since 3.75 whatever the flags, this release ran that filter only while verifying", out)
+            for name in ("shop.ts", "worker.ts", "snippet.md"):
+                self.assertNotIn(name, out)
+            self.assertRegex(out, r"CloudflareApiToken\s+CLOUDFLARE_API_TOKEN\s+Qm7x\.\.\.4p\s+config/cf\.yml:1\s+move to \.env")
+            log = read_file(re.search(r"^Log: (.*)$", out, re.M).group(1).strip())
+            self.assertRegex(log, r"set aside, not what the current TruffleHog reports \(TruffleHog removed its Etsy detector[^\n]*:"
+                                  r" src[/\\]shop\.ts line 2 \(EtsyApiKey\)")
+            self.assertRegex(log, r"set aside, not what the current TruffleHog reports \(an identifier[^\n]*: src[/\\]worker\.ts line 2"
+                                  r" \(CloudflareApiToken\)")
+            self.assertRegex(log, r"set aside, not what the current TruffleHog reports \(a placeholder term[^\n]*: docs[/\\]snippet\.md"
+                                  r" line 1 \(CloudflareApiToken\)")
+            for value in ("createShopListingsEditor", "createWorkerRequestContextHandlerFactory", "exampleexampleexample", token):
+                self.assertNotIn(value, log)
+            code, out, err = run_script(tree.root, ["--yes"], extra_env=old)
+            self.assertEqual(code, 0, out + err)
+            self.assertEqual(tree.read("config/cf.yml"), "cloudflare_api_token: ${CLOUDFLARE_API_TOKEN}\n")
+            self.assertIn("createShopListingsEditor", tree.read("src/shop.ts"))
+            self.assertIn("createWorkerRequestContextHandlerFactory", tree.read("src/worker.ts"))
+            self.assertIn("exampleexampleexampleexampleexampleexamp", tree.read("docs/snippet.md"))
+            self.assertEqual(tree.leftovers(), [])
+        finally:
+            shutil.rmtree(tree.root, ignore_errors=True)
 
     def test_an_old_releases_loose_patterns_are_held_to_the_current_ones(self):
         # measured: TruffleHog 3.5x reports any 20-character run within 40 characters of the letters "pd" as a
@@ -2687,6 +2735,48 @@ class UnitTests(unittest.TestCase):
         self.assertIn('in "%s"' % sas.mask(GITHUB_TOKEN), shown)          # the Stripe key sits under the token
         self.assertIn('in "%s"' % sas.mask("long" + "x" * 60), shown)      # the long name is cut as well
         self.assertNotIn("xxxxxxxxxx", shown)
+
+    def test_an_old_releases_findings_are_held_to_trufflehogs_own_filter(self):
+        def finding(detector, raw, verified=False):
+            return sas.Finding("x", 1, detector, raw, "", verified, "PLAIN", {})
+
+        # identifiers: common words joined camelCase, snake_case, kebab-case or dotted; acronyms, stubs and a word
+        # the list lacks are allowed as long as the words make up half the letters
+        for text in ("createShopListingsEditor", "createWorkerRequestContextHandlerFactory", "pager-item-active-xy",
+                     "CREATE_SHOP_LISTING_EDITOR", "config.editor.active", "parseXMLDocumentHandler",
+                     "HTMLParserFactoryBuilder", "create-listing-navigator-sm", "MAX_PAGE_SIZE_LIMIT",
+                     "createShopFoozleEditor", "handlersCreatedByFactories"):
+            self.assertTrue(sas.identifier_shaped(text), text)
+        # keys and other runs: digits, pieces that are not words (Codex, PR 15: a random letters-only Stripe key whose
+        # pieces all carry a vowel), one piece, too many stubs or acronyms
+        for text in ("Qm7xP2vL9kR4tZ8wN3yH6bJ1cF5gD0sA7eU2iO4p", "KqZxVbNmPqWrTyPlKjHgFdSa", "AbcdEfghIjklMnopQrstUvwxYz",
+                     "sk_live_" + "SVYogDqigrah" + "KipySigxexao", "KipyDqigrahSigxexaoYogLive", "sk_live_" + "ShopEditor" + "Qxzvbnmkpqwrtlzy",
+                     "kqzxvbnmpqwrtyplkjhgfdsa", "a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5", "u+AbCdEfGhIjKlMnOpQr",
+                     "createShop2Editor", "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij", "ABCD-EFGH-IJKL-MNOP-QRST",
+                     "my_shop_id", "xy", "", "https://user:pw@shop-listing-editor.test/db"):
+            self.assertFalse(sas.identifier_shaped(text), text)
+        for piece, is_word in (("handlers", True), ("Listings", True), ("created", True), ("CREATE", True), ("factories", True),
+                               ("Sigxexao", False), ("yog", False), ("ab", False)):
+            self.assertEqual(sas.dictionary_word(piece), is_word, piece)
+        old, new = (3, 55, 1), (3, 99, 3)
+        ident = "createWorkerRequestContextHandlerFactory"
+        self.assertIn("an identifier", sas.current_pattern_rejects(finding("CloudflareApiToken", ident), None, old))
+        self.assertIsNone(sas.current_pattern_rejects(finding("CloudflareApiToken", ident), None, new))    # filtered by TruffleHog itself
+        self.assertIsNone(sas.current_pattern_rejects(finding("CloudflareApiToken", ident), None, None))   # version unknown: nothing assumed
+        self.assertIsNone(sas.current_pattern_rejects(finding("CloudflareApiToken", ident, True), None, old))   # verified: live
+        self.assertIsNone(sas.current_pattern_rejects(finding("CloudflareApiToken", "Qm7xP2vL9kR4tZ8wN3yH6bJ1cF5gD0sA7eU2iO4p"), None, old))
+        self.assertIn("a placeholder term", sas.current_pattern_rejects(finding("CloudflareApiToken", "exampleexampleexampleexampleexampleexamp"), None, old))
+        self.assertIn("a placeholder term", sas.current_pattern_rejects(finding("Github", "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij"), None, old))   # abcde
+        self.assertIsNone(sas.current_pattern_rejects(finding("Github", "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij"), None, new))
+        # the detectors whose current versions never drop a finding are left alone, whatever the text holds
+        for detector, raw in (("URI", "https://user:pw@example.com/db"), ("JDBC", "jdbc:mysql://example.com/db?password=sample"),
+                              ("PrivateKey", "-----BEGIN EXAMPLE PRIVATE KEY-----"), ("GCP", '{"type": "service_account", "project_id": "example"}'),
+                              ("SlackWebhook", "https://hooks.slack.com/services/T/B/example")):
+            self.assertIsNone(sas.current_pattern_rejects(finding(detector, raw), None, old), detector)
+        # retired detectors: nothing the current TruffleHog reports, whatever the release
+        self.assertIn("removed its Etsy detector", sas.current_pattern_rejects(finding("EtsyApiKey", "Qm7xP2vL9kR4tZ8wN3yH6bJ1"), None, old))
+        self.assertIn("removed its Etsy detector", sas.current_pattern_rejects(finding("EtsyApiKey", "createShopListingsEditor"), None, None))
+        self.assertIsNone(sas.current_pattern_rejects(finding("EtsyApiKey", "Qm7xP2vL9kR4tZ8wN3yH6bJ1", True), None, old))   # verified: live
 
     def test_current_patterns_and_base64_blobs(self):
         def finding(detector, raw):

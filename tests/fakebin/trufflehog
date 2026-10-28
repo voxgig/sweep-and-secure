@@ -55,6 +55,8 @@ DETECTORS = [
     # (pd- and pd_ here, so that the fixture's own texts stay quiet); 3.60 and later want u+ and 18 characters.
     ("PagerDutyApiKey", re.compile(r"(?i)(?:pagerduty|pd[-_])(?:.|\n){0,40}?\b([a-zA-Z0-9_+-]{20})\b"), {}),
 ]
+# TruffleHog's Etsy detector, retired after 3.63: any 24-character run within 40 characters of the word "etsy".
+ETSY = ("EtsyApiKey", re.compile(r"(?i)etsy(?:.|\n){0,40}?\b([a-zA-Z-0-9]{24})\b"), {})
 AWS_ID = re.compile(r"\bAKIA[0-9A-Z]{16}\b")
 AWS_SECRET = re.compile(r"(?<![A-Za-z0-9/+=])[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])")
 
@@ -102,7 +104,8 @@ def scan_file(path, log_level=0):
         decoder = "UTF16"
     else:
         text = data.decode("utf-8", "replace")
-    for detector, pattern, extra in DETECTORS:
+    detectors = DETECTORS + ([ETSY] if VINTAGE and VINTAGE < (3, 64) else [])
+    for detector, pattern, extra in detectors:
         for match in pattern.finditer(text):
             group = 1 if match.lastindex else 0   # keyword detectors report the run after the keyword
             raw = match.group(group)
