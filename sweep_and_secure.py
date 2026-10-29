@@ -33,6 +33,7 @@ import argparse
 import base64
 import binascii
 import bz2
+import getpass
 import gzip
 import hashlib
 import io
@@ -60,7 +61,7 @@ try:
 except ImportError:  # pragma: no cover - Python 2 without the backport
     lzma = None
 
-__version__ = "1.6.3"
+__version__ = "1.7.0"
 
 # --------------------------------------------------------------------------
 # Python 2 / 3 compatibility
@@ -103,6 +104,7 @@ def fs_text(path):
 
 
 RUN_LOG = None   # this run's RunLog once main() has opened it; say() copies every line into it
+RUN_RECORD = None   # this run's RunRecord: every line said or logged, written out when the run changed files
 ANSI_RE = re.compile(u"\x1b\\[[0-9;]*m")
 
 
@@ -134,10 +136,97 @@ class RunLog(object):
             pass
 
 
+class RunRecord(object):
+    """What a run that changes files leaves behind for later: one Markdown file in the user's run-record
+    folder (default_record_dir) saying what was changed, where the keys are, how to use them and what to do
+    when something is wrong, followed by the complete output of the run: everything printed, the prompts and
+    answers, the tool commands and their diagnostics, the exit code. The run log is pruned after LOG_KEEP
+    runs; a record is kept until its owner removes it, so that the person or the agent who comes back to the
+    project months later finds the run that set it up. Secret values never go in: like the log it holds masked
+    previews only. Lines are collected from the first one; the file is written by cli() once the exit code is
+    known, and only when wrap_up() or a restore armed it, which dry runs and runs that changed nothing never do."""
+
+    EXIT_MEANINGS = {0: u"done", 1: u"something failed or the scan was incomplete (see the output)",
+                     2: u"no confirmation, nothing was changed", 130: u"interrupted"}
+
+    def __init__(self, folder, root, enabled):
+        self.folder = folder
+        self.root = root
+        self.enabled = enabled
+        self.started = time.gmtime()
+        self.lines = []        # (stamp, prefix, text), as the run log gets them
+        self.sections = None   # the structured part, as Markdown lines, once armed
+        self.path = None
+        self.tools = {}
+        self.log_path = None
+
+    def add(self, text, prefix=u""):
+        stamp = time.strftime("%H:%M:%S")
+        for line in to_text(text).split(u"\n"):
+            self.lines.append((stamp, prefix, ANSI_RE.sub(u"", line)))
+
+    def arm(self, sections):
+        """Name the file and keep the structured part; the path, or None when records are off."""
+        if not self.enabled:
+            return None
+        stamp = time.strftime("%Y-%m-%dT%H-%M-%SZ", self.started)
+        label = re.sub(u"[^A-Za-z0-9_.-]+", u"_", os.path.basename(self.root) or u"root")[:40]
+        self.path = os.path.join(self.folder, u"%s-%s-%d.md" % (stamp, label, os.getpid()))
+        self.sections = sections
+        return self.path
+
+    def text(self, code):
+        try:
+            user = getpass.getuser()
+        except Exception:   # no account name to be had (some containers)
+            user = u"?"
+        rows = [
+            (u"Tool", u"sweep-and-secure %s" % __version__),
+            (u"When", time.strftime("%Y-%m-%d %H:%M:%S UTC", self.started)),
+            (u"Folder", u"`%s`" % self.root),
+            (u"Command", u"`%s`" % u" ".join([prog_name()] + [fs_text(a) for a in sys.argv[1:]])),
+            (u"Machine", u"%s, %s, user %s" % (platform.node() or u"?", platform.platform(), to_text(user))),
+        ]
+        for name, info in self.tools.items():
+            rows.append((name, u"%s  `%s`" % ((info.get("text") or u"version unknown").strip(), info.get("path") or u"?")))
+        rows.append((u"Exit code", u"%s: %s" % (code, self.EXIT_MEANINGS.get(code, u"see the output"))))
+        rows.append((u"Run log", (u"`%s` (one of the newest %d logs kept; this record is kept)" % (self.log_path, LOG_KEEP))
+                     if self.log_path else u"none (--no-log)"))
+        out = [u"# sweep-and-secure run record", u"",
+               u"A run of sweep-and-secure that changed files, kept so that whoever comes back to this project, a person",
+               u"or an agent, can see what was changed, where the keys are and how to use them. It holds no secret",
+               u"values: masked previews only, like the run log.", u"",
+               u"| | |", u"| --- | --- |"]
+        out.extend(u"| %s | %s |" % (name, value) for name, value in rows)
+        out.append(u"")
+        out.extend(self.sections or [])
+        out.extend([u"", u"## Full output of the run", u"",
+                    u"Every line the run printed (`!` marks the error stream), the prompts and answers, and the commands",
+                    u"it ran (`|`), as in the run log.", u"", u"~~~~"])
+        out.extend(u"%s %s%s" % (stamp, prefix, line) for stamp, prefix, line in self.lines)
+        out.extend([u"~~~~", u""])
+        return u"\n".join(out)
+
+    def write(self, code):
+        """Write the record if armed: (path or None, problem text)."""
+        if self.path is None:
+            return None, u""
+        try:
+            if not os.path.isdir(self.folder):
+                os.makedirs(self.folder)
+            with io.open(self.path, "w", encoding="utf-8") as fh:
+                fh.write(self.text(code))
+            return self.path, u""
+        except (IOError, OSError, ValueError) as exc:
+            return None, u"%s (%s)" % (self.path, to_text(str(exc)))
+
+
 def log_only(text):
     """A line for the run log alone (commands, diagnostics), not for the screen."""
     if RUN_LOG is not None:
         RUN_LOG.write(text, u"| ")
+    if RUN_RECORD is not None:
+        RUN_RECORD.add(text, u"| ")
 
 
 def default_log_dir():
@@ -154,6 +243,22 @@ def default_log_dir():
         return os.path.join(home, "Library", "Logs", "sweep-and-secure")
     base = fs_text(os.environ.get("XDG_STATE_HOME") or os.path.join(home, ".local", "state"))
     return os.path.join(base, "sweep-and-secure", "logs")
+
+
+def default_record_dir():
+    """Where the records of runs that changed files go unless --record-dir or SWEEP_AND_SECURE_RECORD_DIR
+    says otherwise: the user's state folder (Application Support on macOS), one place per machine."""
+    chosen = os.environ.get("SWEEP_AND_SECURE_RECORD_DIR")
+    if chosen:
+        return fs_text(chosen)
+    home = fs_text(os.path.expanduser("~"))
+    if os.name == "nt":
+        base = fs_text(os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local"))
+        return os.path.join(base, "sweep-and-secure", "runs")
+    if sys.platform == "darwin":
+        return os.path.join(home, "Library", "Application Support", "sweep-and-secure", "runs")
+    base = fs_text(os.environ.get("XDG_STATE_HOME") or os.path.join(home, ".local", "state"))
+    return os.path.join(base, "sweep-and-secure", "runs")
 
 
 def open_run_log(args, root):
@@ -189,6 +294,9 @@ def say(text=u"", stream=None, log_text=None):
     if RUN_LOG is not None:
         RUN_LOG.write(text if log_text is None else log_text,
                       u"" if (stream is None or stream is sys.stdout) else u"! ")
+    if RUN_RECORD is not None:
+        RUN_RECORD.add(text if log_text is None else log_text,
+                       u"" if (stream is None or stream is sys.stdout) else u"! ")
     stream = stream or sys.stdout
     if stream is None:
         return
@@ -3675,6 +3783,12 @@ def restore_from_quarantine(args, root, store, dotenvx, style):
         say(u"  %s restored, but the quarantine records could not be updated: %s" % (style.warn("[--]"), to_text(str(exc))))
     say(u"  %s restored %s from %s%s" % (style.ok("[ok]"), record["original"], record["quarantined"],
                                          u" (decrypted)" if record.get("encrypted") else u""))
+    arm_run_record([u"## What changed", u"",
+                    u"- `%s` was put back from the quarantine (`%s`)%s; the quarantine's records note the restore."
+                    % (record["original"], record["quarantined"], u", decrypted" if record.get("encrypted") else u""),
+                    u"", u"## If something is wrong", u"",
+                    u"- The file came back as recorded (its checksum was checked). The secrets in it are plaintext again:"
+                    u" run sweep-and-secure once more to quarantine it, or rotate them."], style)
     return 0
 
 
@@ -4825,6 +4939,142 @@ def print_next_steps(plan, chosen, keys_files, args, style):
     print_dotenvx_primer(plan, chosen, keys_files, args, style)
 
 
+def dotenvx_commands(plan, chosen, env_touched, key_env, args):
+    """The commands a user needs from here on, as (command, what) rows: dotenvx run, get, set and keypair for
+    the app's env file (the first touched; .env when none was), native up when the key still sits in a file
+    the OS store could hold, and this tool's --restore when the quarantine holds encrypted files."""
+    def file_flag(path):
+        rel = plan.rel(path)
+        return u"" if rel == u".env" else u" -f %s" % rel
+
+    app_flag = file_flag(env_touched[0]) if env_touched else u""
+    key_flag = file_flag(key_env) if key_env else u""
+    rows = [
+        (u"dotenvx run%s -- <your command>" % app_flag, u"runs a program with the decrypted values in its environment"),
+        (u"dotenvx get%s KEY" % app_flag, u"prints one decrypted value; without KEY, all of them"),
+        (u"dotenvx set%s KEY \"value\"" % app_flag,
+         u"adds or changes a value, encrypted on the way in: the file never holds plaintext"),
+        (u"dotenvx keypair%s%s" % (key_flag, u" DOTENV_PRIVATE_KEY" if not key_flag else u""),
+         u"prints the %s, to give another machine or CI as the DOTENV_PRIVATE_KEY variable"
+         % (u"private key" if not key_flag else u"key pair")),
+    ]
+    store = native_store_name()
+    key_in_file = key_env is not None and plan.custody.get(key_env, (None,))[0] == "file"
+    if key_in_file and store and dotenvx_version() >= DOTENVX_NATIVE_SINCE and not getattr(args, "no_native", False):
+        rows.append((u"dotenvx native up%s" % key_flag,
+                     u"moves the private key from .env.keys into the %s, so that nothing is left on disk" % store))
+    if plan.quarantine and plan.quarantine_crypto and (plan.quarantine_upgraded or any(
+            item.kind == "quarantine" and item.status == "done" for item in chosen)):
+        rows.append((u"%s --restore <stored name>" % prog_name(),
+                     u"puts a quarantined file back, decrypted (its passphrase is in %s/%s)"
+                     % (plan.rel(plan.quarantine), QUARANTINE_KEYS_ENV)))
+    return rows
+
+
+def record_sections(plan, chosen, journal, keys_files, args, failed, error):
+    """The structured part of the run record: what changed, where the keys are, how to use them and what to
+    do when something is wrong. Key names, paths and masked previews only, never a value."""
+    rel = plan.rel
+    lines = [u"## What changed", u""]
+    if error is not None:
+        lines.append(u"- The run stopped early (%s). The state of the tree is in the output below." % error)
+    by_store = OrderedDict()
+    for item in chosen:
+        if item.status not in ("done", "stored"):
+            continue
+        if item.kind == "env":
+            by_store.setdefault(item.path, []).append(u"`%s`: encrypted in place" % item.key)
+        elif item.kind == "source":
+            where = u"`%s` line %s (%s)" % (rel(item.path), item.line, item.detector)
+            if item.status == "done" and not args.no_rewrite:
+                entry = u"`%s`: moved here from %s, where `%s` now stands" % (item.key, where, args.placeholder.replace("NAME", item.key))
+            else:
+                entry = u"`%s`: stored here from %s, which was left as it was%s" % (item.key, where, u" (--no-rewrite)" if args.no_rewrite else u"")
+            by_store.setdefault(item.store, []).append(entry)
+    for store, entries in by_store.items():
+        lines.append(u"- Env file `%s`, encrypted by dotenvx:" % rel(store))
+        lines.extend(u"  - %s" % entry for entry in entries)
+    for kind, path, detail in journal.events:
+        if kind == "quarantine":
+            how = (u"AES-256 encrypted; its passphrase is in `%s/%s`, encrypted by dotenvx" % (rel(plan.quarantine), QUARANTINE_KEYS_ENV)
+                   if plan.quarantine_crypto else u"as it is: %s" % (plan.quarantine_plain_reason or u"not encrypted"))
+            lines.append(u"- `%s` moved to `%s` (%s)" % (rel(path), rel(detail) if detail else u"?", how))
+    if plan.quarantine_upgraded:
+        lines.append(u"- %d file(s) already in `%s` were encrypted in place" % (len(plan.quarantine_upgraded), rel(plan.quarantine)))
+    key_files_said = set()
+    for env_path, (kind, where, note) in plan.custody.items():
+        if kind == "native":
+            lines.append(u"- Private key of `%s`: %s the %s, kept by dotenvx (nothing on disk)"
+                         % (rel(env_path), (note + u" into") if note.startswith(u"moved") else u"in", where))
+        elif kind == "file":
+            key_files_said.add(os.path.realpath(where))
+            lines.append(u"- Private key of `%s`: in `%s`. Never commit it; share it through a password manager or a CI"
+                         u" secret (DOTENV_PRIVATE_KEY)" % (rel(env_path), rel(where)))
+        elif kind == "existing":
+            lines.append(u"- `%s` already had its dotenvx key pair; its private key stays where it was" % rel(env_path))
+    for keys_file in keys_files:
+        if os.path.realpath(keys_file) not in key_files_said:
+            lines.append(u"- Private key file in place: `%s` (never commit it)" % rel(keys_file))
+    for item in failed or []:
+        lines.append(u"- FAILED: `%s` %s: %s" % (rel(getattr(item, "path", u"?")), getattr(item, "key", None) or getattr(item, "detector", u""),
+                                                 getattr(item, "note", u"") or u"see the output"))
+    for entry in plan.unfixable.values():
+        if entry.item is None or entry.item.status != "done" or entry.item not in chosen:
+            detectors = u", ".join(sorted(set(f.detector for f in entry.findings))) or u"?"
+            lines.append(u"- Left in place, needs attention: `%s` (%s; %s)" % (rel(entry.path), entry.why, detectors))
+    for key in plan.key_files.values():
+        if key.entry is None or key.entry.item is None or key.entry.item.status != "done":
+            lines.append(u"- Private key file `%s`: %s" % (rel(key.path), passphrase_text(key)))
+    if len(lines) == 2:
+        lines.append(u"- Nothing was changed.")
+
+    env_touched = []
+    for item in chosen:
+        if item.status in ("done", "stored") and item.store and item.store not in env_touched:
+            env_touched.append(item.store)
+        if item.kind == "env" and item.status == "done" and item.path not in env_touched:
+            env_touched.append(item.path)
+    fresh = [path for path, (kind, _, _) in plan.custody.items() if kind in ("native", "file")]
+    key_env = fresh[0] if fresh else (env_touched[0] if env_touched else plan.store)
+    lines.extend([u"", u"## Using the keys from now on", u"",
+                  u"dotenvx is the tool in use, not sweep-and-secure. Run these in `%s`:" % plan.root, u""])
+    for command, what in dotenvx_commands(plan, chosen, env_touched, key_env, args):
+        lines.append(u"- `%s`: %s" % (command, what))
+    store = native_store_name()
+    lines.extend([u"", u"dotenvx looks for the private key in the DOTENV_PRIVATE_KEY* variables of the environment, then in"
+                  u" .env.keys next to the env file%s. Docs: https://dotenvx.com/docs" % (u", then in the %s on this machine" % store if store else u"")])
+    lines.extend([u"", u"## If something is wrong", u"",
+                  u"- A value does not decrypt: dotenvx has no private key for that env file. On this machine it is where the"
+                  u" lines above say; elsewhere it must arrive as the DOTENV_PRIVATE_KEY variable. `dotenvx keypair -f <env>`"
+                  u" shows which public key a file was encrypted to.",
+                  u"- The private key must go to another machine or to CI: `dotenvx keypair DOTENV_PRIVATE_KEY -f <env>` prints"
+                  u" it here. Give it as a secret, never commit it.",
+                  u"- A placeholder such as `${KEY}` sits where a program needs the value: run the program through"
+                  u" `dotenvx run -- <command>`, which puts the decrypted values in its environment.",
+                  u"- A quarantined file is needed: `%s --restore <stored name>` in `%s`; %s lists the stored"
+                  u" names and the openssl recipe." % (prog_name(), plan.root,
+                                                       u"`%s/%s`" % (rel(plan.quarantine), QUARANTINE_MANIFEST) if plan.quarantine
+                                                       else u"the quarantine's `%s`" % QUARANTINE_MANIFEST),
+                  u"- The secrets sat in plaintext before this run: treat them as exposed and rotate them; git history still holds"
+                  u" the old text.",
+                  u"- Running sweep-and-secure again is safe: stored values are recognised and reused, and a later run tightens"
+                  u" an earlier setup (a key still in .env.keys goes into the OS store where dotenvx can put it)."])
+    return lines
+
+
+def arm_run_record(sections, style):
+    """Arm this run's record with its structured part and say where it will be."""
+    if RUN_RECORD is None:
+        return
+    if RUN_LOG is not None:
+        RUN_RECORD.log_path = RUN_LOG.path
+    path = RUN_RECORD.arm(sections)
+    if path:
+        say(u"")
+        say(style.dim(u"Run record: %s" % path))
+        say(style.dim(u"  (what changed, where the keys are and how to use them, and this run's full output; kept until you remove it)"))
+
+
 def print_dotenvx_primer(plan, chosen, keys_files, args, style):
     """From here on dotenvx is the tool in use, so a run that set up a key pair for the first time
     ends with the few commands and rules a first-time user needs; a run that only added to files
@@ -4852,32 +5102,9 @@ def print_dotenvx_primer(plan, chosen, keys_files, args, style):
         say(u"  dotenvx itself, not this tool:")
     else:
         say(u"  decrypts them is in .env.keys next to each env file. Day to day you use dotenvx itself, not this tool:")
-    def file_flag(path):
-        rel = plan.rel(path)
-        return u"" if rel == u".env" else u" -f %s" % rel
-
-    app_flag = file_flag(env_touched[0]) if env_touched else u""   # the app's env file; .env when none was touched
     key_env = fresh[0]            # the file whose key pair is new: the store, or the quarantine's own .env
-    key_flag = file_flag(key_env)
-    rows = [
-        (u"dotenvx run%s -- <your command>" % app_flag, u"runs a program with the decrypted values in its environment"),
-        (u"dotenvx get%s KEY" % app_flag, u"prints one decrypted value; without KEY, all of them"),
-        (u"dotenvx set%s KEY \"value\"" % app_flag,
-         u"adds or changes a value, encrypted on the way in: the file never holds plaintext"),
-        (u"dotenvx keypair%s%s" % (key_flag, u" DOTENV_PRIVATE_KEY" if not key_flag else u""),
-         u"prints the %s, to give another machine or CI as the DOTENV_PRIVATE_KEY variable"
-         % (u"private key" if not key_flag else u"key pair")),
-    ]
+    rows = dotenvx_commands(plan, chosen, env_touched, key_env, args)
     store = native_store_name()
-    key_in_file = plan.custody.get(key_env, (None,))[0] == "file"
-    if key_in_file and store and dotenvx_version() >= DOTENVX_NATIVE_SINCE and not getattr(args, "no_native", False):
-        rows.append((u"dotenvx native up%s" % key_flag,
-                     u"moves the private key from .env.keys into the %s, so that nothing is left on disk" % store))
-    if plan.quarantine and plan.quarantine_crypto and (plan.quarantine_upgraded or any(
-            item.kind == "quarantine" and item.status == "done" for item in chosen)):
-        rows.append((u"%s --restore <stored name>" % prog_name(),
-                     u"puts a quarantined file back, decrypted (its passphrase is in %s/%s)"
-                     % (plan.rel(plan.quarantine), QUARANTINE_KEYS_ENV)))
     width = max(len(command) for command, _ in rows)
     for command, what in rows:
         say(u"    %-*s   %s" % (width, command, what))
@@ -4910,8 +5137,12 @@ def parse_args(argv):
             "            2 you said no or gave no answer (stdin not a terminal, nothing piped, no --yes), 130 interrupted\n"
             "\n"
             "A log of every run is kept in " + default_log_dir() + "\n"
-            "(--log-dir to change, --no-log to skip); it holds what was printed, the prompts and the tool\n"
-            "commands, never secret values.\n"
+            "(--log-dir to change, --no-log to skip; the newest 100 are kept); it holds what was printed, the\n"
+            "prompts and the tool commands, never secret values. A run that changes files also leaves a record in\n"
+            + default_record_dir() + "\n"
+            "(--record-dir, --no-record; kept until you remove it): what changed, where the keys are and how to\n"
+            "use them, what to do when something is wrong, and the run's full output. Scripts and agents: the\n"
+            "README's 'For agents and scripts' section lists the output lines worth reading and the exit codes.\n"
             "\n"
             "TruffleHog: https://trufflesecurity.com/trufflehog     dotenvx: https://dotenvx.com"),
     )
@@ -4968,6 +5199,10 @@ def parse_args(argv):
                         help="where this run's log goes (default: the user's state folder, see --help's notes; "
                              "SWEEP_AND_SECURE_LOG_DIR overrides it)")
     parser.add_argument("--no-log", action="store_true", help="do not write a run log")
+    parser.add_argument("--record-dir", metavar="DIR",
+                        help="where the record of a run that changes files goes (default: the user's state folder, see "
+                             "--help's notes; SWEEP_AND_SECURE_RECORD_DIR overrides it)")
+    parser.add_argument("--no-record", action="store_true", help="do not write a run record")
     parser.add_argument("-v", "--verbose", action="store_true", help="show the commands run and tool output")
     parser.add_argument("--no-color", action="store_true", help="plain output")
     parser.add_argument("--check-setup", action="store_true",
@@ -5080,6 +5315,7 @@ def wrap_up(plan, chosen, journal, root, git_root, args, style, failed, error, s
                 % (path, u", ".join(sorted(set(keys)))))
         if pending:
             say(u"  Run again to finish: stored values are recognised and reused, not duplicated.")
+        arm_run_record(record_sections(plan, chosen, journal, keys_files, args, failed, error), style)
         return
 
     stored = set((item.store, item.key) for item in chosen
@@ -5121,6 +5357,7 @@ def wrap_up(plan, chosen, journal, root, git_root, args, style, failed, error, s
     say(style.bold(summary))
     if any(item.status in ("done", "stored") for item in chosen) or moved_keys or plan.quarantine_upgraded:
         print_next_steps(plan, chosen, keys_files, args, style)
+    arm_run_record(record_sections(plan, chosen, journal, keys_files, args, failed, error), style)
 
 
 def main(argv=None):
@@ -5145,12 +5382,15 @@ def main(argv=None):
                       % store), sys.stderr)
         return 1
 
-    global RUN_LOG
+    global RUN_LOG, RUN_RECORD
     RUN_LOG, log_note = open_run_log(args, root)
+    RUN_RECORD = RunRecord(fs_text(args.record_dir) if args.record_dir else default_record_dir(), root, not args.no_record)
+    header = (u"sweep-and-secure %s | %s | python %s | %s | cwd %s | args %s"
+              % (__version__, time.strftime("%Y-%m-%d %H:%M:%S %Z"), platform.python_version(),
+                 platform.platform(), fs_text(os.getcwd()), u" ".join(fs_text(a) for a in sys.argv[1:])))
     if RUN_LOG is not None:
-        RUN_LOG.write(u"sweep-and-secure %s | %s | python %s | %s | cwd %s | args %s"
-                      % (__version__, time.strftime("%Y-%m-%d %H:%M:%S %Z"), platform.python_version(),
-                         platform.platform(), fs_text(os.getcwd()), u" ".join(fs_text(a) for a in sys.argv[1:])), u"| ")
+        RUN_LOG.write(header, u"| ")
+    RUN_RECORD.add(header, u"| ")
     say(style.bold(u"sweep-and-secure %s" % __version__) + style.dim(u"  (TruffleHog + dotenvx)"))
     if RUN_LOG is not None:
         say(style.dim(u"Log: %s" % RUN_LOG.path))
@@ -5161,6 +5401,7 @@ def main(argv=None):
     say(u"Folder: %s" % root)
     if args.restore:
         tools = locate_tools(args, root, style, names=("dotenvx",))
+        RUN_RECORD.tools = tools
         return restore_from_quarantine(args, root, store, tools["dotenvx"]["path"], style)
     if args.dry_run:
         last = u"This is a dry run: nothing is changed."
@@ -5172,6 +5413,7 @@ def main(argv=None):
     say(style.warn(u"  source files and moves files to quarantine. The changes are deliberate and it cannot undo them;"))
     say(style.warn(u"  commit or back up first. %s" % last))
     tools = locate_tools(args, root, style)
+    RUN_RECORD.tools = tools
 
     # Archives holding secrets are offered for quarantine whenever the run asks before
     # acting; a --yes run (scripts, CI) moves them only when told to with --quarantine.
@@ -5311,7 +5553,7 @@ def main(argv=None):
 
 def cli(argv=None):
     """Entry point of the `sweep-and-secure` command: main()'s exit code, 130 on Ctrl-C."""
-    global RUN_LOG
+    global RUN_LOG, RUN_RECORD
     code = 1
     try:
         code = main(argv)
@@ -5321,6 +5563,12 @@ def cli(argv=None):
         code = 130
         return code
     finally:
+        if RUN_RECORD is not None:
+            RUN_RECORD.add(u"exit code %s" % code, u"| ")
+            _, problem = RUN_RECORD.write(code)
+            if problem:
+                say(u"[--] the run record could not be written: %s" % problem, sys.stderr)
+            RUN_RECORD = None
         if RUN_LOG is not None:
             RUN_LOG.write(u"exit code %s" % code, u"| ")
             RUN_LOG.close()

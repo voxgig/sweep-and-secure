@@ -23,6 +23,7 @@ says what it did, and running again finishes the job.
 - [What it does](#what-it-does)
 - [Install](#install)
 - [Examples](#examples)
+- [For agents and scripts](#for-agents-and-scripts)
 - [Reference](#reference): [options](#options), [exit codes](#exit-codes),
   [limitations](#limitations)
 - [Development](#development)
@@ -211,6 +212,23 @@ is `~/.local/state/sweep-and-secure/logs` on Linux (`$XDG_STATE_HOME` when set),
 logs are kept; other files in the folder are never touched. Each run prints
 `Log: <path>` as its second line.
 
+A run that changes files leaves a second file that is never pruned: a run
+record, in Markdown, so that whoever comes back to the project later, a person
+or an agent, can see what that run did and how to live with the result. It
+says what changed (which keys went into which env file, from where, what
+replaced them, which files moved to quarantine and how they are encrypted),
+where each private key is, the dotenvx commands that use the values from now
+on, what to do when something is wrong (a value that does not decrypt, a key
+needed on another machine, a quarantined file wanted back), and then the full
+output of the run as the log has it, prompts, answers and tool commands
+included, down to the exit code. Dry runs, declined runs and runs that found
+nothing to do leave none. The folder is `~/.local/state/sweep-and-secure/runs`
+on Linux, `~/Library/Application Support/sweep-and-secure/runs` on macOS and
+`%LOCALAPPDATA%\sweep-and-secure\runs` on Windows; `SWEEP_AND_SECURE_RECORD_DIR`
+or `--record-dir DIR` choose another, `--no-record` writes none. The run prints
+`Run record: <path>` as its last lines. Like the log, a record never holds a
+secret value.
+
 ### Built never to leave a file half-written
 
 Nothing is written to an env file until the result has been checked. The env
@@ -302,7 +320,7 @@ Without installing anything, straight from the repository:
 uvx --from git+https://github.com/voxgig/sweep-and-secure sweep-and-secure --dry-run
 ```
 
-To pin a release, append `@v1.6.3` to the git URL, or pass `-v v1.6.3` to the
+To pin a release, append `@v1.7.0` to the git URL, or pass `-v v1.7.0` to the
 installer. To upgrade, run the same command again (`pipx upgrade
 sweep-and-secure` or `uv tool upgrade sweep-and-secure` for those routes). The
 installer takes `-b DIR` for another folder (without `-b` it uses
@@ -396,7 +414,7 @@ everything.
 
 ```
 $ sweep-and-secure --check-setup
-sweep-and-secure 1.6.3  (TruffleHog + dotenvx)
+sweep-and-secure 1.7.0  (TruffleHog + dotenvx)
 Log: /home/me/.local/state/sweep-and-secure/logs/2026-10-23T16-38-58Z-shop-48213.log
 Python 3.13.16 (/usr/bin/python3) on Linux-6.8.0-x86_64-with-glibc2.39
   [ok] trufflehog  3.99.3     /usr/local/bin/trufflehog
@@ -442,7 +460,7 @@ audit.
 ```
 $ cd shop
 $ sweep-and-secure --dry-run
-sweep-and-secure 1.6.3  (TruffleHog + dotenvx)
+sweep-and-secure 1.7.0  (TruffleHog + dotenvx)
 Log: /home/me/.local/state/sweep-and-secure/logs/2026-10-23T16-39-04Z-shop-48213.log
 Folder: /home/me/shop
   Note: this is a security tool that changes files on purpose: it encrypts env files, rewrites
@@ -724,7 +742,7 @@ recognised and never stored twice.
 
 ```
 $ sweep-and-secure --dry-run
-sweep-and-secure 1.6.3  (TruffleHog + dotenvx)
+sweep-and-secure 1.7.0  (TruffleHog + dotenvx)
 Log: /home/me/.local/state/sweep-and-secure/logs/2026-10-23T16-39-20Z-shop-48213.log
 Folder: /home/me/shop
   Note: this is a security tool that changes files on purpose: it encrypts env files, rewrites
@@ -765,7 +783,7 @@ a file put back with its secret still inside is found again by the next run.
 
 ```
 $ sweep-and-secure --restore build/keys.zip
-sweep-and-secure 1.6.3  (TruffleHog + dotenvx)
+sweep-and-secure 1.7.0  (TruffleHog + dotenvx)
 Log: /home/me/.local/state/sweep-and-secure/logs/2026-10-23T16-39-24Z-shop-48213.log
 Folder: /home/me/shop
   [ok] dotenvx     2.38.2     /usr/local/bin/dotenvx
@@ -984,7 +1002,221 @@ sweep-and-secure again or use `dotenvx set`.
   sends them over the network): `--verify`; live ones are marked `*`.
 - Sweep a folder other than the current one: `sweep-and-secure path/to/project`.
 - See every command the script runs: `-v`. Keep the run's log somewhere else,
-  or not at all: `--log-dir DIR`, `--no-log`.
+  or not at all: `--log-dir DIR`, `--no-log`. The same for the record of a run
+  that changed files: `--record-dir DIR`, `--no-record`.
+
+## For agents and scripts
+
+This section is for whoever runs the tool without a person at the keyboard: a
+shell script, a CI job, or an AI agent working in a repository on someone's
+behalf. The tool asks nothing when `--yes` or `--dry-run` is given, prints a few
+stable lines a caller can read, exits with a meaningful code, and leaves a
+record of every run that changed files. [What it does](#what-it-does) gives the
+model; this is the operating manual.
+
+### The sequence
+
+1. **Check the setup**: `sweep-and-secure --check-setup`. Exit 0 means Python,
+   TruffleHog and dotenvx are in place and a trial run of both tools worked;
+   exit 1 names what is missing, with install links. Nothing is scanned.
+2. **Dry run**: `sweep-and-secure --dry-run PATH`. The report lists every
+   plaintext secret with its file, line, detector and a masked preview, the
+   action a real run would take, and the files that cannot be fixed in place.
+   Nothing is changed. Exit 0, or 1 when the TruffleHog scan was cut short.
+3. **Decide** whether the files that cannot be fixed in place (archives, lock
+   files, example env files, SSH keys without a passphrase) should leave the
+   tree. With `--yes` they stay where they are unless `--quarantine` is given.
+4. **Run**: `sweep-and-secure --yes [--quarantine] PATH`. It encrypts, rewrites
+   and moves as the report said, prints what it did, and ends with
+   `Run record: <path>`.
+5. **Read the run record**: what changed, where the private key is, the dotenvx
+   commands that use the values, and what to do when something is wrong. Keep
+   the path with the task's notes; the file stays until its owner removes it.
+6. **From then on, dotenvx**: `dotenvx run -- <command>` runs a program with the
+   decrypted values in its environment. Do not print values; `dotenvx get KEY`
+   is for the one case where a value is really needed, and only when a human
+   asked for it.
+
+Run again any time: stored values are recognised and reused, not duplicated,
+and a later run tightens an earlier setup (a key still in `.env.keys` moves into
+the OS secret store where dotenvx can use it).
+
+### Lines worth reading
+
+Each of these is a line of its own with stable wording, in this order.
+
+| line | meaning |
+| --- | --- |
+| `Log: <path>` | this run's log, the second line of the output |
+| `[ok] trufflehog <version> <path>`, `[ok] dotenvx <version> <path>` | the tools in use; a `[!!]` line names a missing or unusable one |
+| `Scanned N file(s) in M:SS; TruffleHog reported K finding(s).` | the scan is over (an old TruffleHog prints `Scan took M:SS; ...`) |
+| `Plaintext secrets found: N in M file(s)` | the table of what is (or would be) encrypted follows |
+| `Files holding secrets that cannot be fixed in place: N` | the table of files to move to quarantine, or to leave in place, follows |
+| `Set aside N finding(s) ...` | checksums, identifiers and other non-secrets TruffleHog reported; each is named in the run log |
+| `Nothing to encrypt.` | nothing to do; exit 0 |
+| `Dry run: nothing was changed.` | a dry run ended; exit 0 |
+| `Nothing encrypted.`, `Nothing changed.` | no confirmation was given; exit 2 |
+| `Done: ...` | a real run ended; its parts count what was stored, rewritten, moved and what failed |
+| `Stopped early (...)` | an interrupted or failed run; the state of the tree follows |
+| `Run record: <path>` | the record of a run that changed files |
+
+The [exit code](#exit-codes) is the verdict: 0 done or nothing to do, 1
+something failed or the scan was incomplete, 2 no confirmation, 130
+interrupted.
+
+### What it leaves behind
+
+In the project:
+
+- the env files, every secret encrypted (`KEY="encrypted:..."`) under the
+  `DOTENV_PUBLIC_KEY` header dotenvx adds; safe to commit;
+- placeholders such as `${KEY}` where the plaintext sat in source files;
+- `.env.keys` beside an env file when dotenvx could not use the OS secret
+  store: the private key, added to `.gitignore`, never to be committed;
+- `.secrets-quarantine/` when files were moved: `MANIFEST.txt` and
+  `index.json` (what came from where), `.env` (the passphrases, encrypted to the
+  project's key pair) and the `*.enc` files. `sweep-and-secure --restore
+  <stored name>` puts one back.
+
+Per user, in one place for the machine:
+
+- a run log for every run, the newest 100 kept:
+  `~/.local/state/sweep-and-secure/logs` on Linux,
+  `~/Library/Logs/sweep-and-secure` on macOS,
+  `%LOCALAPPDATA%\sweep-and-secure\logs` on Windows;
+- a run record for every run that changed files, kept:
+  `~/.local/state/sweep-and-secure/runs`,
+  `~/Library/Application Support/sweep-and-secure/runs`,
+  `%LOCALAPPDATA%\sweep-and-secure\runs`.
+
+Neither ever holds a secret value.
+
+### Rules of thumb for an agent
+
+- Never print, paste or commit a secret value. The report, the log and the
+  record show masked previews; `dotenvx get` is the only thing that prints a
+  value.
+- Never commit `.env.keys`, and never delete or move the quarantine's `.env`:
+  it holds the passphrases of the quarantined files.
+- Run the dry run first and read it; `--yes` acts on everything it listed.
+- `--verify` sends the credentials to their services over the network: only
+  with permission.
+- Without a terminal and without the OS secret store (containers, CI), dotenvx
+  keeps the private key in `.env.keys`; give CI the key as the
+  `DOTENV_PRIVATE_KEY` secret. `--no-native` asks for a key file on purpose.
+- When a run says `Stopped early`, run it again: each file is changed completely
+  or not at all, and the next run finishes the job.
+- The environment variables it reads: `TRUFFLEHOG_BIN` and `DOTENVX_BIN` (the
+  tools), `SWEEP_AND_SECURE_LOG_DIR` and `SWEEP_AND_SECURE_RECORD_DIR` (the
+  folders), `NO_COLOR`; dotenvx reads its own, such as `DOTENVX_NO_NATIVE`.
+
+### Full command-line help
+
+The output of `sweep-and-secure --help`, kept in step with the program by a
+test:
+
+<!-- help-start -->
+```
+usage: sweep-and-secure [-h] [-n] [-y] [--env-file PATH] [--env-all]
+                        [--no-rewrite] [--quarantine] [--quarantine-dir DIR]
+                        [--no-native] [--placeholder TEMPLATE] [--verify]
+                        [--exclude REGEX] [--no-default-excludes]
+                        [--scan-compiled] [--min-length N] [--restore FILE]
+                        [--openssl PATH] [--trufflehog PATH] [--dotenvx PATH]
+                        [--no-version-check] [--log-dir DIR] [--no-log]
+                        [--record-dir DIR] [--no-record] [-v] [--no-color]
+                        [--check-setup] [--version]
+                        [path]
+
+Scan a folder tree for API keys and secrets with TruffleHog, list what was found
+(and what is already encrypted), then -- after you confirm -- encrypt them with dotenvx.
+
+  secrets in dotenv files   -> encrypted in place        (KEY="encrypted:...")
+  secrets in other files    -> moved into the project's .env, encrypted, and the
+                               plaintext replaced by a placeholder like ${KEY}
+  private key files         -> never rewritten: one without a passphrase can be moved to the
+                               quarantine, and the ssh-keygen line that adds one is printed
+
+positional arguments:
+  path                  folder to sweep (default: current folder)
+
+options:
+  -h, --help            show this help message and exit
+  -n, --dry-run, --list
+                        scan and list only; change nothing
+  -y, --yes             encrypt everything found without asking
+  --env-file PATH       dotenv file that receives secrets moved out of other
+                        files (default: .env inside the swept folder)
+  --env-all             also encrypt every other plaintext key in dotenv
+                        files, not only the ones TruffleHog flagged
+  --no-rewrite          store secrets encrypted but leave the source files
+                        untouched
+  --quarantine          with --yes, also move every file that holds a secret
+                        and cannot be fixed in place (archives, binaries,
+                        PDFs, lock files, example env files, ...) out of the
+                        tree into the quarantine folder, keeping relative
+                        paths (interactive runs offer this anyway)
+  --quarantine-dir DIR  the quarantine folder (default: .secrets-quarantine
+                        inside the swept folder); implies --quarantine
+  --no-native           keep new private keys in .env.keys files instead of
+                        letting dotenvx put them in the OS secret store (macOS
+                        Keychain, Windows Credential Manager, Linux Secret
+                        Service)
+  --placeholder TEMPLATE
+                        text that replaces a secret in source files; NAME
+                        becomes the key (default: ${NAME})
+  --verify              let TruffleHog verify each secret against its service
+                        (needs network access)
+  --exclude REGEX       skip paths matching this regular expression
+                        (repeatable)
+  --no-default-excludes
+                        also scan .git, node_modules, virtualenvs and friends
+                        (.env.keys and staging files stay excluded)
+  --scan-compiled       also scan compiled code (.so, .dll, .exe, .pyc,
+                        .class, ... and files whose first bytes say ELF, PE,
+                        Mach-O or WebAssembly) and list what TruffleHog finds
+                        there; such files are never rewritten or moved.
+                        Skipped by default: TruffleHog 3.75 and later skip
+                        them anyway, and older releases match symbol names in
+                        them
+  --min-length N        ignore secrets shorter than N characters (default: 8)
+  --restore FILE        put FILE back from the quarantine folder of PATH,
+                        decrypting it (FILE is the stored name or the original
+                        path as MANIFEST.txt lists them); nothing is scanned
+  --openssl PATH        openssl executable that encrypts quarantined files
+                        (default: search PATH, and on Windows Git's copy)
+  --trufflehog PATH     trufflehog executable (default: search PATH)
+  --dotenvx PATH        dotenvx executable (default: search PATH)
+  --no-version-check    use a tool even if its --version could not be read
+  --log-dir DIR         where this run's log goes (default: the user's state
+                        folder, see --help's notes; SWEEP_AND_SECURE_LOG_DIR
+                        overrides it)
+  --no-log              do not write a run log
+  --record-dir DIR      where the record of a run that changes files goes
+                        (default: the user's state folder, see --help's notes;
+                        SWEEP_AND_SECURE_RECORD_DIR overrides it)
+  --no-record           do not write a run record
+  -v, --verbose         show the commands run and tool output
+  --no-color            plain output
+  --check-setup         check that Python, TruffleHog and dotenvx are in place
+                        and run both tools in a scratch folder; exit 0 if a
+                        real run would work, 1 otherwise; nothing is scanned
+  --version             show program's version number and exit
+
+exit codes: 0 done (or nothing to do), 1 missing tool / scan incomplete or failed / encryption failed,
+            2 you said no or gave no answer (stdin not a terminal, nothing piped, no --yes), 130 interrupted
+
+A log of every run is kept in ~/.local/state/sweep-and-secure/logs
+(--log-dir to change, --no-log to skip; the newest 100 are kept); it holds what was printed, the
+prompts and the tool commands, never secret values. A run that changes files also leaves a record in
+~/.local/state/sweep-and-secure/runs
+(--record-dir, --no-record; kept until you remove it): what changed, where the keys are and how to
+use them, what to do when something is wrong, and the run's full output. Scripts and agents: the
+README's 'For agents and scripts' section lists the output lines worth reading and the exit codes.
+
+TruffleHog: https://trufflesecurity.com/trufflehog     dotenvx: https://dotenvx.com
+```
+<!-- help-end -->
 
 ## Reference
 
@@ -1136,6 +1368,12 @@ sweep-and-secure again or use `dotenvx set`.
   `%LOCALAPPDATA%\sweep-and-secure\logs`; `SWEEP_AND_SECURE_LOG_DIR` also
   overrides it). `--no-log`: write no log. The newest 100 of this tool's logs
   are kept; other files in the folder are never removed.
+- `--record-dir DIR`: write the record of a run that changes files into DIR
+  instead of the user's run-record folder
+  (`~/.local/state/sweep-and-secure/runs`,
+  `~/Library/Application Support/sweep-and-secure/runs`,
+  `%LOCALAPPDATA%\sweep-and-secure\runs`; `SWEEP_AND_SECURE_RECORD_DIR` also
+  overrides it). `--no-record`: write no record. Records are never pruned.
 - `--no-color`: plain output. Colour is only used on a terminal, and the
   `NO_COLOR` environment variable has the same effect.
 - `-h`, `--help`: the short reference. `--version`: print
@@ -1164,7 +1402,7 @@ it yourself for a downloaded `sweep_and_secure.py`, from the folder it was
 downloaded into:
 
 ```
-curl -sSfL -O https://github.com/voxgig/sweep-and-secure/releases/download/v1.6.3/SHA256SUMS
+curl -sSfL -O https://github.com/voxgig/sweep-and-secure/releases/download/v1.7.0/SHA256SUMS
 ```
 
 ```
@@ -1299,11 +1537,18 @@ the script against them. CI (`.github/workflows/test.yml`) runs the suite on
 Linux, macOS and Windows with Python 3.8 to 3.13, the real-tools tier on Linux
 with the current TruffleHog and dotenvx, and a packaging job that builds the
 wheel, runs the console script and exercises `install.sh` with and without the
-tools present.
+tools present. One test checks that the README's "Full command-line help" block
+is `--help`'s output; after changing an option, regenerate the block with
+
+```
+COLUMNS=80 SWEEP_AND_SECURE_LOG_DIR='~/.local/state/sweep-and-secure/logs' \
+SWEEP_AND_SECURE_RECORD_DIR='~/.local/state/sweep-and-secure/runs' \
+python3 -c "import sys; sys.argv = ['sweep-and-secure', '--help']; import sweep_and_secure; sweep_and_secure.parse_args(['--help'])"
+```
 
 
 To release: set `__version__` in `sweep_and_secure.py`, merge, then either push
-a matching tag (`git tag v1.6.3 && git push origin v1.6.3`) or run the release
+a matching tag (`git tag v1.7.0 && git push origin v1.7.0`) or run the release
 workflow from the Actions tab with the version, which creates the tag for you.
 The workflow (`.github/workflows/release.yml`) checks that the tag matches the
 version, runs the tests, builds the sdist and wheel, and publishes a GitHub
