@@ -190,6 +190,8 @@ FAKE_OPENSSL = os.path.join(FAKEBIN, "openssl")
 
 LOG_TMP = tempfile.mkdtemp(prefix="sweep-logs-")   # run logs of the tests, removed at exit
 atexit.register(shutil.rmtree, LOG_TMP, True)
+RECORD_TMP = tempfile.mkdtemp(prefix="sweep-records-")   # run records of the tests, never the user's own folder
+atexit.register(shutil.rmtree, RECORD_TMP, True)
 
 
 def clean_env(extra_env=None, path=None):
@@ -197,6 +199,7 @@ def clean_env(extra_env=None, path=None):
     env["PATH"] = (FAKEBIN + os.pathsep + env.get("PATH", "")) if path is None else path
     env["NO_COLOR"] = "1"
     env["SWEEP_AND_SECURE_LOG_DIR"] = LOG_TMP
+    env["SWEEP_AND_SECURE_RECORD_DIR"] = RECORD_TMP
     for name in FAKE_KNOBS:
         env.pop(name, None)
     env.pop("CI", None)   # a CI runner keeps keys in files; the tests want a developer's machine unless they say so
@@ -1466,6 +1469,61 @@ class EndToEndTests(unittest.TestCase):
         finally:
             shutil.rmtree(logs, ignore_errors=True)
 
+    def test_a_run_that_changes_files_leaves_a_record(self):
+        records = tempfile.mkdtemp(prefix="sweep-records-")
+        try:
+            env = {"SWEEP_AND_SECURE_RECORD_DIR": records}
+            code, out, err = run_script(self.tree.root, ["--dry-run"], extra_env=env)   # changes nothing: no record
+            self.assertEqual(code, 0, out + err)
+            self.assertNotIn("Run record:", out)
+            self.assertEqual(os.listdir(records), [])
+            code, out, err = run_script(self.tree.root, [], stdin_text="n\n", extra_env=env)   # declined: no record
+            self.assertEqual(code, 2, out + err)
+            self.assertNotIn("Run record:", out)
+            self.assertEqual(os.listdir(records), [])
+            code, out, err = run_script(self.tree.root, ["--yes", "--quarantine"], extra_env=env)
+            self.assertEqual(code, 0, out + err)
+            match = re.search(r"^Run record: (.*)$", out, re.M)
+            self.assertTrue(match, out)
+            path = match.group(1).strip()
+            self.assertEqual(os.path.dirname(path), records)
+            self.assertRegex(os.path.basename(path), r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z-sweep-test-[A-Za-z0-9_.-]+-\d+\.md$")
+            self.assertIn("what changed, where the keys are and how to use them, and this run's full output; kept until you remove it", out)
+            text = read_file(path)
+            for needle in ("# sweep-and-secure run record", "| Tool | sweep-and-secure %s |" % sas.__version__,
+                           "| Folder | `%s` |" % self.tree.root, "--yes --quarantine`", "| trufflehog | trufflehog 3.99.0  `",
+                           "| dotenvx | 2.0.0  `", "| Exit code | 0: done |", "| Run log | `", "logs kept; this record is kept)",
+                           "## What changed", "- Env file `.env`, encrypted by dotenvx:", "  - `STRIPE_SECRET_KEY`: encrypted in place",
+                           ": moved here from `src/client.js` line 1 (Github), where `${",
+                           "- `build/keys.zip` moved to `.secrets-quarantine/build/keys.zip.enc` (AES-256 encrypted; its passphrase is in"
+                           " `.secrets-quarantine/.env`, encrypted by dotenvx)",
+                           "- Private key of `.env`: in `.env.keys`. Never commit it",
+                           "## Using the keys from now on", "- `dotenvx run -- <your command>`: runs a program with the decrypted values",
+                           "--restore <stored name>`: puts a quarantined file back, decrypted (its passphrase is in .secrets-quarantine/.env)",
+                           "## If something is wrong", "`.secrets-quarantine/MANIFEST.txt` lists the stored names",
+                           "## Full output of the run", "~~~~", "Plaintext secrets found:", " Done: ", "| exit code 0"):
+                self.assertIn(needle, text)
+            for value in (STRIPE_KEY, GITHUB_TOKEN, AWS_SECRET, SLACK):   # masked previews only, never the values
+                self.assertNotIn(value, text)
+            # a restore changes files too; --no-record writes none; --record-dir chooses the folder
+            before = set(os.listdir(records))
+            code, out, err = run_script(self.tree.root, ["--restore", "build/keys.zip", "--no-record"], extra_env=env)
+            self.assertEqual(code, 0, out + err)
+            self.assertIn("restored build/keys.zip", out)
+            self.assertNotIn("Run record:", out)
+            self.assertEqual(set(os.listdir(records)), before)
+            other = os.path.join(records, "elsewhere")
+            code, out, err = run_script(self.tree.root, ["--restore", "build/blob.txt.gz", "--record-dir", other], extra_env=env)
+            self.assertEqual(code, 0, out + err)
+            self.assertIn("Run record: " + other, out)
+            self.assertEqual(len(os.listdir(other)), 1)
+            text = read_file(os.path.join(other, os.listdir(other)[0]))
+            self.assertIn("- `build/blob.txt.gz` was put back from the quarantine (`build/blob.txt.gz.enc`), decrypted", text)
+            self.assertIn("--restore build/blob.txt.gz --record-dir", text)
+            self.assertNotIn(GITHUB_TOKEN, text)
+        finally:
+            shutil.rmtree(records, ignore_errors=True)
+
     def test_utf16_source_file_is_rewritten_in_its_own_encoding(self):
         text = u"token = '%s'\r\n" % GITHUB_TOKEN
         self.tree.write("src/legacy.txt", b"\xff\xfe" + text.encode("utf-16-le"))
@@ -2305,6 +2363,50 @@ class UnitTests(unittest.TestCase):
         # the key-file rule names files, not every descendant of a similarly named folder
         self.assertFalse(sas.is_excluded("/backup/.env.keys-project/src/a.py", always))
         self.assertFalse(sas.is_excluded("/p/.env.keysmith", always))
+
+    def test_default_record_dir(self):
+        saved = os.environ.get("SWEEP_AND_SECURE_RECORD_DIR")
+        try:
+            os.environ["SWEEP_AND_SECURE_RECORD_DIR"] = os.path.join("x", "runs")
+            self.assertEqual(sas.default_record_dir(), os.path.join("x", "runs"))
+            del os.environ["SWEEP_AND_SECURE_RECORD_DIR"]
+            folder = sas.default_record_dir()
+            self.assertEqual(os.path.basename(folder), "runs")
+            self.assertEqual(os.path.basename(os.path.dirname(folder)), "sweep-and-secure")
+            if os.name == "nt":
+                self.assertIn("AppData", folder + os.environ.get("LOCALAPPDATA", "AppData"))
+            elif sys.platform == "darwin":
+                self.assertIn(os.path.join("Library", "Application Support"), folder)
+            else:
+                self.assertTrue(folder.endswith(os.path.join(".local", "state", "sweep-and-secure", "runs"))
+                                or os.environ.get("XDG_STATE_HOME"), folder)
+        finally:
+            if saved is None:
+                os.environ.pop("SWEEP_AND_SECURE_RECORD_DIR", None)
+            else:
+                os.environ["SWEEP_AND_SECURE_RECORD_DIR"] = saved
+
+    def test_readme_carries_the_full_command_line_help(self):
+        # the README's "Full command-line help" block is --help's output, word for word (wrapping aside)
+        env = dict(os.environ)
+        env.update({"COLUMNS": "80", "SWEEP_AND_SECURE_LOG_DIR": "~/.local/state/sweep-and-secure/logs",
+                    "SWEEP_AND_SECURE_RECORD_DIR": "~/.local/state/sweep-and-secure/runs"})
+        program = ("import sys; sys.argv = ['sweep-and-secure', '--help']; sys.path.insert(0, %r); "
+                   "import sweep_and_secure; sweep_and_secure.parse_args(['--help'])" % os.path.dirname(SCRIPT))
+        proc = subprocess.Popen([sys.executable, "-c", program], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = proc.communicate()
+        self.assertEqual(proc.returncode, 0, err.decode("utf-8", "replace"))
+        help_text = out.decode("utf-8", "replace")
+        readme = read_file(os.path.join(os.path.dirname(SCRIPT), "README.md"))
+        block = re.search(r"<!-- help-start -->\s*```\n(.*?)```\s*<!-- help-end -->", readme, re.S)
+        self.assertTrue(block, "the README has no help block")
+
+        def normal(text):
+            return re.sub(r"\s+", " ", text.replace("optional arguments:", "options:")).strip()
+
+        self.assertEqual(normal(block.group(1)), normal(help_text))
+        for option in ("--record-dir", "--no-record", "--restore", "--check-setup", "--quarantine-dir"):
+            self.assertIn(option, block.group(1))
 
     def test_build_plan_ignores_findings_in_excluded_paths(self):
         folder = tempfile.mkdtemp(prefix="sweep-unit-")
