@@ -1469,6 +1469,99 @@ class EndToEndTests(unittest.TestCase):
         finally:
             shutil.rmtree(logs, ignore_errors=True)
 
+    def test_several_folders_are_swept_one_after_another(self):
+        other = ProjectTree()
+        records = tempfile.mkdtemp(prefix="sweep-records-")
+        try:
+            env = {"SWEEP_AND_SECURE_RECORD_DIR": records}
+            code, out, err = run_script(self.tree.root, [other.root, "--dry-run"], extra_env=env)
+            self.assertEqual(code, 0, out + err)
+            for needle in ("=== Folder 1 of 2 ===", "=== Folder 2 of 2 ===", "Folder: %s" % self.tree.root, "Folder: %s" % other.root,
+                           "Summary of 2 folders", "  exit 0  %s  (done)" % self.tree.root, "  exit 0  %s  (done)" % other.root):
+                self.assertIn(needle, out)
+            self.assertEqual(out.count("Dry run: nothing was changed."), 2)
+            self.assertEqual(out.count("Log: "), 1)
+            self.assertNotIn("Run record:", out)
+            self.assertEqual(os.listdir(records), [])
+            # --yes over both: each gets its own .env and quarantine; one record with both folders' sections
+            code, out, err = run_script(self.tree.root, [other.root, "--yes", "--quarantine"], extra_env=env)
+            self.assertEqual(code, 0, out + err)
+            self.assertEqual(out.count("Done: "), 2)
+            self.assertEqual(out.count("Run record: "), 1)
+            self.assertTrue(encrypted("STRIPE_SECRET_KEY", self.tree.read(".env")))
+            self.assertTrue(encrypted("STRIPE_SECRET_KEY", other.read(".env")))
+            self.assertTrue(os.path.isfile(self.tree.path(".secrets-quarantine/build/keys.zip.enc")))
+            self.assertTrue(os.path.isfile(other.path(".secrets-quarantine/build/keys.zip.enc")))
+            names = os.listdir(records)
+            self.assertEqual(len(names), 1)
+            self.assertRegex(names[0], r"-sweep-test-[A-Za-z0-9_.-]+\+1-\d+\.md$")
+            text = read_file(os.path.join(records, names[0]))
+            self.assertIn("| Folders | `%s`, `%s` |" % (self.tree.root, other.root), text)
+            self.assertIn("## Folder `%s`" % self.tree.root, text)
+            self.assertIn("## Folder `%s`" % other.root, text)
+            self.assertEqual(text.count("### What changed"), 2)
+            self.assertEqual(text.count("### Using the keys from now on"), 2)
+            self.assertIn("| Exit code | 0: done |", text)
+            for value in (STRIPE_KEY, GITHUB_TOKEN, AWS_SECRET, SLACK):
+                self.assertNotIn(value, text)
+            # a new secret in each; the first folder declined, the second accepted: the exit code says one was declined
+            for tree in (self.tree, other):
+                tree.write("src/fresh.py", ('FRESH = "%s"\n' % STRIPE_KEY).encode("utf-8"))
+            code, out, err = run_script(self.tree.root, [other.root], stdin_text="n\ny\n", extra_env=env)
+            self.assertEqual(code, 2, out + err)
+            self.assertIn("Nothing encrypted.", out)
+            self.assertEqual(out.count("Done: "), 1)
+            self.assertIn("  exit 2  %s  (no confirmation, nothing was changed)" % self.tree.root, out)
+            self.assertIn("  exit 0  %s  (done)" % other.root, out)
+            self.assertIn(STRIPE_KEY, self.tree.read("src/fresh.py"))
+            self.assertNotIn(STRIPE_KEY, other.read("src/fresh.py"))
+            names = sorted(os.listdir(records))
+            self.assertEqual(len(names), 2)
+            text = read_file(os.path.join(records, names[-1]))
+            self.assertIn("## Folder `%s`" % other.root, text)
+            self.assertNotIn("## Folder `%s`" % self.tree.root, text)
+            self.assertIn("| Exit code | 2:", text)
+            # what cannot be swept together
+            for args, problem in (([self.tree.root, "--dry-run"], "is given twice."),
+                                  ([os.path.join(self.tree.root, "src"), "--dry-run"], "is inside"),
+                                  ([other.root, "--restore", "build/keys.zip"], "--restore works on one folder at a time."),
+                                  ([other.root, "--check-setup"], "--check-setup takes one folder"),
+                                  ([other.root, "--env-file", os.path.join(other.root, "shared.env"), "--dry-run"],
+                                   "--env-file must be a relative path"),
+                                  ([other.root, "--quarantine-dir", os.path.join(other.root, "q"), "--dry-run"],
+                                   "--quarantine-dir must be a relative path")):
+                code, out, err = run_script(self.tree.root, args, extra_env=env)
+                self.assertEqual(code, 1, (args, out, err))
+                self.assertIn(problem, err)
+            self.assertEqual(len(os.listdir(records)), 2)
+        finally:
+            other.cleanup()
+            shutil.rmtree(records, ignore_errors=True)
+
+    def test_a_folder_without_its_tools_does_not_stop_the_next_folder(self):
+        # Codex, PR 17: the tools are looked for per folder (a project-local dotenvx counts), and a missing one ends
+        # the run through locate_tools(); with several folders that is one folder's failure, not the run's
+        other = ProjectTree()
+        try:
+            local_bin = other.path("node_modules/.bin")
+            os.makedirs(local_bin)
+            for name in os.listdir(FAKEBIN):
+                if name.startswith("dotenvx"):
+                    shutil.copy(os.path.join(FAKEBIN, name), os.path.join(local_bin, name))
+            # the fake trufflehog by name, and a PATH holding only Python's own folder (the fakes' interpreter), so that no
+            # dotenvx is found anywhere but in the second folder's node_modules, whatever the machine has installed
+            env = {"TRUFFLEHOG_BIN": os.path.join(FAKEBIN, "trufflehog")}
+            code, out, err = run_script(self.tree.root, [other.root, "--dry-run"], extra_env=env, path=os.path.dirname(sys.executable))
+            self.assertEqual(code, 1, out + err)
+            self.assertIn("dotenvx is not installed", err)
+            self.assertIn("Cannot continue: 1 required tool(s) missing", err)
+            self.assertIn("=== Folder 2 of 2 ===", out)
+            self.assertEqual(out.count("Dry run: nothing was changed."), 1)   # the second folder was swept
+            self.assertIn("  exit 1  %s  (something failed" % self.tree.root, out)
+            self.assertIn("  exit 0  %s  (done)" % other.root, out)
+        finally:
+            other.cleanup()
+
     def test_a_run_that_changes_files_leaves_a_record(self):
         records = tempfile.mkdtemp(prefix="sweep-records-")
         try:
@@ -2364,6 +2457,36 @@ class UnitTests(unittest.TestCase):
         self.assertFalse(sas.is_excluded("/backup/.env.keys-project/src/a.py", always))
         self.assertFalse(sas.is_excluded("/p/.env.keysmith", always))
 
+    def test_folders_of_one_run(self):
+        self.assertEqual(sas.run_label(["/x/proj"]), "proj")
+        self.assertEqual(sas.run_label(["/x/proj", "/y/other", "/z"]), "proj+2")
+        self.assertEqual(sas.combined_exit_code([0, 0]), 0)
+        self.assertEqual(sas.combined_exit_code([0, 2]), 2)
+        self.assertEqual(sas.combined_exit_code([2, 1, 0]), 1)
+        self.assertEqual(sas.combined_exit_code([]), 0)
+        args = sas.parse_args([".", "--dry-run"])
+        folder = tempfile.mkdtemp(prefix="sweep-unit-")
+        try:
+            inner = os.path.join(folder, "inner")
+            os.mkdir(inner)
+            self.assertIsNone(sas.check_roots([folder], args))
+            self.assertIn("is not a folder", sas.check_roots([folder, os.path.join(folder, "missing")], args))
+            self.assertIn("is given twice", sas.check_roots([folder, folder + os.sep], args))
+            self.assertIn("is inside", sas.check_roots([folder, inner], args))
+            self.assertIn("is inside", sas.check_roots([inner, folder], args))
+            other = tempfile.mkdtemp(prefix="sweep-unit-")
+            try:
+                self.assertIsNone(sas.check_roots([folder, other], args))
+                self.assertIn("--restore works on one folder", sas.check_roots([folder, other], sas.parse_args(["--restore", "x"])))
+                self.assertIn("--check-setup takes one folder", sas.check_roots([folder, other], sas.parse_args(["--check-setup"])))
+                self.assertIn("--env-file must be a relative path",
+                              sas.check_roots([folder, other], sas.parse_args(["--env-file", os.path.join(other, "e")])))
+                self.assertIsNone(sas.check_roots([folder, other], sas.parse_args(["--env-file", "config/.env"])))
+            finally:
+                shutil.rmtree(other, ignore_errors=True)
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
     def test_default_record_dir(self):
         saved = os.environ.get("SWEEP_AND_SECURE_RECORD_DIR")
         try:
@@ -2402,7 +2525,9 @@ class UnitTests(unittest.TestCase):
         self.assertTrue(block, "the README has no help block")
 
         def normal(text):
-            return re.sub(r"\s+", " ", text.replace("optional arguments:", "options:")).strip()
+            # Python 3.9 renamed the heading and shortened the usage of a list argument ([path [path ...]] -> [path ...])
+            text = text.replace("optional arguments:", "options:").replace("[path [path ...]]", "[path ...]")
+            return re.sub(r"\s+", " ", text).strip()
 
         self.assertEqual(normal(block.group(1)), normal(help_text))
         for option in ("--record-dir", "--no-record", "--restore", "--check-setup", "--quarantine-dir"):

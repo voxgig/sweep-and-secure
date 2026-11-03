@@ -61,7 +61,7 @@ try:
 except ImportError:  # pragma: no cover - Python 2 without the backport
     lzma = None
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 # --------------------------------------------------------------------------
 # Python 2 / 3 compatibility
@@ -149,9 +149,9 @@ class RunRecord(object):
     EXIT_MEANINGS = {0: u"done", 1: u"something failed or the scan was incomplete (see the output)",
                      2: u"no confirmation, nothing was changed", 130: u"interrupted"}
 
-    def __init__(self, folder, root, enabled):
+    def __init__(self, folder, roots, enabled):
         self.folder = folder
-        self.root = root
+        self.roots = list(roots)
         self.enabled = enabled
         self.started = time.gmtime()
         self.lines = []        # (stamp, prefix, text), as the run log gets them
@@ -166,13 +166,18 @@ class RunRecord(object):
             self.lines.append((stamp, prefix, ANSI_RE.sub(u"", line)))
 
     def arm(self, sections):
-        """Name the file and keep the structured part; the path, or None when records are off."""
+        """Name the file (the first time) and add to the structured part, one folder's sections after
+        another's; the path, or None when records are off."""
         if not self.enabled:
             return None
-        stamp = time.strftime("%Y-%m-%dT%H-%M-%SZ", self.started)
-        label = re.sub(u"[^A-Za-z0-9_.-]+", u"_", os.path.basename(self.root) or u"root")[:40]
-        self.path = os.path.join(self.folder, u"%s-%s-%d.md" % (stamp, label, os.getpid()))
-        self.sections = sections
+        if self.path is None:
+            stamp = time.strftime("%Y-%m-%dT%H-%M-%SZ", self.started)
+            label = re.sub(u"[^A-Za-z0-9_.+-]+", u"_", run_label(self.roots))[:40]
+            self.path = os.path.join(self.folder, u"%s-%s-%d.md" % (stamp, label, os.getpid()))
+            self.sections = []
+        if self.sections:
+            self.sections.append(u"")
+        self.sections.extend(sections)
         return self.path
 
     def text(self, code):
@@ -183,7 +188,7 @@ class RunRecord(object):
         rows = [
             (u"Tool", u"sweep-and-secure %s" % __version__),
             (u"When", time.strftime("%Y-%m-%d %H:%M:%S UTC", self.started)),
-            (u"Folder", u"`%s`" % self.root),
+            (u"Folder" if len(self.roots) == 1 else u"Folders", u", ".join(u"`%s`" % root for root in self.roots)),
             (u"Command", u"`%s`" % u" ".join([prog_name()] + [fs_text(a) for a in sys.argv[1:]])),
             (u"Machine", u"%s, %s, user %s" % (platform.node() or u"?", platform.platform(), to_text(user))),
         ]
@@ -261,7 +266,7 @@ def default_record_dir():
     return os.path.join(base, "sweep-and-secure", "runs")
 
 
-def open_run_log(args, root):
+def open_run_log(args, label):
     """Create this run's log file and drop this tool's oldest logs beyond LOG_KEEP: (RunLog or
     None, note). Only files named the way this tool names them are ever removed: a shared
     --log-dir can hold other programs' logs."""
@@ -272,7 +277,7 @@ def open_run_log(args, root):
         if not os.path.isdir(folder):
             os.makedirs(folder)
         stamp = time.strftime("%Y-%m-%dT%H-%M-%SZ", time.gmtime())
-        label = re.sub(u"[^A-Za-z0-9_.-]+", u"_", os.path.basename(root) or u"root")[:40]
+        label = re.sub(u"[^A-Za-z0-9_.+-]+", u"_", label or u"root")[:40]   # proj+2: the first folder and the count of the others
         log = RunLog(os.path.join(folder, u"%s-%s-%d.log" % (stamp, label, os.getpid())))
         logs = sorted(name for name in os.listdir(folder)
                       if RUN_LOG_NAME_RE.match(name) and name != os.path.basename(log.path))
@@ -3788,7 +3793,7 @@ def restore_from_quarantine(args, root, store, dotenvx, style):
                     % (record["original"], record["quarantined"], u", decrypted" if record.get("encrypted") else u""),
                     u"", u"## If something is wrong", u"",
                     u"- The file came back as recorded (its checksum was checked). The secrets in it are plaintext again:"
-                    u" run sweep-and-secure once more to quarantine it, or rotate them."], style)
+                    u" run sweep-and-secure once more to quarantine it, or rotate them."], root)
     return 0
 
 
@@ -5062,16 +5067,22 @@ def record_sections(plan, chosen, journal, keys_files, args, failed, error):
     return lines
 
 
-def arm_run_record(sections, style):
-    """Arm this run's record with its structured part and say where it will be."""
+def arm_run_record(sections, root):
+    """Arm this run's record with one folder's structured part (under its own heading when several folders are
+    swept); main() says where the record is once the run is over."""
     if RUN_RECORD is None:
         return
     if RUN_LOG is not None:
         RUN_RECORD.log_path = RUN_LOG.path
-    path = RUN_RECORD.arm(sections)
-    if path:
+    if len(RUN_RECORD.roots) > 1:
+        sections = [u"## Folder `%s`" % root, u""] + [(u"#" + line) if line.startswith(u"## ") else line for line in sections]
+    RUN_RECORD.arm(sections)
+
+
+def announce_run_record(style):
+    if RUN_RECORD is not None and RUN_RECORD.path:
         say(u"")
-        say(style.dim(u"Run record: %s" % path))
+        say(style.dim(u"Run record: %s" % RUN_RECORD.path))
         say(style.dim(u"  (what changed, where the keys are and how to use them, and this run's full output; kept until you remove it)"))
 
 
@@ -5134,7 +5145,8 @@ def parse_args(argv):
             "                               quarantine, and the ssh-keygen line that adds one is printed"),
         epilog=(
             "exit codes: 0 done (or nothing to do), 1 missing tool / scan incomplete or failed / encryption failed,\n"
-            "            2 you said no or gave no answer (stdin not a terminal, nothing piped, no --yes), 130 interrupted\n"
+            "            2 you said no or gave no answer (stdin not a terminal, nothing piped, no --yes), 130 interrupted;\n"
+            "            with several folders the worst code wins (1 if any failed, else 2 if any was declined)\n"
             "\n"
             "A log of every run is kept in " + default_log_dir() + "\n"
             "(--log-dir to change, --no-log to skip; the newest 100 are kept); it holds what was printed, the\n"
@@ -5146,7 +5158,9 @@ def parse_args(argv):
             "\n"
             "TruffleHog: https://trufflesecurity.com/trufflehog     dotenvx: https://dotenvx.com"),
     )
-    parser.add_argument("path", nargs="?", default=".", help="folder to sweep (default: current folder)")
+    parser.add_argument("path", nargs="*", default=["."],
+                        help="folder(s) to sweep (default: the current folder); several are swept one after another, "
+                             "each with its own .env and quarantine, with one log and one record for the run")
     parser.add_argument("-n", "--dry-run", "--list", dest="dry_run", action="store_true",
                         help="scan and list only; change nothing")
     parser.add_argument("-y", "--yes", action="store_true", help="encrypt everything found without asking")
@@ -5315,7 +5329,7 @@ def wrap_up(plan, chosen, journal, root, git_root, args, style, failed, error, s
                 % (path, u", ".join(sorted(set(keys)))))
         if pending:
             say(u"  Run again to finish: stored values are recognised and reused, not duplicated.")
-        arm_run_record(record_sections(plan, chosen, journal, keys_files, args, failed, error), style)
+        arm_run_record(record_sections(plan, chosen, journal, keys_files, args, failed, error), plan.root)
         return
 
     stored = set((item.store, item.key) for item in chosen
@@ -5357,17 +5371,106 @@ def wrap_up(plan, chosen, journal, root, git_root, args, style, failed, error, s
     say(style.bold(summary))
     if any(item.status in ("done", "stored") for item in chosen) or moved_keys or plan.quarantine_upgraded:
         print_next_steps(plan, chosen, keys_files, args, style)
-    arm_run_record(record_sections(plan, chosen, journal, keys_files, args, failed, error), style)
+    arm_run_record(record_sections(plan, chosen, journal, keys_files, args, failed, error), plan.root)
+
+
+def run_label(roots):
+    """The folder name that labels this run's log and record: the first folder's, with +N for the others."""
+    label = os.path.basename(roots[0]) or u"root"
+    if len(roots) > 1:
+        label += u"+%d" % (len(roots) - 1)
+    return label
+
+
+def check_roots(roots, args):
+    """Why the folders given cannot be swept together, or None: a missing folder, one given twice or lying
+    inside another, or an option that takes one folder (--restore, --check-setup, an absolute --env-file or
+    --quarantine-dir) with several."""
+    real = []
+    for root in roots:
+        if not os.path.isdir(root):
+            return u"%s is not a folder." % root
+        real.append(os.path.realpath(root))
+    for i, outer in enumerate(real):
+        for j, inner in enumerate(real):
+            if i < j and outer == inner:
+                return u"%s is given twice." % roots[j]
+            if i != j and inner.startswith(outer.rstrip(os.sep) + os.sep):
+                return u"%s is inside %s: sweep the outer folder alone, it covers the inner one." % (roots[j], roots[i])
+    if len(roots) > 1:
+        if args.restore:
+            return u"--restore works on one folder at a time."
+        if args.check_setup:
+            return u"--check-setup takes one folder (it looks for a project-local dotenvx there)."
+        for name, value in ((u"--env-file", args.env_file), (u"--quarantine-dir", args.quarantine_dir)):
+            if value and os.path.isabs(fs_text(value)):
+                return (u"with several folders, %s must be a relative path, resolved inside each folder (%s is absolute)."
+                        % (name, fs_text(value)))
+    return None
+
+
+def combined_exit_code(codes):
+    """One exit code for several folders: 1 when any failed, else 2 when any was declined, else 0."""
+    if any(code not in (0, 2) for code in codes):
+        return 1
+    return 2 if 2 in codes else 0
+
+
+def print_folder_summary(roots, codes, style):
+    say(u"")
+    say(style.bold(u"Summary of %d folders" % len(roots)))
+    for root, code in zip(roots, codes):
+        say(u"  exit %d  %s  (%s)" % (code, root, RunRecord.EXIT_MEANINGS.get(code, u"see above")))
 
 
 def main(argv=None):
     args = parse_args(argv)
     style = Style(colour_wanted(args.no_color))
     configure_streams()
-    root = os.path.abspath(fs_text(args.path))
-    if not os.path.isdir(root):
-        say(style.bad(u"[!!] %s is not a folder." % root), sys.stderr)
+    roots = [os.path.abspath(fs_text(path)) for path in (args.path or [u"."])]
+    problem = check_roots(roots, args)
+    if problem:
+        say(style.bad(u"[!!] %s" % problem), sys.stderr)
         return 1
+
+    global RUN_LOG, RUN_RECORD
+    RUN_LOG, log_note = open_run_log(args, run_label(roots))
+    RUN_RECORD = RunRecord(fs_text(args.record_dir) if args.record_dir else default_record_dir(), roots, not args.no_record)
+    header = (u"sweep-and-secure %s | %s | python %s | %s | cwd %s | args %s"
+              % (__version__, time.strftime("%Y-%m-%d %H:%M:%S %Z"), platform.python_version(),
+                 platform.platform(), fs_text(os.getcwd()), u" ".join(fs_text(a) for a in sys.argv[1:])))
+    if RUN_LOG is not None:
+        RUN_LOG.write(header, u"| ")
+    RUN_RECORD.add(header, u"| ")
+    say(style.bold(u"sweep-and-secure %s" % __version__) + style.dim(u"  (TruffleHog + dotenvx)"))
+    if RUN_LOG is not None:
+        say(style.dim(u"Log: %s" % RUN_LOG.path))
+    elif log_note:
+        say(style.dim(u"(%s)" % log_note))
+    if args.check_setup:
+        return check_setup(args, roots[0], style)
+    codes = []
+    try:
+        for index, root in enumerate(roots):
+            if len(roots) > 1:
+                say(u"")
+                say(style.bold(u"=== Folder %d of %d ===" % (index + 1, len(roots))))
+            try:
+                codes.append(sweep_folder(args, root, style))
+            except SystemExit as exc:
+                # locate_tools() ends a run whose tools are missing or unusable; the tools are looked for per folder
+                # (a project-local dotenvx counts), so that is this folder's failure and the next folder still gets its turn
+                codes.append(exc.code if isinstance(exc.code, int) else 1)
+    finally:
+        announce_run_record(style)
+    if len(roots) > 1:
+        print_folder_summary(roots, codes, style)
+    return combined_exit_code(codes)
+
+
+def sweep_folder(args, root, style):
+    """One folder's sweep, from the name of its env file to its exit code: the report, the confirmation, the
+    changes and the wrap-up, or a restore from its quarantine."""
     store = fs_text(args.env_file)
     if not os.path.isabs(store):
         store = os.path.join(root, store)
@@ -5381,23 +5484,6 @@ def main(argv=None):
                       u" rewritten, so secrets stored there would be lost; use a name like .env or config/secrets.env."
                       % store), sys.stderr)
         return 1
-
-    global RUN_LOG, RUN_RECORD
-    RUN_LOG, log_note = open_run_log(args, root)
-    RUN_RECORD = RunRecord(fs_text(args.record_dir) if args.record_dir else default_record_dir(), root, not args.no_record)
-    header = (u"sweep-and-secure %s | %s | python %s | %s | cwd %s | args %s"
-              % (__version__, time.strftime("%Y-%m-%d %H:%M:%S %Z"), platform.python_version(),
-                 platform.platform(), fs_text(os.getcwd()), u" ".join(fs_text(a) for a in sys.argv[1:])))
-    if RUN_LOG is not None:
-        RUN_LOG.write(header, u"| ")
-    RUN_RECORD.add(header, u"| ")
-    say(style.bold(u"sweep-and-secure %s" % __version__) + style.dim(u"  (TruffleHog + dotenvx)"))
-    if RUN_LOG is not None:
-        say(style.dim(u"Log: %s" % RUN_LOG.path))
-    elif log_note:
-        say(style.dim(u"(%s)" % log_note))
-    if args.check_setup:
-        return check_setup(args, root, style)
     say(u"Folder: %s" % root)
     if args.restore:
         tools = locate_tools(args, root, style, names=("dotenvx",))
