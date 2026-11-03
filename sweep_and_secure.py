@@ -5455,7 +5455,12 @@ def main(argv=None):
             if len(roots) > 1:
                 say(u"")
                 say(style.bold(u"=== Folder %d of %d ===" % (index + 1, len(roots))))
-            codes.append(sweep_folder(args, root, style))
+            try:
+                codes.append(sweep_folder(args, root, style))
+            except SystemExit as exc:
+                # locate_tools() ends a run whose tools are missing or unusable; the tools are looked for per folder
+                # (a project-local dotenvx counts), so that is this folder's failure and the next folder still gets its turn
+                codes.append(exc.code if isinstance(exc.code, int) else 1)
     finally:
         announce_run_record(style)
     if len(roots) > 1:

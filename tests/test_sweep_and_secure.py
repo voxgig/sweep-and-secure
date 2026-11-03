@@ -1538,6 +1538,28 @@ class EndToEndTests(unittest.TestCase):
             other.cleanup()
             shutil.rmtree(records, ignore_errors=True)
 
+    def test_a_folder_without_its_tools_does_not_stop_the_next_folder(self):
+        # Codex, PR 17: the tools are looked for per folder (a project-local dotenvx counts), and a missing one ends
+        # the run through locate_tools(); with several folders that is one folder's failure, not the run's
+        other = ProjectTree()
+        try:
+            local_bin = other.path("node_modules/.bin")
+            os.makedirs(local_bin)
+            for name in os.listdir(FAKEBIN):
+                if name.startswith("dotenvx"):
+                    shutil.copy(os.path.join(FAKEBIN, name), os.path.join(local_bin, name))
+            env = {"TRUFFLEHOG_BIN": os.path.join(FAKEBIN, "trufflehog")}   # the fake trufflehog by name; no fakebin on PATH
+            code, out, err = run_script(self.tree.root, [other.root, "--dry-run"], extra_env=env, path=os.environ.get("PATH", ""))
+            self.assertEqual(code, 1, out + err)
+            self.assertIn("dotenvx is not installed", err)
+            self.assertIn("Cannot continue: 1 required tool(s) missing", err)
+            self.assertIn("=== Folder 2 of 2 ===", out)
+            self.assertEqual(out.count("Dry run: nothing was changed."), 1)   # the second folder was swept
+            self.assertIn("  exit 1  %s  (something failed" % self.tree.root, out)
+            self.assertIn("  exit 0  %s  (done)" % other.root, out)
+        finally:
+            other.cleanup()
+
     def test_a_run_that_changes_files_leaves_a_record(self):
         records = tempfile.mkdtemp(prefix="sweep-records-")
         try:
