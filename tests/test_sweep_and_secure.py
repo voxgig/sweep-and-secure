@@ -2501,7 +2501,9 @@ class UnitTests(unittest.TestCase):
         self.assertTrue(block, "the README has no help block")
 
         def normal(text):
-            return re.sub(r"\s+", " ", text.replace("optional arguments:", "options:")).strip()
+            # Python 3.9 renamed the heading and shortened the usage of a list argument ([path [path ...]] -> [path ...])
+            text = text.replace("optional arguments:", "options:").replace("[path [path ...]]", "[path ...]")
+            return re.sub(r"\s+", " ", text).strip()
 
         self.assertEqual(normal(block.group(1)), normal(help_text))
         for option in ("--record-dir", "--no-record", "--restore", "--check-setup", "--quarantine-dir"):
