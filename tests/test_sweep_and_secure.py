@@ -1548,8 +1548,10 @@ class EndToEndTests(unittest.TestCase):
             for name in os.listdir(FAKEBIN):
                 if name.startswith("dotenvx"):
                     shutil.copy(os.path.join(FAKEBIN, name), os.path.join(local_bin, name))
-            env = {"TRUFFLEHOG_BIN": os.path.join(FAKEBIN, "trufflehog")}   # the fake trufflehog by name; no fakebin on PATH
-            code, out, err = run_script(self.tree.root, [other.root, "--dry-run"], extra_env=env, path=os.environ.get("PATH", ""))
+            # the fake trufflehog by name, and a PATH holding only Python's own folder (the fakes' interpreter), so that no
+            # dotenvx is found anywhere but in the second folder's node_modules, whatever the machine has installed
+            env = {"TRUFFLEHOG_BIN": os.path.join(FAKEBIN, "trufflehog")}
+            code, out, err = run_script(self.tree.root, [other.root, "--dry-run"], extra_env=env, path=os.path.dirname(sys.executable))
             self.assertEqual(code, 1, out + err)
             self.assertIn("dotenvx is not installed", err)
             self.assertIn("Cannot continue: 1 required tool(s) missing", err)
