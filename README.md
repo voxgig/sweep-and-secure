@@ -227,7 +227,8 @@ on Linux, `~/Library/Application Support/sweep-and-secure/runs` on macOS and
 `%LOCALAPPDATA%\sweep-and-secure\runs` on Windows; `SWEEP_AND_SECURE_RECORD_DIR`
 or `--record-dir DIR` choose another, `--no-record` writes none. The run prints
 `Run record: <path>` as its last lines. Like the log, a record never holds a
-secret value.
+secret value. When several folders are swept in one run there is one log and
+one record for all of them, with a section per folder that changed.
 
 ### Built never to leave a file half-written
 
@@ -320,7 +321,7 @@ Without installing anything, straight from the repository:
 uvx --from git+https://github.com/voxgig/sweep-and-secure sweep-and-secure --dry-run
 ```
 
-To pin a release, append `@v1.7.0` to the git URL, or pass `-v v1.7.0` to the
+To pin a release, append `@v1.8.0` to the git URL, or pass `-v v1.8.0` to the
 installer. To upgrade, run the same command again (`pipx upgrade
 sweep-and-secure` or `uv tool upgrade sweep-and-secure` for those routes). The
 installer takes `-b DIR` for another folder (without `-b` it uses
@@ -414,7 +415,7 @@ everything.
 
 ```
 $ sweep-and-secure --check-setup
-sweep-and-secure 1.7.0  (TruffleHog + dotenvx)
+sweep-and-secure 1.8.0  (TruffleHog + dotenvx)
 Log: /home/me/.local/state/sweep-and-secure/logs/2026-10-23T16-38-58Z-shop-48213.log
 Python 3.13.16 (/usr/bin/python3) on Linux-6.8.0-x86_64-with-glibc2.39
   [ok] trufflehog  3.99.3     /usr/local/bin/trufflehog
@@ -460,7 +461,7 @@ audit.
 ```
 $ cd shop
 $ sweep-and-secure --dry-run
-sweep-and-secure 1.7.0  (TruffleHog + dotenvx)
+sweep-and-secure 1.8.0  (TruffleHog + dotenvx)
 Log: /home/me/.local/state/sweep-and-secure/logs/2026-10-23T16-39-04Z-shop-48213.log
 Folder: /home/me/shop
   Note: this is a security tool that changes files on purpose: it encrypts env files, rewrites
@@ -742,7 +743,7 @@ recognised and never stored twice.
 
 ```
 $ sweep-and-secure --dry-run
-sweep-and-secure 1.7.0  (TruffleHog + dotenvx)
+sweep-and-secure 1.8.0  (TruffleHog + dotenvx)
 Log: /home/me/.local/state/sweep-and-secure/logs/2026-10-23T16-39-20Z-shop-48213.log
 Folder: /home/me/shop
   Note: this is a security tool that changes files on purpose: it encrypts env files, rewrites
@@ -783,7 +784,7 @@ a file put back with its secret still inside is found again by the next run.
 
 ```
 $ sweep-and-secure --restore build/keys.zip
-sweep-and-secure 1.7.0  (TruffleHog + dotenvx)
+sweep-and-secure 1.8.0  (TruffleHog + dotenvx)
 Log: /home/me/.local/state/sweep-and-secure/logs/2026-10-23T16-39-24Z-shop-48213.log
 Folder: /home/me/shop
   [ok] dotenvx     2.38.2     /usr/local/bin/dotenvx
@@ -1001,6 +1002,8 @@ sweep-and-secure again or use `dotenvx set`.
 - Ask TruffleHog to verify credentials against the issuing services (this
   sends them over the network): `--verify`; live ones are marked `*`.
 - Sweep a folder other than the current one: `sweep-and-secure path/to/project`.
+- Sweep several project folders in one go: `sweep-and-secure ~/work/api ~/work/web`.
+  Each gets its own `.env` and quarantine; one log and one record cover the run.
 - See every command the script runs: `-v`. Keep the run's log somewhere else,
   or not at all: `--log-dir DIR`, `--no-log`. The same for the record of a run
   that changed files: `--record-dir DIR`, `--no-record`.
@@ -1019,16 +1022,18 @@ model; this is the operating manual.
 1. **Check the setup**: `sweep-and-secure --check-setup`. Exit 0 means Python,
    TruffleHog and dotenvx are in place and a trial run of both tools worked;
    exit 1 names what is missing, with install links. Nothing is scanned.
-2. **Dry run**: `sweep-and-secure --dry-run PATH`. The report lists every
+2. **Dry run**: `sweep-and-secure --dry-run PATH [PATH ...]`. The report lists every
    plaintext secret with its file, line, detector and a masked preview, the
    action a real run would take, and the files that cannot be fixed in place.
    Nothing is changed. Exit 0, or 1 when the TruffleHog scan was cut short.
 3. **Decide** whether the files that cannot be fixed in place (archives, lock
    files, example env files, SSH keys without a passphrase) should leave the
    tree. With `--yes` they stay where they are unless `--quarantine` is given.
-4. **Run**: `sweep-and-secure --yes [--quarantine] PATH`. It encrypts, rewrites
-   and moves as the report said, prints what it did, and ends with
-   `Run record: <path>`.
+4. **Run**: `sweep-and-secure --yes [--quarantine] PATH [PATH ...]`. It
+   encrypts, rewrites and moves as the report said, prints what it did, and
+   ends with `Run record: <path>`. Several folders are swept one after another,
+   each with its own `.env` and quarantine; one log and one record cover them
+   all, and a `Summary of N folders` gives each folder's exit code.
 5. **Read the run record**: what changed, where the private key is, the dotenvx
    commands that use the values, and what to do when something is wrong. Keep
    the path with the task's notes; the file stays until its owner removes it.
@@ -1059,6 +1064,7 @@ Each of these is a line of its own with stable wording, in this order.
 | `Done: ...` | a real run ended; its parts count what was stored, rewritten, moved and what failed |
 | `Stopped early (...)` | an interrupted or failed run; the state of the tree follows |
 | `Run record: <path>` | the record of a run that changed files |
+| `=== Folder N of M ===`, `Summary of M folders` | several folders were given: each folder's own report follows its heading, and the summary lists each folder with its exit code |
 
 The [exit code](#exit-codes) is the verdict: 0 done or nothing to do, 1
 something failed or the scan was incomplete, 2 no confirmation, 130
@@ -1126,7 +1132,7 @@ usage: sweep-and-secure [-h] [-n] [-y] [--env-file PATH] [--env-all]
                         [--no-version-check] [--log-dir DIR] [--no-log]
                         [--record-dir DIR] [--no-record] [-v] [--no-color]
                         [--check-setup] [--version]
-                        [path]
+                        [path ...]
 
 Scan a folder tree for API keys and secrets with TruffleHog, list what was found
 (and what is already encrypted), then -- after you confirm -- encrypt them with dotenvx.
@@ -1138,7 +1144,10 @@ Scan a folder tree for API keys and secrets with TruffleHog, list what was found
                                quarantine, and the ssh-keygen line that adds one is printed
 
 positional arguments:
-  path                  folder to sweep (default: current folder)
+  path                  folder(s) to sweep (default: the current folder);
+                        several are swept one after another, each with its own
+                        .env and quarantine, with one log and one record for
+                        the run
 
 options:
   -h, --help            show this help message and exit
@@ -1204,7 +1213,8 @@ options:
   --version             show program's version number and exit
 
 exit codes: 0 done (or nothing to do), 1 missing tool / scan incomplete or failed / encryption failed,
-            2 you said no or gave no answer (stdin not a terminal, nothing piped, no --yes), 130 interrupted
+            2 you said no or gave no answer (stdin not a terminal, nothing piped, no --yes), 130 interrupted;
+            with several folders the worst code wins (1 if any failed, else 2 if any was declined)
 
 A log of every run is kept in ~/.local/state/sweep-and-secure/logs
 (--log-dir to change, --no-log to skip; the newest 100 are kept); it holds what was printed, the
@@ -1226,9 +1236,17 @@ TruffleHog: https://trufflesecurity.com/trufflehog     dotenvx: https://dotenvx.
 
 **Where to scan**
 
-- `path`: the folder to sweep, default the current folder. Every sub-folder is
-  included. This folder is also where the default `.env` lives, where the
-  quarantine folder is made, and where the script stages files while it works.
+- `path ...`: the folder or folders to sweep, default the current folder. Every
+  sub-folder is included. Each folder is where its default `.env` lives, where
+  its quarantine folder is made, and where the script stages files while it
+  works. Several folders are swept one after another, each with its own report
+  and confirmation (`=== Folder N of M ===` heads each), with one run log and one
+  run record for the whole run and a `Summary of M folders` at the end that
+  gives each folder's exit code; the run's own exit code is the worst of them:
+  1 if any folder failed, else 2 if any was declined, else 0. A folder given
+  twice or lying inside another is refused, and with several folders
+  `--env-file` and `--quarantine-dir` must be relative paths (resolved inside
+  each folder) while `--restore` and `--check-setup` take one folder.
 - `--exclude REGEX`: skip paths matching a regular expression; repeat the option
   for several. Patterns are matched against the whole path as TruffleHog sees
   it, so on Windows write `[/\\]` rather than `/` for a separator, for example
@@ -1395,6 +1413,10 @@ pipe or a CI log, so a long scan is visibly alive rather than hung. It ends with
 | 2 | you answered no, or gave no answer: stdin was not a terminal, nothing was piped in and `--yes` was not given |
 | 130 | interrupted with Ctrl-C; what had already been changed is printed |
 
+With several folders the worst code wins: 1 if any folder failed, else 2 if any
+was declined, else 0. The `Summary of N folders` lines at the end give each
+folder's own code.
+
 ### Checking a download by hand
 
 The curl installer verifies the script against the release's checksums. To do
@@ -1402,7 +1424,7 @@ it yourself for a downloaded `sweep_and_secure.py`, from the folder it was
 downloaded into:
 
 ```
-curl -sSfL -O https://github.com/voxgig/sweep-and-secure/releases/download/v1.7.0/SHA256SUMS
+curl -sSfL -O https://github.com/voxgig/sweep-and-secure/releases/download/v1.8.0/SHA256SUMS
 ```
 
 ```
@@ -1548,7 +1570,7 @@ python3 -c "import sys; sys.argv = ['sweep-and-secure', '--help']; import sweep_
 
 
 To release: set `__version__` in `sweep_and_secure.py`, merge, then either push
-a matching tag (`git tag v1.7.0 && git push origin v1.7.0`) or run the release
+a matching tag (`git tag v1.8.0 && git push origin v1.8.0`) or run the release
 workflow from the Actions tab with the version, which creates the tag for you.
 The workflow (`.github/workflows/release.yml`) checks that the tag matches the
 version, runs the tests, builds the sdist and wheel, and publishes a GitHub
